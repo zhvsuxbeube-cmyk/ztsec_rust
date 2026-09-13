@@ -8,21 +8,21 @@ use crate::text;
 
 pub fn fingerprint() -> String {
     let (machine_id, hwid) = identity();
-    derive(&machine_id, &hwid)
+    derive(&machine_id, &hwid).0
 }
 
 #[cfg(test)]
 fn from_id(machine_id: &str) -> String {
     let hwid = digest(format!("{machine_id}|windows").as_bytes());
-    derive(machine_id, &hwid)
+    derive(machine_id, &hwid).0
 }
 
-fn derive(machine_id: &str, hwid: &str) -> String {
+fn derive(machine_id: &str, hwid: &str) -> (String, [u8; 32]) {
     let hk = Hkdf::<Sha256>::new(Some(hwid.as_bytes()), machine_id.as_bytes());
     let mut seed = [0u8; 32];
     hk.expand(b"mirage-identity", &mut seed).expect("hkdf");
     let key = SigningKey::from_bytes(&seed);
-    hex(&Sha256::digest(key.verifying_key().to_bytes()))
+    (hex(&Sha256::digest(key.verifying_key().to_bytes())), seed)
 }
 
 fn identity() -> (String, String) {
@@ -180,9 +180,24 @@ mod tests {
 
     #[test]
     fn fingerprint_contract() {
+        let machine_id = "00112233-4455-6677-8899-aabbccddeeff";
+        let hwid = super::digest(format!("{machine_id}|windows").as_bytes());
+        let (fingerprint, seed) = super::derive(machine_id, &hwid);
         assert_eq!(
-            from_id("00112233-4455-6677-8899-aabbccddeeff"),
-            "df5d93dab28d0df783ecafe806a225c622d128a792c12c5f16f756faf563ee2d"
+            hwid,
+            "b8aaf957abbdd67c3f611b113886e4dd656375b2b1e6c8ec11edaddd13af918b"
+        );
+        assert_eq!(
+            super::hex(&seed),
+            "0baa1679f8562ab33b4ce4b27ae355130ff1d758a530b98134a68ef49b85adee"
+        );
+        assert_eq!(
+            fingerprint,
+            "14f30ccfbc5b248cc89c5dede0e41fe2d7f427ff6b092a5dfd70e6f4d93994f9"
+        );
+        assert_eq!(
+            from_id(machine_id),
+            "14f30ccfbc5b248cc89c5dede0e41fe2d7f427ff6b092a5dfd70e6f4d93994f9"
         );
     }
 
