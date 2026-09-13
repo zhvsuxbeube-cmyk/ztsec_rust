@@ -1,7 +1,16 @@
 #[test]
 fn contract() {
     let source = std::fs::read_to_string("src/text.rs").unwrap();
-    for command in ["SLEEP", "HIBERNATE", "RESTART", "SHUTDOWN", "RECONNECT", "CLOSE"] { assert!(source.contains(command)); }
+    for command in [
+        "SLEEP",
+        "HIBERNATE",
+        "RESTART",
+        "SHUTDOWN",
+        "RECONNECT",
+        "CLOSE",
+    ] {
+        assert!(source.contains(command));
+    }
     assert!(!source.contains("CMD:BLOCK"));
     assert!(source.contains("127.0.0.1"));
     assert!(source.contains("4793"));

@@ -38,7 +38,6 @@ pub const REG_QUERY: &str = "query";
 pub const REG_VALUE: &str = "/v";
 pub const REG_QUERY_KEY: &str = "MachineGuid";
 pub const REG_64: &str = r"HKLM\SOFTWARE\Microsoft\Cryptography";
-pub const REG_32: &str = r"HKLM\SOFTWARE\Wow6432Node\Microsoft\Cryptography";
 
 pub const PS: &str = "powershell";
 pub const PS_ARG: [&str; 3] = ["-NoProfile", "-NonInteractive", "-Command"];
