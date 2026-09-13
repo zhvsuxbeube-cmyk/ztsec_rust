@@ -7,7 +7,7 @@ use std::{
 
 use crate::{sys, telemetry, text};
 
-pub fn run(ip: &str, port: u16) -> ! {
+pub fn run(ip: &str, port: u16) {
     let fp = telemetry::fingerprint();
 
     loop {

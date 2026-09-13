@@ -15,7 +15,13 @@ pub fn get() -> Args {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             text::IP => ip = value(&mut it),
-            text::PORT_ARG => port = value(&mut it).parse().unwrap_or_else(|_| fail()),
+            text::PORT_ARG => {
+                let v = value(&mut it);
+                port = match v.parse() {
+                    Ok(v) => v,
+                    Err(_) => fail(),
+                };
+            }
             text::HELP | text::SHORT_HELP => {
                 println!("{}", text::USAGE);
                 process::exit(0);
@@ -32,7 +38,10 @@ pub fn get() -> Args {
 }
 
 fn value<I: Iterator<Item = String>>(it: &mut I) -> String {
-    it.next().unwrap_or_else(fail)
+    match it.next() {
+        Some(v) => v,
+        None => fail(),
+    }
 }
 
 fn fail() -> ! {
