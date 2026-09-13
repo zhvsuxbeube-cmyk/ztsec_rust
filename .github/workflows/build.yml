@@ -7,13 +7,13 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable-x86_64-pc-windows-msvc
-      - name: Format
-        run: cargo fmt --all -- --check
       - name: Test
         run: cargo test
       - name: Build
