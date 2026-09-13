@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+
+      - run: cargo generate-lockfile
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\ztsec-agent.exe dist\agent.exe
+          if (-not (Test-Path dist\agent.exe)) { throw 'agent.exe was not built.' }
+          $p = Start-Process -FilePath dist\agent.exe -ArgumentList '--ip','127.0.0.1','--port','4793' -NoNewWindow -PassThru -RedirectStandardOutput output.txt -RedirectStandardError error.txt
+          Start-Sleep -Seconds 2
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          Get-Content output.txt -ErrorAction SilentlyContinue | Write-Host
+          Get-Content error.txt -ErrorAction SilentlyContinue | Write-Host
+          Compress-Archive -Path dist\agent.exe -DestinationPath ztsec-agent-windows.zip -Force
+          Get-Item dist\agent.exe, ztsec-agent-windows.zip | Select-Object Name,Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ztsec-agent-windows
+          path: ztsec-agent-windows.zip

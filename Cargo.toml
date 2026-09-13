@@ -1,0 +1,11 @@
+[package]
+name = "ztsec-agent"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+ed25519-dalek = "3.0"
+hkdf = "0.13"
+sha2 = "0.10"
+winreg = "0.56"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
