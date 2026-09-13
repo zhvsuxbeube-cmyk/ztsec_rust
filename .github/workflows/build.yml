@@ -28,6 +28,7 @@ jobs:
           $client = $listener.AcceptTcpClient()
           $second = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4794' -NoNewWindow -PassThru
           if (-not $second.WaitForExit(3000)) { Stop-Process $second.Id -Force; throw 'mutex' }
+          if ($second.ExitCode -ne 0) { throw "mutex exit $($second.ExitCode)" }
           $stream = $client.GetStream()
           $reader = [System.IO.StreamReader]::new($stream)
           $writer = [System.IO.StreamWriter]::new($stream)

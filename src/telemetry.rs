@@ -11,7 +11,8 @@ pub fn fingerprint() -> String {
     derive(&machine_id, &hwid)
 }
 
-pub fn from_id(machine_id: &str) -> String {
+#[cfg(test)]
+fn from_id(machine_id: &str) -> String {
     let hwid = digest(format!("{machine_id}|windows").as_bytes());
     derive(machine_id, &hwid)
 }
