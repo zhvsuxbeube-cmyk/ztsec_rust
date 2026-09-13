@@ -1,39 +1,56 @@
-name: Build
+name: build
 
 on:
   push:
   workflow_dispatch:
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
-
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable-x86_64-pc-windows-msvc
-
-      - run: cargo generate-lockfile
-      - run: cargo test --locked
-      - run: cargo build --release --locked
-
-      - name: Package
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Test
+        run: cargo test
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Spy
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
+          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 4794)
+          $listener.Start()
+          $first = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4794' -NoNewWindow -PassThru -RedirectStandardOutput 'agent.out' -RedirectStandardError 'agent.err'
+          $client = $listener.AcceptTcpClient()
+          $second = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4794' -NoNewWindow -PassThru
+          if (-not $second.WaitForExit(3000)) { Stop-Process $second.Id -Force; throw 'mutex' }
+          $stream = $client.GetStream()
+          $reader = [System.IO.StreamReader]::new($stream)
+          $writer = [System.IO.StreamWriter]::new($stream)
+          $writer.AutoFlush = $true
+          $hello = $reader.ReadLine()
+          $data = $reader.ReadLine()
+          if (-not $hello.StartsWith('HELLO:FINGERPRINT:')) { throw 'handshake' }
+          if ($data.Split('|').Count -ne 16) { throw 'telemetry' }
+          $writer.WriteLine('CMD:CLOSE')
+          if ($reader.ReadLine() -ne 'ACK:CLOSE') { throw 'ack' }
+          if (-not $first.WaitForExit(5000)) { Stop-Process $first.Id -Force; throw 'exit' }
+          $listener.Stop()
+          Write-Host '--- stdout ---'
+          Get-Content agent.out
+          Write-Host '--- stderr ---'
+          Get-Content agent.err
+      - name: Archive
+        shell: pwsh
+        run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target\release\ztsec-agent.exe dist\agent.exe
-          if (-not (Test-Path dist\agent.exe)) { throw 'agent.exe was not built.' }
-          $p = Start-Process -FilePath dist\agent.exe -ArgumentList '--ip','127.0.0.1','--port','4793' -NoNewWindow -PassThru -RedirectStandardOutput output.txt -RedirectStandardError error.txt
-          Start-Sleep -Seconds 2
-          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
-          Get-Content output.txt -ErrorAction SilentlyContinue | Write-Host
-          Get-Content error.txt -ErrorAction SilentlyContinue | Write-Host
-          Compress-Archive -Path dist\agent.exe -DestinationPath ztsec-agent-windows.zip -Force
-          Get-Item dist\agent.exe, ztsec-agent-windows.zip | Select-Object Name,Length
-
+          Copy-Item target\x86_64-pc-windows-msvc\release\ztsec_agent.exe dist\ztsec_agent.exe
+          Compress-Archive -Path dist\* -DestinationPath ztsec_agent-win64.zip -Force
       - uses: actions/upload-artifact@v4
         with:
-          name: ztsec-agent-windows
-          path: ztsec-agent-windows.zip
+          name: ztsec_agent-win64
+          path: ztsec_agent-win64.zip

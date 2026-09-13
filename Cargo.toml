@@ -1,11 +1,15 @@
 [package]
-name = "ztsec-agent"
+name = "ztsec_agent"
 version = "1.0.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-ed25519-dalek = "3.0"
-hkdf = "0.13"
-sha2 = "0.10"
-winreg = "0.56"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+ed25519-dalek = "=2.1.1"
+hkdf = "=0.12.4"
+sha2 = "=0.10.9"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
