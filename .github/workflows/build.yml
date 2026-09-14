@@ -76,6 +76,18 @@ jobs:
           }
           Write-Host '--- execute panel ---'
           Get-Content exec_panel.out
+      - name: Update handoff
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
+          python tools\update_test.py --agent $exe
+          if ($LASTEXITCODE -ne 0) { throw 'update handoff test failed' }
+      - name: Update panel handoff
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
+          python tools\update_panel_test.py --agent $exe
+          if ($LASTEXITCODE -ne 0) { throw 'update panel handoff test failed' }
       - name: Archive
         shell: pwsh
         run: |

