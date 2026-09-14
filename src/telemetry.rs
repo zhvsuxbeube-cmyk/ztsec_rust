@@ -62,7 +62,6 @@ pub fn record(target: &str, ping_ms: Option<u128>, fp: &str) -> String {
     let gpu = clean(ps(text::GPU));
     let antivirus = clean(ps(text::AV));
     let ram = clean(ps(text::RAM));
-    let uptime = clean(ps(text::UPTIME));
     let os = clean(ps(text::OS));
     let afk = afk();
     let country = if matches!(target, "127.0.0.1" | "::1" | "localhost") {
