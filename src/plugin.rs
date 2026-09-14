@@ -151,7 +151,6 @@ mod win {
     }
 
     // Manual PE loader: maps image, applies relocs, resolves imports, sets protections
-    #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn load_pe(data: &[u8]) -> Option<(*mut u8, usize)> {
         if data.len() < 64 { return None; }
         let dos = unsafe { &*(data.as_ptr() as *const DosHdr) };
@@ -216,7 +215,8 @@ mod win {
             }
         }
 
-        // Resolve imports
+        // Resolve imports. Every imported function must resolve: a null IAT
+        // entry would only move the failure from load time to the first call.
         let imp_dir = &nt.opt.dirs[1];
         if imp_dir.size > 0 {
             let mut imp_off = imp_dir.va as usize;
@@ -236,7 +236,7 @@ mod win {
                     let thunk = unsafe { *(image.add(thunk_off + k * 8) as *const usize) };
                     if thunk == 0 { break; }
                     let fn_addr = if thunk & (1 << 63) != 0 {
-                        // import by ordinal
+                        // Ordinal imports are not used by the bundled plugin ABI.
                         None
                     } else {
                         let ibn = unsafe { image.add(thunk & 0x7FFF_FFFF_FFFF_FFFF) } as *const ImportByName;
@@ -246,10 +246,11 @@ mod win {
                         let fn_bytes = unsafe { core::slice::from_raw_parts(fn_name_ptr, fn_len) };
                         unsafe { resolve_import(&mod_name_lc, fn_bytes) }
                     };
-                    unsafe {
-                        *(image.add(iat_off + k * 8) as *mut usize) =
-                            fn_addr.map(|p| p as usize).unwrap_or(0);
-                    }
+                    let Some(fn_addr) = fn_addr else {
+                        unsafe { nt_free(image, image_sz); }
+                        return None;
+                    };
+                    unsafe { *(image.add(iat_off + k * 8) as *mut usize) = fn_addr as usize; }
                     k += 1;
                 }
                 imp_off += core::mem::size_of::<ImportDesc>();
