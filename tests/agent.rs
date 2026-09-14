@@ -19,4 +19,7 @@ fn contract() {
     assert!(source.contains("PLUGIN:"));
     assert!(source.contains("PLUGIN_EVENT:"));
     assert!(source.contains("PLUGIN_OUT:"));
+    assert!(source.contains(".Caption -replace '^Microsoft\\s+', ''"));
+    assert!(source.contains("){'Admin'}else{'User'}"));
+    assert!(!source.contains("DisplayVersion"));
 }

@@ -1,5 +1,8 @@
 use std::{env, process::Command};
 
+#[cfg(windows)]
+use std::net::{Ipv4Addr, ToSocketAddrs};
+
 use ed25519_dalek::SigningKey;
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
@@ -83,7 +86,7 @@ pub fn record(target: &str, ping_ms: Option<u128>, fp: &str) -> String {
         cpu,
         ram,
         antivirus,
-        uptime(ps(text::UPTIME)),
+        uptime(),
         afk,
         ping_ms.map_or_else(|| "Unknown".into(), |v| format!("{v} ms")),
         hwid,
@@ -142,7 +145,7 @@ fn afk() -> String {
         }
         #[link(name = "kernel32")]
         unsafe extern "system" {
-            fn GetTickCount() -> u32;
+            fn GetTickCount64() -> u64;
         }
 
         let mut info = LastInput {
@@ -150,18 +153,114 @@ fn afk() -> String {
             tick: 0,
         };
         if unsafe { GetLastInputInfo(&mut info) } != 0 {
-            let now = unsafe { GetTickCount() };
-            return human(now.wrapping_sub(info.tick) as u64);
+            let now = unsafe { GetTickCount64() };
+            return human((now as u32).wrapping_sub(info.tick) as u64);
         }
     }
     "0s".into()
 }
 
-fn uptime(v: String) -> String {
-    v.trim()
-        .parse::<u64>()
-        .map(human)
-        .unwrap_or_else(|_| "Unknown".into())
+fn uptime() -> String {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetTickCount64() -> u64;
+        }
+        return human(unsafe { GetTickCount64() } / 1_000);
+    }
+    #[cfg(not(windows))]
+    {
+        "Unknown".into()
+    }
+}
+
+pub fn ping_ms(target: &str) -> Option<u128> {
+    #[cfg(windows)]
+    {
+        let ip = target.parse::<Ipv4Addr>().ok().or_else(|| {
+            (target, 0).to_socket_addrs().ok()?.find_map(|a| match a {
+                std::net::SocketAddr::V4(v4) => Some(*v4.ip()),
+                std::net::SocketAddr::V6(_) => None,
+            })
+        })?;
+        return icmp_ping_ms(ip);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = target;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn icmp_ping_ms(ip: Ipv4Addr) -> Option<u128> {
+    use core::{ffi::c_void, mem::size_of, ptr};
+
+    type Handle = *mut c_void;
+
+    #[repr(C)]
+    struct Reply {
+        address: u32,
+        status: u32,
+        round_trip_time: u32,
+        data_size: u16,
+        reserved: u16,
+        data: *mut c_void,
+        options: Options,
+    }
+
+    #[repr(C)]
+    struct Options {
+        ttl: u8,
+        tos: u8,
+        flags: u8,
+        options_size: u8,
+        options_data: *mut u8,
+    }
+
+    #[link(name = "iphlpapi")]
+    unsafe extern "system" {
+        fn IcmpCreateFile() -> Handle;
+        fn IcmpSendEcho(
+            handle: Handle,
+            destination_address: u32,
+            request_data: *const c_void,
+            request_size: u16,
+            request_options: *const Options,
+            reply_buffer: *mut c_void,
+            reply_size: u32,
+            timeout: u32,
+        ) -> u32;
+        fn IcmpCloseHandle(handle: Handle) -> i32;
+    }
+
+    let handle = unsafe { IcmpCreateFile() };
+    if handle.is_null() {
+        return None;
+    }
+
+    let mut reply = [0u8; size_of::<Reply>()];
+    let sent = unsafe {
+        IcmpSendEcho(
+            handle,
+            u32::from_ne_bytes(ip.octets()),
+            ptr::null(),
+            0,
+            ptr::null(),
+            reply.as_mut_ptr() as *mut c_void,
+            reply.len() as u32,
+            2_000,
+        )
+    };
+    let result = if sent > 0 {
+        let reply = unsafe { &*(reply.as_ptr() as *const Reply) };
+        (reply.status == 0).then_some(reply.round_trip_time as u128)
+    } else {
+        None
+    };
+    unsafe { IcmpCloseHandle(handle) };
+    result
 }
 
 fn human(mut secs: u64) -> String {
