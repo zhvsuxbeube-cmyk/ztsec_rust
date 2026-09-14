@@ -63,6 +63,7 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                     let (id, b64) = match rest.split_once(':') {
                         Some((i, b)) => (i.trim(), b.trim()),
                         None => {
+                            eprintln!("[plugin-debug] session: plugin base64 decode failed id={id:?}");
                             let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN));
                             continue;
                         }
@@ -76,7 +77,8 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                             Ok(()) => {
                                 let _ = send(stream, &format!("{}{}{}", text::ACK, text::PLUGIN, id));
                             }
-                            Err(_) => {
+                            Err(err) => {
+                                eprintln!("[plugin-debug] session: plugin load id={id:?} failed: {err}");
                                 let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN));
                             }
                         },

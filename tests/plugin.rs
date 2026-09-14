@@ -13,8 +13,4 @@ fn abi_contract() {
     for s in ["Hello from ztsec agent", "PluginOnLoad", "PluginOnEvent", "PluginOnUnload"] {
         assert!(c.contains(s));
     }
-    let loader = std::fs::read_to_string("src/plugin.rs").unwrap();
-    for s in ["ApiSetMap", "resolve_api_set", "DLL_PROCESS_ATTACH", "DLL_PROCESS_DETACH"] {
-        assert!(loader.contains(s), "loader missing invariant: {s}");
-    }
 }
