@@ -37,17 +37,6 @@ mod win {
     #[repr(C)] struct BaseReloc { va: u32, sz: u32 }
     #[repr(C)] struct ImportDesc { orig_thunk: u32, _ts: u32, _fwd: u32, name: u32, thunk: u32 }
     #[repr(C)] struct ImportByName { hint: u16, name: [u8; 1] }
-    #[repr(C)] struct ApiSetNamespaceV6 {
-        version: u32, size: u32, flags: u32, count: u32,
-        entry_off: u32, hash_off: u32, hash_factor: u32,
-    }
-    #[repr(C)] struct ApiSetEntryV6 {
-        flags: u32, name_off: u32, name_len: u32, hashed_len: u32,
-        value_off: u32, value_count: u32,
-    }
-    #[repr(C)] struct ApiSetValueV6 {
-        flags: u32, name_off: u32, name_len: u32, value_off: u32, value_len: u32,
-    }
 
     unsafe fn nt_alloc(size: usize, prot: usize) -> *mut u8 {
         let mut base: usize = 0;
@@ -102,63 +91,8 @@ mod win {
         None
     }
 
-    // Resolve an API-set contract (api-ms-win-* / ext-ms-win-*) to its host module.
-    unsafe fn find_api_set_module(name: &str) -> Option<*mut u8> {
-        let name = name.strip_suffix(".dll").unwrap_or(name);
-        if !(name.starts_with("api-") || name.starts_with("ext-")) {
-            return None;
-        }
-
-        use crate::syscalls::{core_impl, crypto};
-
-        let peb = unsafe { core_impl::get_peb() };
-        if peb.is_null() { return None; }
-        let map = unsafe { *(peb.add(0x68) as *const *const u8) };
-        if map.is_null() { return None; }
-
-        let ns = unsafe { &*(map as *const ApiSetNamespaceV6) };
-        if ns.version < 6 || ns.size < core::mem::size_of::<ApiSetNamespaceV6>() as u32 {
-            return None;
-        }
-
-        let name_lc = name.as_bytes();
-        let entries = unsafe { map.add(ns.entry_off as usize) as *const ApiSetEntryV6 };
-        for i in 0..ns.count as usize {
-            let entry = unsafe { &*entries.add(i) };
-            let len = entry.name_len as usize / 2;
-            if len != name_lc.len() { continue; }
-            let p = unsafe { map.add(entry.name_off as usize) as *const u16 };
-            let mut matched = true;
-            for j in 0..len {
-                let mut c = unsafe { *p.add(j) };
-                if c >= b'A' as u16 && c <= b'Z' as u16 { c += 32; }
-                if c as u8 != name_lc[j] { matched = false; break; }
-            }
-            if !matched { continue; }
-
-            let values = unsafe { map.add(entry.value_off as usize) as *const ApiSetValueV6 };
-            let mut fallback = core::ptr::null::<ApiSetValueV6>();
-            for j in 0..entry.value_count as usize {
-                let value = unsafe { &*values.add(j) };
-                if value.value_len == 0 { continue; }
-                if value.name_len == 0 || fallback.is_null() {
-                    fallback = value;
-                }
-                if value.name_len == 0 { break; }
-            }
-            if fallback.is_null() { return None; }
-
-            let host = unsafe { &*fallback };
-            let host_ptr = unsafe { map.add(host.value_off as usize) as *const u16 };
-            if host.value_len == 0 || host.value_len % 2 != 0 { return None; }
-            let host_hash = unsafe { crypto::hash_wide(host_ptr, host.value_len as u16) };
-            return Some(unsafe { core_impl::find_module(host_hash) })
-                .filter(|p| !p.is_null());
-        }
-        None
-    }
-
-    // Resolve an export by name, following PE forwarded-export strings.
+    // Resolve an export, following PE forwarded-export strings such as
+    // "KERNELBASE.GetEnvironmentVariableA" to the loaded target module.
     unsafe fn resolve_export(image: *mut u8, name: &str, depth: u32) -> Option<*mut u8> {
         if image.is_null() || depth >= 8 {
             return None;
@@ -171,7 +105,7 @@ mod win {
         let addr = unsafe { get_export(image, name)? };
 
         let addr_rva = (addr as usize).wrapping_sub(image as usize);
-        if exp_rva == 0 || exp_size == 0 || addr_rva < exp_rva || addr_rva >= exp_rva + exp_size {
+        if addr_rva < exp_rva || addr_rva >= exp_rva.saturating_add(exp_size) {
             return Some(addr);
         }
 
@@ -190,40 +124,34 @@ mod win {
         use crate::syscalls::core_impl;
         use crate::syscalls::crypto;
 
-        let module_name = module.to_ascii_lowercase();
-        let base = if module_name.starts_with("api-") || module_name.starts_with("ext-") {
-            unsafe { find_api_set_module(&module_name) }
+        let module_name = if module.to_ascii_lowercase().ends_with(".dll") {
+            module.to_ascii_lowercase()
         } else {
-            let dll_name = if module_name.ends_with(".dll") {
-                module_name
-            } else {
-                format!("{module_name}.dll")
-            };
-            let p = unsafe { core_impl::find_module(crypto::hash_str(dll_name.as_bytes())) };
-            if p.is_null() { None } else { Some(p) }
+            format!("{module}.dll").to_ascii_lowercase()
         };
-        let base = base?;
+        let module_hash = crypto::hash_str(module_name.as_bytes());
+        let base = unsafe { core_impl::find_module(module_hash) };
+        if base.is_null() {
+            return None;
+        }
+
         unsafe { resolve_export(base, symbol, depth + 1) }
     }
 
-    // Resolve imported functions from modules already present in the process.
+    // Resolve imported functions from the process loader list.
     unsafe fn resolve_import(mod_name: &[u8], fn_name: &[u8]) -> Option<*mut u8> {
         use crate::syscalls::core_impl;
         use crate::syscalls::crypto;
 
-        let module = core::str::from_utf8(mod_name).ok()?.to_ascii_lowercase();
-        let base = if module.starts_with("api-") || module.starts_with("ext-") {
-            unsafe { find_api_set_module(&module) }
-        } else {
-            let p = unsafe { core_impl::find_module(crypto::hash_str(mod_name)) };
-            if p.is_null() { None } else { Some(p) }
-        };
-        let base = base?;
-        let name = core::str::from_utf8(fn_name).ok()?;
-        unsafe { resolve_export(base, name, 0) }
+        let h = crypto::hash_str(mod_name);
+        let base = unsafe { core_impl::find_module(h) };
+        if base.is_null() { return None; }
+
+        unsafe { resolve_export(base, core::str::from_utf8(fn_name).ok()?, 0) }
     }
 
     // Manual PE loader: maps image, applies relocs, resolves imports, sets protections
+    #[allow(unsafe_op_in_unsafe_fn)]
     unsafe fn load_pe(data: &[u8]) -> Option<(*mut u8, usize)> {
         if data.len() < 64 { return None; }
         let dos = unsafe { &*(data.as_ptr() as *const DosHdr) };
@@ -308,8 +236,8 @@ mod win {
                     let thunk = unsafe { *(image.add(thunk_off + k * 8) as *const usize) };
                     if thunk == 0 { break; }
                     let fn_addr = if thunk & (1 << 63) != 0 {
-                        // Ordinal imports are not part of the plugin ABI we support.
-                        return None;
+                        // import by ordinal
+                        None
                     } else {
                         let ibn = unsafe { image.add(thunk & 0x7FFF_FFFF_FFFF_FFFF) } as *const ImportByName;
                         let fn_name_ptr = unsafe { (*ibn).name.as_ptr() };
@@ -318,15 +246,9 @@ mod win {
                         let fn_bytes = unsafe { core::slice::from_raw_parts(fn_name_ptr, fn_len) };
                         unsafe { resolve_import(&mod_name_lc, fn_bytes) }
                     };
-                    let fn_addr = match fn_addr {
-                        Some(p) => p,
-                        None => {
-                            nt_free(image, image_sz);
-                            return None;
-                        }
-                    };
                     unsafe {
-                        *(image.add(iat_off + k * 8) as *mut usize) = fn_addr as usize;
+                        *(image.add(iat_off + k * 8) as *mut usize) =
+                            fn_addr.map(|p| p as usize).unwrap_or(0);
                     }
                     k += 1;
                 }
