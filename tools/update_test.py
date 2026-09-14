@@ -40,19 +40,38 @@ def wait_for_result(conn, timeout=30):
             return line
 
 
-def accept_agent(server, timeout=30):
-    server.settimeout(timeout)
-    conn, _ = server.accept()
-    conn.settimeout(timeout)
-    hello = read_line(conn)
-    data = read_line(conn)
-    if not hello or not hello.startswith("HELLO:FINGERPRINT:"):
-        conn.close()
-        raise RuntimeError(f"unexpected hello: {hello!r}")
-    if not data or not data.startswith("DATA:"):
-        conn.close()
-        raise RuntimeError(f"unexpected data: {data!r}")
-    return conn
+def accept_agent(server, timeout=45, process=None):
+    deadline = time.time() + timeout
+    last_error = "timed out"
+    server.settimeout(min(2.0, max(0.1, timeout)))
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            stdout = Path(process._ztsec_stdout).read_text(errors="replace") if hasattr(process, "_ztsec_stdout") else ""
+            stderr = Path(process._ztsec_stderr).read_text(errors="replace") if hasattr(process, "_ztsec_stderr") else ""
+            raise RuntimeError(f"agent exited with code {process.returncode}; stdout={stdout!r}; stderr={stderr!r}")
+        try:
+            conn, _ = server.accept()
+        except socket.timeout:
+            continue
+        conn.settimeout(10)
+        try:
+            hello = read_line(conn)
+            data = read_line(conn)
+            if not hello or not hello.startswith("HELLO:FINGERPRINT:"):
+                last_error = f"unexpected hello: {hello!r}"
+                continue
+            if not data or not data.startswith("DATA:"):
+                last_error = f"unexpected data: {data!r}"
+                continue
+            return conn
+        except (ConnectionError, OSError) as exc:
+            last_error = f"agent connection failed: {exc}"
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+    raise RuntimeError(last_error)
 
 
 def send_update(conn, filename, payload):
@@ -88,14 +107,18 @@ def main():
             server.listen(4)
             port = server.getsockname()[1]
 
+            stdout_path = root / "old_agent.out"
+            stderr_path = root / "old_agent.err"
             proc = subprocess.Popen(
                 [str(old), "--ip", "127.0.0.1", "--port", str(port)],
                 cwd=str(install),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=stdout_path.open("w", encoding="utf-8"),
+                stderr=stderr_path.open("w", encoding="utf-8"),
             )
+            proc._ztsec_stdout = stdout_path
+            proc._ztsec_stderr = stderr_path
             try:
-                conn = accept_agent(server)
+                conn = accept_agent(server, process=proc)
                 with conn:
                     # Invalid PE uses the real command dispatcher and must be rejected in-place.
                     conn.sendall(b"CMD:UPDATE:rejected.exe:AAECAwQF\n")
