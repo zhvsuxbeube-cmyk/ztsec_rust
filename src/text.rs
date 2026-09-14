@@ -54,5 +54,5 @@ pub const RAM: &str = "$m=Get-CimInstance Win32_OperatingSystem; [math]::Round((
 pub const GPU: &str = "(Get-CimInstance Win32_VideoController | Where-Object {$_.Name} | Select-Object -Expand Name) -join '; '";
 pub const AV: &str = "(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | Where-Object {$_.displayName} | Select-Object -Expand displayName) -join '; '";
 pub const UPTIME: &str = "$os=Get-CimInstance Win32_OperatingSystem; [math]::Round(((Get-Date)-$os.LastBootUpTime).TotalSeconds,0)";
-pub const OS: &str = "$os=Get-CimInstance Win32_OperatingSystem; $cv=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'; \"$($os.Caption) $($cv.DisplayVersion)\"";
+pub const OS: &str = r#"$os=Get-CimInstance Win32_OperatingSystem; $cv=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'; "$($os.Caption) $($cv.DisplayVersion)""#;
 pub const PRIV: &str = "if(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){'Administrator'}else{'User'}";

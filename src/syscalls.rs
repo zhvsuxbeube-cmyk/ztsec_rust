@@ -357,7 +357,7 @@ mod windows_impl {
             if base.is_null() {
                 return false;
             }
-            let (sec_base, count) = unsafe { section_base(base) };
+            let (sec_base, count) = section_base(base);
             for i in 0..count as usize {
                 let sec = unsafe { &*sec_base.add(i) };
                 if u32::from_le_bytes(sec.name[..4].try_into().unwrap()) == 0x7865742E {
@@ -377,7 +377,7 @@ mod windows_impl {
             if base.is_null() {
                 return core::ptr::null_mut();
             }
-            let (sec_base, count) = unsafe { section_base(base) };
+            let (sec_base, count) = section_base(base);
             for i in 0..count as usize {
                 let sec = unsafe { &*sec_base.add(i) };
                 if u32::from_le_bytes(sec.name[..4].try_into().unwrap()) == 0x7865742E {
@@ -445,7 +445,7 @@ mod windows_impl {
             if base.is_null() {
                 return core::ptr::null_mut();
             }
-            let (sec_base, count) = unsafe { section_base(base) };
+            let (sec_base, count) = section_base(base);
             for i in 0..count as usize {
                 let sec = unsafe { &*sec_base.add(i) };
                 if u32::from_le_bytes(sec.name[..4].try_into().unwrap()) == 0x7865742E {
@@ -678,7 +678,7 @@ mod windows_impl {
     //   r9d  = reg    (u32 — which callee-saved reg holds the site ptr)
     //   [rsp+0x28] = args (*mut usize, flat array of up to 12 NT args)
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn do_syscall_invoke(
             ssn: u32,
             site: *mut u8,
