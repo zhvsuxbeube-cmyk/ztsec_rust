@@ -62,40 +62,8 @@ jobs:
         shell: pwsh
         run: |
           $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
-          $script = "Write-Output 'ztsec_execute_ok'"
-          $scriptPath = Join-Path $PWD 'dist\test_exec.ps1'
-          Set-Content -Path $scriptPath -Value $script -Encoding UTF8
-          $testPanel = @'
-import base64, socket, os, sys
-def read_line(s):
-    b = bytearray()
-    while True:
-        c = s.recv(1)
-        if not c or c == b"\n":
-            return bytes(b).decode(errors="replace").rstrip("\r")
-        b.extend(c)
-with socket.create_server(("127.0.0.1", 4795)) as srv:
-    conn, _ = srv.accept()
-    with conn:
-        read_line(conn); read_line(conn)
-        with open(sys.argv[1], "rb") as f: data = f.read()
-        b64 = base64.b64encode(data).decode()
-        conn.sendall(f"CMD:EXECUTE:ps1:{b64}\n".encode())
-        while True:
-            line = read_line(conn)
-            if not line: sys.exit(1)
-            if line == "HB": conn.sendall(b"PONG\n"); continue
-            if line.startswith("ACK:EXECUTE:"): break
-            if line.startswith("ERR:"): sys.exit(1)
-        conn.sendall(b"CMD:CLOSE\n")
-        while True:
-            line = read_line(conn)
-            if not line: break
-            if line == "HB": conn.sendall(b"PONG\n"); continue
-            if line.startswith("ACK:CLOSE"): break
-'@
-          $testPanel | Out-File -Encoding utf8 dist\exec_panel.py
-          $panel = Start-Process python -ArgumentList "dist\exec_panel.py","$scriptPath" -NoNewWindow -PassThru -RedirectStandardOutput 'exec_panel.out' -RedirectStandardError 'exec_panel.err'
+          Set-Content -Path 'dist\test_exec.ps1' -Value "Write-Output 'ztsec_execute_ok'" -Encoding UTF8
+          $panel = Start-Process python -ArgumentList 'tools\exec_test.py','4795',"$PWD\dist\test_exec.ps1" -NoNewWindow -PassThru -RedirectStandardOutput 'exec_panel.out' -RedirectStandardError 'exec_panel.err'
           Start-Sleep -Seconds 2
           $env:ZTSEC_CI = '1'
           $agent = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4795' -NoNewWindow -PassThru -RedirectStandardOutput 'exec_agent.out' -RedirectStandardError 'exec_agent.err'
