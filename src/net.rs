@@ -2,7 +2,7 @@ use std::{
     io::{BufRead, BufReader, ErrorKind, Write},
     net::TcpStream,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{plugin::Manager, sys, telemetry, text};
@@ -13,11 +13,12 @@ pub fn run(ip: &str, port: u16) {
     let mut plugins = Manager::new();
 
     loop {
+        let started = Instant::now();
         match TcpStream::connect((ip, port)) {
             Ok(mut stream) => {
-                let ping = telemetry::ping(ip);
+                let ping = started.elapsed().as_millis();
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(text::READ)));
-                let data = telemetry::record(ip, ping, &fp);
+                let data = telemetry::record(ip, Some(ping), &fp);
 
                 if send(&mut stream, &format!("{}{}", text::HELLO, fp)).is_ok()
                     && send(&mut stream, &format!("{}{}", text::DATA, data)).is_ok()

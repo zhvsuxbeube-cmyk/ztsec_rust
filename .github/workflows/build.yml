@@ -26,8 +26,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          # cl /nologo /LD /EHs-c- /GR- /GS- /Zl /std:c++17 hello.cpp /link /NOENTRY /NODEFAULTLIB /OUT:hello.dll kernel32.lib user32.lib
-          cl /nologo /LD /EHs-c- /GR- /GS- /Zl /std:c++17 plugin\hello.cpp /link /NOENTRY /NODEFAULTLIB /OUT:dist\hello.dll kernel32.lib user32.lib
+          # cl /nologo /LD /EHsc hello.cpp /link /OUT:hello.dll user32.lib
+          cl /nologo /LD /EHsc /std:c++17 plugin\hello.cpp /link /OUT:dist\hello.dll user32.lib
           if ($LASTEXITCODE -ne 0) { throw 'plugin build failed' }
           dumpbin /exports dist\hello.dll | Out-File dist\exports.txt
           $exports = Get-Content dist\exports.txt -Raw
