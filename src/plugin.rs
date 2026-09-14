@@ -91,16 +91,63 @@ mod win {
         None
     }
 
-    // Resolve kernel32 GetProcAddress via PEB for imports
+    // Resolve an export, following PE forwarded-export strings such as
+    // "KERNELBASE.GetEnvironmentVariableA" to the loaded target module.
+    unsafe fn resolve_export(image: *mut u8, name: &str, depth: u32) -> Option<*mut u8> {
+        if image.is_null() || depth >= 8 {
+            return None;
+        }
+
+        let dos = unsafe { &*(image as *const DosHdr) };
+        let nt  = unsafe { &*(image.add(dos.e_lfanew as usize) as *const NtHdrs64) };
+        let exp_rva = nt.opt.dirs[0].va as usize;
+        let exp_size = nt.opt.dirs[0].size as usize;
+        let addr = unsafe { get_export(image, name)? };
+
+        let addr_rva = (addr as usize).wrapping_sub(image as usize);
+        if addr_rva < exp_rva || addr_rva >= exp_rva.saturating_add(exp_size) {
+            return Some(addr);
+        }
+
+        let mut len = 0usize;
+        while len < exp_size && unsafe { *addr.add(len) } != 0 {
+            len += 1;
+        }
+        if len == exp_size {
+            return None;
+        }
+
+        let forwarder = unsafe { core::slice::from_raw_parts(addr, len) };
+        let forwarder = core::str::from_utf8(forwarder).ok()?;
+        let (module, symbol) = forwarder.split_once('.')?;
+
+        use crate::syscalls::core_impl;
+        use crate::syscalls::crypto;
+
+        let module_name = if module.to_ascii_lowercase().ends_with(".dll") {
+            module.to_ascii_lowercase()
+        } else {
+            format!("{module}.dll").to_ascii_lowercase()
+        };
+        let module_hash = crypto::hash_str(module_name.as_bytes());
+        let base = unsafe { core_impl::find_module(module_hash) };
+        if base.is_null() {
+            return None;
+        }
+
+        unsafe { resolve_export(base, symbol, depth + 1) }
+    }
+
+    // Resolve imported functions from the process loader list.
     unsafe fn resolve_import(mod_name: &[u8], fn_name: &[u8]) -> Option<*mut u8> {
         use crate::syscalls::core_impl;
         use crate::syscalls::crypto;
 
-        // Hash the module name (lowercase)
         let h = crypto::hash_str(mod_name);
         let base = unsafe { core_impl::find_module(h) };
         if base.is_null() { return None; }
-        unsafe { get_export(base, core::str::from_utf8(fn_name).ok()?) }
+
+        unsafe { resolve_export(base, core::str::from_utf8(fn_name).ok()?, 0) }
     }
 
     // Manual PE loader: maps image, applies relocs, resolves imports, sets protections
@@ -260,9 +307,9 @@ mod win {
                 load_pe(data).ok_or_else(|| text::PLUG_ERR_LOAD.to_owned())?
             };
 
-            let on_load   = unsafe { get_export(image, "PluginOnLoad") };
-            let on_event  = unsafe { get_export(image, "PluginOnEvent") };
-            let on_unload = unsafe { get_export(image, "PluginOnUnload") };
+            let on_load   = unsafe { resolve_export(image, "PluginOnLoad", 0) };
+            let on_event  = unsafe { resolve_export(image, "PluginOnEvent", 0) };
+            let on_unload = unsafe { resolve_export(image, "PluginOnUnload", 0) };
             let (Some(on_load), Some(on_event), Some(on_unload)) =
                 (on_load, on_event, on_unload)
             else {
