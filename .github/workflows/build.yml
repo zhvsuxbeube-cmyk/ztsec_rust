@@ -18,39 +18,46 @@ jobs:
         run: cargo test
       - name: Build
         run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Plugin
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          # cl /nologo /LD /EHsc hello.cpp /link /OUT:hello.dll user32.lib
+          cl /nologo /LD /EHsc plugin\hello.cpp /link /OUT:dist\hello.dll user32.lib
+          if ($LASTEXITCODE -ne 0) { throw 'plugin build failed' }
+          dumpbin /exports dist\hello.dll | Out-File dist\exports.txt
+          $exports = Get-Content dist\exports.txt -Raw
+          foreach ($name in 'PluginOnLoad','PluginOnEvent','PluginOnUnload') {
+            if ($exports -notmatch $name) { throw "missing export: $name" }
+          }
       - name: Spy
         shell: pwsh
         run: |
           $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
-          $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 4794)
-          $listener.Start()
-          $first = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4794' -NoNewWindow -PassThru -RedirectStandardOutput 'agent.out' -RedirectStandardError 'agent.err'
-          $client = $listener.AcceptTcpClient()
-          $second = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4794' -NoNewWindow -PassThru
-          if (-not $second.WaitForExit(3000)) { Stop-Process $second.Id -Force; throw 'mutex' }
-          if ($second.ExitCode -ne 0) { throw "mutex exit $($second.ExitCode)" }
-          $stream = $client.GetStream()
-          $reader = [System.IO.StreamReader]::new($stream)
-          $writer = [System.IO.StreamWriter]::new($stream)
-          $writer.AutoFlush = $true
-          $hello = $reader.ReadLine()
-          $data = $reader.ReadLine()
-          if (-not $hello.StartsWith('HELLO:FINGERPRINT:')) { throw 'handshake' }
-          if ($data.Split('|').Count -ne 16) { throw 'telemetry' }
-          $writer.WriteLine('CMD:CLOSE')
-          if ($reader.ReadLine() -ne 'ACK:CLOSE') { throw 'ack' }
-          if (-not $first.WaitForExit(5000)) { Stop-Process $first.Id -Force; throw 'exit' }
-          $listener.Stop()
-          Write-Host '--- stdout ---'
+          $panel = Start-Process python -ArgumentList 'tools\panel.py','--port','4794','--test',"$PWD\dist\hello.dll" -NoNewWindow -PassThru -RedirectStandardOutput 'panel.out' -RedirectStandardError 'panel.err'
+          $env:ZTSEC_CI = '1'
+          $agent = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4794' -NoNewWindow -PassThru -RedirectStandardOutput 'agent.out' -RedirectStandardError 'agent.err'
+          if (-not $panel.WaitForExit(30000)) { Stop-Process $panel.Id -Force; Stop-Process $agent.Id -Force; throw 'panel timeout' }
+          if ($agent.HasExited -eq $false) { Stop-Process $agent.Id -Force }
+          $p = Get-Content panel.out -Raw
+          if ($p -notmatch 'ACK:PLUGIN:hello') { throw 'plugin ack' }
+          if ($p -notmatch 'ACK:PLUGIN_EVENT:ping') { throw 'event ack' }
+          if ($p -notmatch 'ACK:PLUGIN_OUT:hello') { throw 'unload ack' }
+          if ($p -notmatch 'ACK:CLOSE') { throw 'close ack' }
+          Write-Host '--- panel ---'
+          Get-Content panel.out
+          Write-Host '--- panel err ---'
+          Get-Content panel.err
+          Write-Host '--- agent ---'
           Get-Content agent.out
-          Write-Host '--- stderr ---'
           Get-Content agent.err
+          $a = Get-Content agent.out -Raw
+          if ($a -notmatch 'plugin event: event ping') { throw 'plugin callback' }
       - name: Archive
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target\x86_64-pc-windows-msvc\release\ztsec_agent.exe dist\ztsec_agent.exe
-          Compress-Archive -Path dist\* -DestinationPath ztsec_agent-win64.zip -Force
+          Compress-Archive -Path dist\ztsec_agent.exe,dist\hello.dll,dist\exports.txt -DestinationPath ztsec_agent-win64.zip -Force
       - uses: actions/upload-artifact@v4
         with:
           name: ztsec_agent-win64

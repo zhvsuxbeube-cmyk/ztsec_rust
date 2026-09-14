@@ -19,6 +19,9 @@ pub const REQ: &str = "REQ:DATA";
 pub const CMD: &str = "CMD:";
 pub const ACK: &str = "ACK:";
 pub const ERR: &str = "ERR:";
+pub const PLUGIN: &str = "PLUGIN:";
+pub const PLUGOUT: &str = "PLUGIN_OUT:";
+pub const PEVENT: &str = "PLUGIN_EVENT:";
 
 pub const SLEEP: &str = "SLEEP";
 pub const HIBERNATE: &str = "HIBERNATE";
@@ -31,6 +34,12 @@ pub const CONNECTED: &str = "connected";
 pub const RETRYING: &str = "retrying in 5s";
 pub const CLOSED: &str = "closed";
 pub const FAILED: &str = "failed";
+pub const PLUG_ERR_FILE: &str = "plugin not found";
+pub const PLUG_ERR_DLL: &str = "plugin must be a dll";
+pub const PLUG_ERR_NAME: &str = "invalid plugin name";
+pub const PLUG_ERR_LOAD: &str = "plugin load failed";
+pub const PLUG_ERR_ENTRY: &str = "plugin entrypoints missing";
+pub const PLUG_ERR_INIT: &str = "plugin init failed";
 
 pub const MUTEX: &str = r"\BaseNamedObjects\ZTSecurity.ztsec_agent";
 pub const REG: &str = "reg";
@@ -45,4 +54,5 @@ pub const RAM: &str = "$m=Get-CimInstance Win32_OperatingSystem; [math]::Round((
 pub const GPU: &str = "(Get-CimInstance Win32_VideoController | Where-Object {$_.Name} | Select-Object -Expand Name) -join '; '";
 pub const AV: &str = "(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct | Where-Object {$_.displayName} | Select-Object -Expand displayName) -join '; '";
 pub const UPTIME: &str = "$os=Get-CimInstance Win32_OperatingSystem; [math]::Round(((Get-Date)-$os.LastBootUpTime).TotalSeconds,0)";
+pub const OS: &str = "$os=Get-CimInstance Win32_OperatingSystem; $cv=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'; \"$($os.Caption) $($cv.DisplayVersion)\"";
 pub const PRIV: &str = "if(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){'Administrator'}else{'User'}";

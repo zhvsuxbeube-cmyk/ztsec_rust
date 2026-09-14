@@ -16,4 +16,7 @@ fn contract() {
     assert!(source.contains("4793"));
     assert!(source.contains("HELLO:FINGERPRINT:"));
     assert!(source.contains("DATA:"));
+    assert!(source.contains("PLUGIN:"));
+    assert!(source.contains("PLUGIN_EVENT:"));
+    assert!(source.contains("PLUGIN_OUT:"));
 }

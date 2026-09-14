@@ -3,6 +3,10 @@ name = "ztsec_agent"
 version = "1.0.0"
 edition = "2024"
 
+[[bin]]
+name = "ztsec_agent"
+path = "src/main.rs"
+
 [dependencies]
 ed25519-dalek = "=2.1.1"
 hkdf = "=0.12.4"

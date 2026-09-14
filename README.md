@@ -1,15 +1,33 @@
 # ztsec_agent
 
-Windows CLI agent for ZTSecurity.
+Windows CLI agent with a small C ABI plugin host.
+
+## Build
+
+```text
+cargo test
+cargo build --release --target x86_64-pc-windows-msvc
+```
 
 ## Run
 
-`ztsec_agent.exe`
+```text
+ztsec_agent.exe
+ztsec_agent.exe --ip 127.0.0.1 --port 4793
+```
 
-`ztsec_agent.exe --ip 192.168.1.10 --port 4793`
+## Plugin
 
-Default: `127.0.0.1:4793`.
+Plugins export `PluginOnLoad`, `PluginOnEvent`, and `PluginOnUnload` from a DLL.
 
-Commands: sleep, hibernate, restart, shutdown, reconnect, close.
+The sample is `plugin/hello.cpp`.
 
-One running instance is allowed.
+The test panel is:
+
+```text
+python tools/panel.py --port 4793
+```
+
+At `>` enter the full DLL path.
+
+CI builds the sample DLL, checks its exports, loads it through the agent, verifies the plugin ACK, and closes the session.
