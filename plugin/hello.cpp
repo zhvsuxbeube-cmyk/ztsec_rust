@@ -1,21 +1,33 @@
-// cl /nologo /LD /EHsc hello.cpp /link /OUT:hello.dll user32.lib
+// cl /nologo /LD /EHsc /std:c++17 hello.cpp /link /OUT:hello.dll user32.lib
 #include "ztsec_plugin.h"
-#include <cstdlib>
-#include <string_view>
 #include <windows.h>
 
 static zt_emit send_evt = nullptr;
+
+// Inline helper: find needle in [hay, hay+hay_len). No CRT dependency.
+static bool contains(const char *hay, uint32_t hay_len, const char *needle) {
+    uint32_t n = 0;
+    while (needle[n]) ++n;
+    if (n == 0 || n > hay_len) return n == 0;
+    for (uint32_t i = 0; i <= hay_len - n; ++i) {
+        bool ok = true;
+        for (uint32_t j = 0; j < n && ok; ++j)
+            ok = (hay[i + j] == needle[j]);
+        if (ok) return true;
+    }
+    return false;
+}
 
 ZT_API int32_t ZT_CALL PluginOnLoad(const uint8_t *host, uint32_t host_len, zt_emit emit) {
     send_evt = emit;
     if (!host || !host_len) return 1;
     const char *h = reinterpret_cast<const char *>(host);
-    const std::string_view v(h, host_len);
-    if (v.find("clientId") == std::string_view::npos ||
-        v.find("os") == std::string_view::npos ||
-        v.find("arch") == std::string_view::npos ||
-        v.find("version") == std::string_view::npos) return 1;
-    if (!std::getenv("ZTSEC_CI")) {
+    if (!contains(h, host_len, "clientId") ||
+        !contains(h, host_len, "os") ||
+        !contains(h, host_len, "arch") ||
+        !contains(h, host_len, "version")) return 1;
+    char ci[2] = {};
+    if (!GetEnvironmentVariableA("ZTSEC_CI", ci, sizeof(ci))) {
         MessageBoxA(nullptr, "Hello from ztsec agent", "ztsec plugin", MB_OK | MB_ICONINFORMATION);
     }
     if (send_evt) {

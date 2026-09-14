@@ -39,6 +39,7 @@ jobs:
         run: |
           $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
           $panel = Start-Process python -ArgumentList 'tools\panel.py','--port','4794','--test',"$PWD\dist\hello.dll" -NoNewWindow -PassThru -RedirectStandardOutput 'panel.out' -RedirectStandardError 'panel.err'
+          Start-Sleep -Seconds 2
           $env:ZTSEC_CI = '1'
           $agent = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4794' -NoNewWindow -PassThru -RedirectStandardOutput 'agent.out' -RedirectStandardError 'agent.err'
           if (-not $panel.WaitForExit(30000)) { Stop-Process $panel.Id -Force; Stop-Process $agent.Id -Force; throw 'panel timeout' }
