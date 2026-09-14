@@ -587,7 +587,7 @@ mod windows_impl {
             }
             let parent_handle = self.parent_handle;
             self.parent_handle = 0;
-            let old_path = self.old_path;
+            let old_path = self.old_path.clone();
             thread::spawn(move || unsafe {
                 let handle = parent_handle as Handle;
                 let _ = WaitForSingleObject(handle, INFINITE);

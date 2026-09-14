@@ -248,4 +248,4 @@ mod win {
     pub fn command(_: &str) -> bool { false }
 }
 
-pub use win::{acquire_successor_mutex, acquire_update_gate, command, release_single, release_update_gate, single, update_gate_held};
+pub use win::{acquire_successor_mutex, acquire_update_gate, command, release_single, release_update_gate, single};
