@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::CString};
+use std::collections::HashMap;
 
 #[cfg(windows)]
 mod win {
@@ -67,25 +67,25 @@ mod win {
 
     // resolve an export by ASCII name from an already-mapped image
     unsafe fn get_export(image: *mut u8, name: &str) -> Option<*mut u8> {
-        let dos = &*(image as *const DosHdr);
-        let nt  = &*(image.add(dos.e_lfanew as usize) as *const NtHdrs64);
+        let dos = unsafe { &*(image as *const DosHdr) };
+        let nt  = unsafe { &*(image.add(dos.e_lfanew as usize) as *const NtHdrs64) };
         let exp_rva = nt.opt.dirs[0].va as usize;
         if exp_rva == 0 { return None; }
-        let exp = &*(image.add(exp_rva) as *const ExpDir);
-        let fns   = image.add(exp.fn_off as usize) as *const u32;
-        let names = image.add(exp.name_off as usize) as *const u32;
-        let ords  = image.add(exp.ord_off as usize) as *const u16;
+        let exp = unsafe { &*(image.add(exp_rva) as *const ExpDir) };
+        let fns   = unsafe { image.add(exp.fn_off as usize) } as *const u32;
+        let names = unsafe { image.add(exp.name_off as usize) } as *const u32;
+        let ords  = unsafe { image.add(exp.ord_off as usize) } as *const u16;
         let want  = name.as_bytes();
         for i in 0..exp.n_names as usize {
-            let nptr = image.add(*names.add(i) as usize);
+            let nptr = unsafe { image.add(*names.add(i) as usize) };
             let mut ok = true;
             for (j, &b) in want.iter().enumerate() {
-                if *nptr.add(j) != b { ok = false; break; }
+                if unsafe { *nptr.add(j) } != b { ok = false; break; }
             }
-            if ok && *nptr.add(want.len()) == 0 {
-                let ord = *ords.add(i) as usize;
-                let rva = *fns.add(ord) as usize;
-                return Some(image.add(rva));
+            if ok && unsafe { *nptr.add(want.len()) } == 0 {
+                let ord = unsafe { *ords.add(i) } as usize;
+                let rva = unsafe { *fns.add(ord) } as usize;
+                return Some(unsafe { image.add(rva) });
             }
         }
         None
@@ -98,43 +98,45 @@ mod win {
 
         // Hash the module name (lowercase)
         let h = crypto::hash_str(mod_name);
-        let base = core_impl::find_module(h);
+        let base = unsafe { core_impl::find_module(h) };
         if base.is_null() { return None; }
-        get_export(base, core::str::from_utf8(fn_name).ok()?)
+        unsafe { get_export(base, core::str::from_utf8(fn_name).ok()?) }
     }
 
     // Manual PE loader: maps image, applies relocs, resolves imports, sets protections
     unsafe fn load_pe(data: &[u8]) -> Option<(*mut u8, usize)> {
         if data.len() < 64 { return None; }
-        let dos = &*(data.as_ptr() as *const DosHdr);
+        let dos = unsafe { &*(data.as_ptr() as *const DosHdr) };
         if dos.e_magic != 0x5A4D { return None; }
         let nt_off = dos.e_lfanew as usize;
         if nt_off + core::mem::size_of::<NtHdrs64>() > data.len() { return None; }
-        let nt = &*(data.as_ptr().add(nt_off) as *const NtHdrs64);
+        let nt = unsafe { &*(data.as_ptr().add(nt_off) as *const NtHdrs64) };
         if nt.sig != 0x0004550 || nt.opt.magic != 0x020B { return None; }
 
         let image_sz = nt.opt.image_sz as usize;
         let hdr_sz   = nt.opt.hdr_sz as usize;
-        let image = nt_alloc(image_sz, PAGE_RW);
+        let image = unsafe { nt_alloc(image_sz, PAGE_RW) };
         if image.is_null() { return None; }
 
         // Copy headers
-        core::ptr::copy_nonoverlapping(data.as_ptr(), image, hdr_sz.min(data.len()));
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), image, hdr_sz.min(data.len())) };
 
         // Copy sections
-        let sec_base = (data.as_ptr().add(nt_off)
-            .add(core::mem::size_of::<u32>())
-            .add(core::mem::size_of::<FileHdr>())
-            .add(nt.file.opt_sz as usize)) as *const SecHdr;
+        let sec_base = unsafe {
+            data.as_ptr().add(nt_off)
+                .add(core::mem::size_of::<u32>())
+                .add(core::mem::size_of::<FileHdr>())
+                .add(nt.file.opt_sz as usize)
+        } as *const SecHdr;
         let n_sec = nt.file.sections as usize;
         for i in 0..n_sec {
-            let s = &*sec_base.add(i);
+            let s = unsafe { &*sec_base.add(i) };
             if s.raw_sz == 0 { continue; }
             let src = s.raw_off as usize;
             let dst = s.va as usize;
             let sz  = s.raw_sz as usize;
             if src + sz > data.len() || dst + sz > image_sz { continue; }
-            core::ptr::copy_nonoverlapping(data.as_ptr().add(src), image.add(dst), sz);
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr().add(src), image.add(dst), sz) };
         }
 
         // Apply base relocations
@@ -147,18 +149,18 @@ mod win {
                 let mut off = reloc_dir.va as usize;
                 let end = off + reloc_dir.size as usize;
                 while off < end {
-                    let blk = &*(image.add(off) as *const BaseReloc);
+                    let blk = unsafe { &*(image.add(off) as *const BaseReloc) };
                     if blk.sz < 8 { break; }
                     let page_va = blk.va as usize;
                     let n_ent   = (blk.sz as usize - 8) / 2;
-                    let entries = image.add(off + 8) as *const u16;
+                    let entries = unsafe { image.add(off + 8) } as *const u16;
                     for j in 0..n_ent {
-                        let e = *entries.add(j);
+                        let e = unsafe { *entries.add(j) };
                         let typ = (e >> 12) as u32;
                         let o   = (e & 0x0FFF) as usize;
                         if typ == 10 { // IMAGE_REL_BASED_DIR64
-                            let ptr = image.add(page_va + o) as *mut isize;
-                            *ptr = (*ptr).wrapping_add(delta);
+                            let ptr = unsafe { image.add(page_va + o) } as *mut isize;
+                            unsafe { *ptr = (*ptr).wrapping_add(delta) };
                         }
                     }
                     off += blk.sz as usize;
@@ -171,33 +173,35 @@ mod win {
         if imp_dir.size > 0 {
             let mut imp_off = imp_dir.va as usize;
             loop {
-                let desc = &*(image.add(imp_off) as *const ImportDesc);
+                let desc = unsafe { &*(image.add(imp_off) as *const ImportDesc) };
                 if desc.name == 0 { break; }
-                let mod_name_ptr = image.add(desc.name as usize);
+                let mod_name_ptr = unsafe { image.add(desc.name as usize) };
                 let mut mod_len = 0usize;
-                while *mod_name_ptr.add(mod_len) != 0 { mod_len += 1; }
-                let mod_name_lc: Vec<u8> = core::slice::from_raw_parts(mod_name_ptr, mod_len)
+                while unsafe { *mod_name_ptr.add(mod_len) } != 0 { mod_len += 1; }
+                let mod_name_lc: Vec<u8> = unsafe { core::slice::from_raw_parts(mod_name_ptr, mod_len) }
                     .iter().map(|b| b.to_ascii_lowercase()).collect();
 
                 let thunk_off = if desc.orig_thunk != 0 { desc.orig_thunk } else { desc.thunk } as usize;
                 let iat_off   = desc.thunk as usize;
                 let mut k = 0usize;
                 loop {
-                    let thunk = *(image.add(thunk_off + k * 8) as *const usize);
+                    let thunk = unsafe { *(image.add(thunk_off + k * 8) as *const usize) };
                     if thunk == 0 { break; }
                     let fn_addr = if thunk & (1 << 63) != 0 {
                         // import by ordinal
                         None
                     } else {
-                        let ibn = image.add(thunk & 0x7FFF_FFFF_FFFF_FFFF) as *const ImportByName;
-                        let fn_name_ptr = (*ibn).name.as_ptr();
+                        let ibn = unsafe { image.add(thunk & 0x7FFF_FFFF_FFFF_FFFF) } as *const ImportByName;
+                        let fn_name_ptr = unsafe { (*ibn).name.as_ptr() };
                         let mut fn_len = 0usize;
-                        while *fn_name_ptr.add(fn_len) != 0 { fn_len += 1; }
-                        let fn_bytes = core::slice::from_raw_parts(fn_name_ptr, fn_len);
-                        resolve_import(&mod_name_lc, fn_bytes)
+                        while unsafe { *fn_name_ptr.add(fn_len) } != 0 { fn_len += 1; }
+                        let fn_bytes = unsafe { core::slice::from_raw_parts(fn_name_ptr, fn_len) };
+                        unsafe { resolve_import(&mod_name_lc, fn_bytes) }
                     };
-                    *(image.add(iat_off + k * 8) as *mut usize) =
-                        fn_addr.map(|p| p as usize).unwrap_or(0);
+                    unsafe {
+                        *(image.add(iat_off + k * 8) as *mut usize) =
+                            fn_addr.map(|p| p as usize).unwrap_or(0);
+                    }
                     k += 1;
                 }
                 imp_off += core::mem::size_of::<ImportDesc>();
@@ -206,7 +210,7 @@ mod win {
 
         // Set section protections
         for i in 0..n_sec {
-            let s = &*sec_base.add(i);
+            let s = unsafe { &*sec_base.add(i) };
             if s.raw_sz == 0 { continue; }
             let exec  = s.chars & 0x20 != 0;
             let write = s.chars & 0x80 != 0;
@@ -216,7 +220,7 @@ mod win {
                 (false, true)  => PAGE_RW,
                 _              => 0x02, // PAGE_READONLY
             };
-            let _ = nt_protect(image.add(s.va as usize), s.vsize as usize, prot);
+            let _ = unsafe { nt_protect(image.add(s.va as usize), s.vsize as usize, prot) };
         }
 
         Some((image, image_sz))

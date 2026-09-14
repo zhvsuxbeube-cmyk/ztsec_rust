@@ -60,7 +60,7 @@ pub mod crypto {
         let p: u32 = OBF_PRIME ^ SEED;
         let mut i = 0isize;
         loop {
-            let b = *ptr.offset(i);
+            let b = unsafe { *ptr.offset(i) };
             if b == 0 {
                 break;
             }
@@ -84,7 +84,7 @@ pub mod crypto {
         let p: u32 = OBF_PRIME ^ SEED;
         let char_count = (byte_len / 2) as usize;
         for i in 0..char_count {
-            let mut c = *buf.add(i);
+            let mut c = unsafe { *buf.add(i) };
             if c >= b'A' as u16 && c <= b'Z' as u16 {
                 c += 32;
             }
@@ -284,7 +284,7 @@ mod windows_impl {
 
     pub mod core_impl {
         use super::*;
-        use crate::crypto;
+        use super::crypto;
 
         /// Read PEB address from GS:[0x60].
         ///
@@ -295,11 +295,13 @@ mod windows_impl {
         #[inline(always)]
         pub unsafe fn get_peb() -> *mut u8 {
             let peb: usize;
-            core::arch::asm!(
-                "mov {}, gs:[0x60]",
-                out(reg) peb,
-                options(nostack, preserves_flags, pure, readonly),
-            );
+            unsafe {
+                core::arch::asm!(
+                    "mov {}, gs:[0x60]",
+                    out(reg) peb,
+                    options(nostack, preserves_flags, pure, readonly),
+                );
+            }
             peb as *mut u8
         }
 
@@ -323,24 +325,24 @@ mod windows_impl {
         /// The current process PEB and loader structures must be valid and
         /// readable, as supplied by the Windows x86-64 process environment.
         pub unsafe fn find_module(module_hash: u32) -> *mut u8 {
-            let peb = get_peb();
+            let peb = unsafe { get_peb() };
             if peb.is_null() {
                 return core::ptr::null_mut();
             }
-            let ldr = *(peb.add(0x18) as *const *mut u8);
-            let head = ldr.add(0x20) as *mut ListEntry;
-            let mut current = (*head).flink;
+            let ldr = unsafe { *(peb.add(0x18) as *const *mut u8) };
+            let head = unsafe { ldr.add(0x20) } as *mut ListEntry;
+            let mut current = unsafe { (*head).flink };
 
             while current != head {
-                let dll_base = *(current.cast::<u8>().add(0x20) as *const *mut u8);
+                let dll_base = unsafe { *(current.cast::<u8>().add(0x20) as *const *mut u8) };
                 if !dll_base.is_null() {
-                    let name = current.cast::<u8>().add(0x48) as *const UnicodeString;
-                    let len = (*name).length;
-                    if len > 0 && crypto::hash_wide((*name).buffer, len) == module_hash {
+                    let name = unsafe { current.cast::<u8>().add(0x48) } as *const UnicodeString;
+                    let len = unsafe { (*name).length };
+                    if len > 0 && unsafe { crypto::hash_wide((*name).buffer, len) } == module_hash {
                         return dll_base;
                     }
                 }
-                current = (*current).flink;
+                current = unsafe { (*current).flink };
             }
             core::ptr::null_mut()
         }
@@ -355,9 +357,9 @@ mod windows_impl {
             if base.is_null() {
                 return false;
             }
-            let (sec_base, count) = section_base(base);
+            let (sec_base, count) = unsafe { section_base(base) };
             for i in 0..count as usize {
-                let sec = &*sec_base.add(i);
+                let sec = unsafe { &*sec_base.add(i) };
                 if u32::from_le_bytes(sec.name[..4].try_into().unwrap()) == 0x7865742E {
                     return (sec.characteristics & 0x8000_0000) != 0;
                 }
@@ -375,26 +377,26 @@ mod windows_impl {
             if base.is_null() {
                 return core::ptr::null_mut();
             }
-            let (sec_base, count) = section_base(base);
+            let (sec_base, count) = unsafe { section_base(base) };
             for i in 0..count as usize {
-                let sec = &*sec_base.add(i);
+                let sec = unsafe { &*sec_base.add(i) };
                 if u32::from_le_bytes(sec.name[..4].try_into().unwrap()) == 0x7865742E {
-                    let text = base.add(sec.virtual_address as usize);
+                    let text = unsafe { base.add(sec.virtual_address as usize) };
                     let size = sec.virtual_size as usize;
                     if size < 16 {
                         return core::ptr::null_mut();
                     }
                     let mut j = 0usize;
                     while j + 16 <= size {
-                        if *text.add(j) == 0x0F && *text.add(j + 1) == 0x05 {
+                        if unsafe { *text.add(j) } == 0x0F && unsafe { *text.add(j + 1) } == 0x05 {
                             let mut k = 2usize;
                             while k < 8 {
-                                let op = *text.add(j + k);
+                                let op = unsafe { *text.add(j + k) };
                                 if op == 0xC3 || op == 0xC2 {
-                                    return text.add(j);
+                                    return unsafe { text.add(j) };
                                 }
                                 if op == 0x58 || op == 0x59 || op == 0x5A || op == 0x5B
-                                    || (op == 0x83 && k + 1 < 8 && *text.add(j + k + 1) == 0xC4)
+                                    || (op == 0x83 && k + 1 < 8 && unsafe { *text.add(j + k + 1) } == 0xC4)
                                 {
                                     break;
                                 }
@@ -420,9 +422,9 @@ mod windows_impl {
         /// memory so the 64-byte scan can safely inspect each 3-byte candidate.
         pub unsafe fn find_local_gadget(func_addr: *mut u8) -> *mut u8 {
             for i in 0..64usize {
-                let p = func_addr.add(i);
-                if *p == 0x0F && *p.add(1) == 0x05 {
-                    let next = *p.add(2);
+                let p = unsafe { func_addr.add(i) };
+                if unsafe { *p } == 0x0F && unsafe { *p.add(1) } == 0x05 {
+                    let next = unsafe { *p.add(2) };
                     if next == 0xC3 || next == 0xC2 {
                         return p;
                     }
@@ -443,11 +445,11 @@ mod windows_impl {
             if base.is_null() {
                 return core::ptr::null_mut();
             }
-            let (sec_base, count) = section_base(base);
+            let (sec_base, count) = unsafe { section_base(base) };
             for i in 0..count as usize {
-                let sec = &*sec_base.add(i);
+                let sec = unsafe { &*sec_base.add(i) };
                 if u32::from_le_bytes(sec.name[..4].try_into().unwrap()) == 0x7865742E {
-                    let text = base.add(sec.virtual_address as usize);
+                    let text = unsafe { base.add(sec.virtual_address as usize) };
                     let size = sec.virtual_size as usize;
                     if size < 4 {
                         return core::ptr::null_mut();
@@ -457,24 +459,24 @@ mod windows_impl {
                         if j + 2 >= size {
                             break;
                         }
-                        if *text.add(j + 2) == 0xC3 && *text.add(j) == 0xFF {
-                            match *text.add(j + 1) {
-                                0xD3 => { *reg_index = 0; return text.add(j); }
-                                0xD7 => { *reg_index = 1; return text.add(j); }
-                                0xD6 => { *reg_index = 2; return text.add(j); }
+                        if unsafe { *text.add(j + 2) } == 0xC3 && unsafe { *text.add(j) } == 0xFF {
+                            match unsafe { *text.add(j + 1) } {
+                                0xD3 => { *reg_index = 0; return unsafe { text.add(j) }; }
+                                0xD7 => { *reg_index = 1; return unsafe { text.add(j) }; }
+                                0xD6 => { *reg_index = 2; return unsafe { text.add(j) }; }
                                 _ => {}
                             }
                         }
                         if j + 3 < size
-                            && *text.add(j + 3) == 0xC3
-                            && *text.add(j) == 0x41
-                            && *text.add(j + 1) == 0xFF
+                            && unsafe { *text.add(j + 3) } == 0xC3
+                            && unsafe { *text.add(j) } == 0x41
+                            && unsafe { *text.add(j + 1) } == 0xFF
                         {
-                            match *text.add(j + 2) {
-                                0xD4 => { *reg_index = 3; return text.add(j); }
-                                0xD5 => { *reg_index = 4; return text.add(j); }
-                                0xD6 => { *reg_index = 5; return text.add(j); }
-                                0xD7 => { *reg_index = 6; return text.add(j); }
+                            match unsafe { *text.add(j + 2) } {
+                                0xD4 => { *reg_index = 3; return unsafe { text.add(j) }; }
+                                0xD5 => { *reg_index = 4; return unsafe { text.add(j) }; }
+                                0xD6 => { *reg_index = 5; return unsafe { text.add(j) }; }
+                                0xD7 => { *reg_index = 6; return unsafe { text.add(j) }; }
                                 _ => {}
                             }
                         }
@@ -492,12 +494,12 @@ mod windows_impl {
         /// `func` must point to at least 28 readable bytes containing a Windows
         /// x86-64 syscall stub.
         pub unsafe fn extract_ssn_direct(func: *const u8) -> u32 {
-            if *func.add(3) == 0xB8 {
-                return core::ptr::read_unaligned(func.add(4) as *const u32);
+            if unsafe { *func.add(3) } == 0xB8 {
+                return unsafe { core::ptr::read_unaligned(func.add(4) as *const u32) };
             }
             for i in 0..24usize {
-                if *func.add(i) == 0xB8 {
-                    let val = core::ptr::read_unaligned(func.add(i + 1) as *const u32);
+                if unsafe { *func.add(i) } == 0xB8 {
+                    let val = unsafe { core::ptr::read_unaligned(func.add(i + 1) as *const u32) };
                     if val < 0x1000 {
                         return val;
                     }
@@ -515,26 +517,26 @@ mod windows_impl {
         /// data referenced by the export directory must be readable.
         pub unsafe fn extract_ssn_sorted(target_addr: *mut u8, base: *mut u8) -> u32 {
             let dos = base as *const ImageDosHeader;
-            let nt = base.add((*dos).e_lfanew as usize) as *const ImageNtHeaders64;
-            let exp_rva = (*nt).optional_header.data_directory[0].virtual_address;
-            let exp = base.add(exp_rva as usize) as *const ImageExportDirectory;
+            let nt = unsafe { base.add((*dos).e_lfanew as usize) } as *const ImageNtHeaders64;
+            let exp_rva = unsafe { (*nt).optional_header.data_directory[0].virtual_address };
+            let exp = unsafe { base.add(exp_rva as usize) } as *const ImageExportDirectory;
 
-            let funcs = base.add((*exp).address_of_functions as usize) as *const u32;
-            let names = base.add((*exp).address_of_names as usize) as *const u32;
-            let ords = base.add((*exp).address_of_name_ordinals as usize) as *const u16;
+            let funcs = unsafe { base.add((*exp).address_of_functions as usize) } as *const u32;
+            let names = unsafe { base.add((*exp).address_of_names as usize) } as *const u32;
+            let ords = unsafe { base.add((*exp).address_of_name_ordinals as usize) } as *const u16;
 
             const H_GETTICK: u32 = crypto::hash_str(b"NtGetTickCount");
             const H_QUERYTIME: u32 = crypto::hash_str(b"NtQuerySystemTime");
 
             let mut ssn: u32 = 0;
-            for i in 0..(*exp).number_of_names as usize {
-                let name_ptr = base.add(*names.add(i) as usize) as *const u8;
-                let addr = base.add(*funcs.add(*ords.add(i) as usize) as usize);
-                if *name_ptr == b'N' && *name_ptr.add(1) == b't' {
-                    if *name_ptr.add(3) == b'l' {
+            for i in 0..unsafe { (*exp).number_of_names } as usize {
+                let name_ptr = unsafe { base.add(*names.add(i) as usize) } as *const u8;
+                let addr = unsafe { base.add(*funcs.add(*ords.add(i) as usize) as usize) };
+                if unsafe { *name_ptr } == b'N' && unsafe { *name_ptr.add(1) } == b't' {
+                    if unsafe { *name_ptr.add(3) } == b'l' {
                         continue;
                     }
-                    let h = crypto::hash_cstr(name_ptr);
+                    let h = unsafe { crypto::hash_cstr(name_ptr) };
                     if h == H_GETTICK || h == H_QUERYTIME {
                         continue;
                     }
@@ -554,7 +556,7 @@ mod windows_impl {
     pub mod engine {
         use super::core_impl;
         use super::*;
-        use crate::crypto;
+        use super::crypto;
 
         static NTDLL_BASE: SafePtr = SafePtr::new();
         static CLEAN_SITE: SafePtr = SafePtr::new();
@@ -815,7 +817,7 @@ mod windows_impl {
         let mut arr = [0usize; 12];
         let n = args.len().min(12);
         arr[..n].copy_from_slice(&args[..n]);
-        do_syscall_invoke(info.ssn, info.site, info.proxy, info.reg, arr.as_mut_ptr())
+        unsafe { do_syscall_invoke(info.ssn, info.site, info.proxy, info.reg, arr.as_mut_ptr()) }
     }
 }
 
