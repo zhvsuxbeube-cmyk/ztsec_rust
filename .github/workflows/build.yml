@@ -45,6 +45,10 @@ jobs:
           if (-not $panel.WaitForExit(30000)) { Stop-Process $panel.Id -Force; Stop-Process $agent.Id -Force; throw 'panel timeout' }
           if ($agent.HasExited -eq $false) { Stop-Process $agent.Id -Force }
           $p = Get-Content panel.out -Raw
+          if ($p -notmatch 'ACK:PLUGIN:hello') { throw 'plugin ack' }
+          if ($p -notmatch 'ACK:PLUGIN_EVENT:ping') { throw 'event ack' }
+          if ($p -notmatch 'ACK:PLUGIN_OUT:hello') { throw 'unload ack' }
+          if ($p -notmatch 'ACK:CLOSE') { throw 'close ack' }
           Write-Host '--- panel ---'
           Get-Content panel.out
           Write-Host '--- panel err ---'
@@ -52,10 +56,6 @@ jobs:
           Write-Host '--- agent ---'
           Get-Content agent.out
           Get-Content agent.err
-          if ($p -notmatch 'ACK:PLUGIN:hello') { throw 'plugin ack' }
-          if ($p -notmatch 'ACK:PLUGIN_EVENT:ping') { throw 'event ack' }
-          if ($p -notmatch 'ACK:PLUGIN_OUT:hello') { throw 'unload ack' }
-          if ($p -notmatch 'ACK:CLOSE') { throw 'close ack' }
           $a = Get-Content agent.out -Raw
           if ($a -notmatch 'plugin event: event ping') { throw 'plugin callback' }
       - name: Archive

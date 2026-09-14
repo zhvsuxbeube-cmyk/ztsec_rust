@@ -19,9 +19,6 @@ mod win {
     type OnEvent  = unsafe extern "C" fn(*const u8, u32, *const u8, u32) -> i32;
     type OnUnload = unsafe extern "C" fn();
 
-    #[inline]
-    fn dbg(msg: impl AsRef<str>) { eprintln!("[plugin-debug] {}", msg.as_ref()); }
-
     // Minimal PE parsing
     #[repr(C)] struct DosHdr { e_magic: u16, _pad: [u8; 58], e_lfanew: i32 }
     #[repr(C)] struct FileHdr { machine: u16, sections: u16, _ts: u32, _sym: u32, _nsym: u32, opt_sz: u16, chars: u16 }
@@ -97,12 +94,7 @@ mod win {
     // Resolve an export, following PE forwarded-export strings such as
     // "KERNELBASE.GetEnvironmentVariableA" to the loaded target module.
     unsafe fn resolve_export(image: *mut u8, name: &str, depth: u32) -> Option<*mut u8> {
-        if image.is_null() {
-            dbg(format!("resolve_export: null image name={name:?} depth={depth}"));
-            return None;
-        }
-        if depth >= 8 {
-            dbg(format!("resolve_export: forwarder depth exceeded name={name:?}"));
+        if image.is_null() || depth >= 8 {
             return None;
         }
 
@@ -110,10 +102,7 @@ mod win {
         let nt  = unsafe { &*(image.add(dos.e_lfanew as usize) as *const NtHdrs64) };
         let exp_rva = nt.opt.dirs[0].va as usize;
         let exp_size = nt.opt.dirs[0].size as usize;
-        let addr = match unsafe { get_export(image, name) } {
-            Some(addr) => addr,
-            None => { dbg(format!("resolve_export: export not found name={name:?}")); return None; }
-        };
+        let addr = unsafe { get_export(image, name)? };
 
         let addr_rva = (addr as usize).wrapping_sub(image as usize);
         if addr_rva < exp_rva || addr_rva >= exp_rva.saturating_add(exp_size) {
@@ -130,11 +119,7 @@ mod win {
 
         let forwarder = unsafe { core::slice::from_raw_parts(addr, len) };
         let forwarder = core::str::from_utf8(forwarder).ok()?;
-        dbg(format!("resolve_export: forwarder {name:?} -> {forwarder:?}"));
-        let (module, symbol) = match forwarder.split_once('.') {
-            Some(parts) => parts,
-            None => { dbg(format!("resolve_export: malformed forwarder {forwarder:?}")); return None; }
-        };
+        let (module, symbol) = forwarder.split_once('.')?;
 
         use crate::syscalls::core_impl;
         use crate::syscalls::crypto;
@@ -147,10 +132,8 @@ mod win {
         let module_hash = crypto::hash_str(module_name.as_bytes());
         let base = unsafe { core_impl::find_module(module_hash) };
         if base.is_null() {
-            dbg(format!("resolve_export: forwarded module not loaded module={module_name:?} hash=0x{module_hash:08x}"));
             return None;
         }
-        dbg(format!("resolve_export: forwarded module found module={module_name:?} hash=0x{module_hash:08x} base=0x{:x} symbol={symbol:?}", base as usize));
 
         unsafe { resolve_export(base, symbol, depth + 1) }
     }
@@ -161,38 +144,26 @@ mod win {
         use crate::syscalls::crypto;
 
         let h = crypto::hash_str(mod_name);
-        let fn_name = match core::str::from_utf8(fn_name) { Some(v) => v, None => { dbg("resolve_import: import name is not UTF-8"); return None; } };
         let base = unsafe { core_impl::find_module(h) };
-        if base.is_null() {
-            dbg(format!("resolve_import: module not loaded module={:?} hash=0x{h:08x} symbol={fn_name:?}", String::from_utf8_lossy(mod_name)));
-            return None;
-        }
-        dbg(format!("resolve_import: module={:?} base=0x{:x} symbol={fn_name:?}", String::from_utf8_lossy(mod_name), base as usize));
-        let out = unsafe { resolve_export(base, fn_name, 0) };
-        match out {
-            Some(ptr) => dbg(format!("resolve_import: resolved symbol={fn_name:?} -> 0x{:x}", ptr as usize)),
-            None => dbg(format!("resolve_import: FAILED symbol={fn_name:?}")),
-        }
-        out
+        if base.is_null() { return None; }
+
+        unsafe { resolve_export(base, core::str::from_utf8(fn_name).ok()?, 0) }
     }
 
     // Manual PE loader: maps image, applies relocs, resolves imports, sets protections
     unsafe fn load_pe(data: &[u8]) -> Option<(*mut u8, usize)> {
-        dbg(format!("load_pe: begin bytes={}", data.len()));
-        if data.len() < 64 { dbg("load_pe: input shorter than DOS header"); return None; }
+        if data.len() < 64 { return None; }
         let dos = unsafe { &*(data.as_ptr() as *const DosHdr) };
-        if dos.e_magic != 0x5A4D { dbg(format!("load_pe: bad DOS magic=0x{:04x}", dos.e_magic)); return None; }
+        if dos.e_magic != 0x5A4D { return None; }
         let nt_off = dos.e_lfanew as usize;
-        if nt_off + core::mem::size_of::<NtHdrs64>() > data.len() { dbg(format!("load_pe: NT header outside file nt_off={nt_off}")); return None; }
+        if nt_off + core::mem::size_of::<NtHdrs64>() > data.len() { return None; }
         let nt = unsafe { &*(data.as_ptr().add(nt_off) as *const NtHdrs64) };
-        if nt.sig != 0x0004550 || nt.opt.magic != 0x020B { dbg(format!("load_pe: invalid PE signature=0x{:08x} optional_magic=0x{:04x}", nt.sig, nt.opt.magic)); return None; }
+        if nt.sig != 0x0004550 || nt.opt.magic != 0x020B { return None; }
 
         let image_sz = nt.opt.image_sz as usize;
         let hdr_sz   = nt.opt.hdr_sz as usize;
-        dbg(format!("load_pe: image_size=0x{image_sz:x} headers=0x{hdr_sz:x} preferred_base=0x{:x} sections={}", nt.opt.image_base, nt.file.sections));
         let image = unsafe { nt_alloc(image_sz, PAGE_RW) };
-        if image.is_null() { dbg("load_pe: NtAllocateVirtualMemory failed"); return None; }
-        dbg(format!("load_pe: mapped image base=0x{:x}", image as usize));
+        if image.is_null() { return None; }
 
         // Copy headers
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), image, hdr_sz.min(data.len())) };
@@ -219,7 +190,6 @@ mod win {
         let pref_base = nt.opt.image_base as usize;
         let actual    = image as usize;
         let delta     = actual.wrapping_sub(pref_base) as isize;
-        dbg(format!("load_pe: relocation delta=0x{:x}", delta));
         if delta != 0 {
             let reloc_dir = &nt.opt.dirs[5];
             if reloc_dir.size > 0 {
@@ -257,7 +227,6 @@ mod win {
                 while unsafe { *mod_name_ptr.add(mod_len) } != 0 { mod_len += 1; }
                 let mod_name_lc: Vec<u8> = unsafe { core::slice::from_raw_parts(mod_name_ptr, mod_len) }
                     .iter().map(|b| b.to_ascii_lowercase()).collect();
-                dbg(format!("load_pe: import module={:?}", String::from_utf8_lossy(&mod_name_lc)));
 
                 let thunk_off = if desc.orig_thunk != 0 { desc.orig_thunk } else { desc.thunk } as usize;
                 let iat_off   = desc.thunk as usize;
@@ -266,8 +235,7 @@ mod win {
                     let thunk = unsafe { *(image.add(thunk_off + k * 8) as *const usize) };
                     if thunk == 0 { break; }
                     let fn_addr = if thunk & (1 << 63) != 0 {
-                        let ordinal = (thunk & 0xFFFF) as u16;
-                        dbg(format!("load_pe: ordinal import module={:?} ordinal={ordinal} (unsupported)" , String::from_utf8_lossy(&mod_name_lc)));
+                        // import by ordinal
                         None
                     } else {
                         let ibn = unsafe { image.add(thunk & 0x7FFF_FFFF_FFFF_FFFF) } as *const ImportByName;
@@ -275,18 +243,11 @@ mod win {
                         let mut fn_len = 0usize;
                         while unsafe { *fn_name_ptr.add(fn_len) } != 0 { fn_len += 1; }
                         let fn_bytes = unsafe { core::slice::from_raw_parts(fn_name_ptr, fn_len) };
-                        let result = unsafe { resolve_import(&mod_name_lc, fn_bytes) };
-                        if result.is_none() {
-                            dbg(format!("load_pe: IMPORT FAILED module={:?} symbol={:?}", String::from_utf8_lossy(&mod_name_lc), String::from_utf8_lossy(fn_bytes)));
-                        }
-                        result
+                        unsafe { resolve_import(&mod_name_lc, fn_bytes) }
                     };
                     unsafe {
                         *(image.add(iat_off + k * 8) as *mut usize) =
                             fn_addr.map(|p| p as usize).unwrap_or(0);
-                    if fn_addr.is_none() {
-                        dbg(format!("load_pe: IAT entry left NULL module={:?} thunk_index={k}", String::from_utf8_lossy(&mod_name_lc)));
-                    }
                     }
                     k += 1;
                 }
@@ -306,12 +267,9 @@ mod win {
                 (false, true)  => PAGE_RW,
                 _              => 0x02, // PAGE_READONLY
             };
-            if !unsafe { nt_protect(image.add(s.va as usize), s.vsize as usize, prot) } {
-                dbg(format!("load_pe: NtProtectVirtualMemory failed section_va=0x{:x} size=0x{:x} prot=0x{:x}", s.va, s.vsize, prot));
-            }
+            let _ = unsafe { nt_protect(image.add(s.va as usize), s.vsize as usize, prot) };
         }
 
-        dbg("load_pe: complete");
         Some((image, image_sz))
     }
 
@@ -342,21 +300,16 @@ mod win {
 
         // Load a plugin from raw DLL bytes supplied in-memory (no disk path).
         pub fn load(&mut self, id: &str, data: &[u8], host: &[u8]) -> Result<(), String> {
-            dbg(format!("Manager::load: id={id:?} bytes={} host_len={}", data.len(), host.len()));
-            if id.is_empty() { dbg("Manager::load: rejected empty id"); return Err(text::PLUG_ERR_NAME.into()); }
+            if id.is_empty() { return Err(text::PLUG_ERR_NAME.into()); }
             self.map.remove(id);
 
             let (image, image_sz) = unsafe {
-                match load_pe(data) {
-                    Some(v) => v,
-                    None => { dbg(format!("Manager::load: load_pe failed id={id:?}")); return Err(text::PLUG_ERR_LOAD.to_owned()); }
-                }
+                load_pe(data).ok_or_else(|| text::PLUG_ERR_LOAD.to_owned())?
             };
 
             let on_load   = unsafe { resolve_export(image, "PluginOnLoad", 0) };
             let on_event  = unsafe { resolve_export(image, "PluginOnEvent", 0) };
             let on_unload = unsafe { resolve_export(image, "PluginOnUnload", 0) };
-            dbg(format!("Manager::load: entrypoints PluginOnLoad={} PluginOnEvent={} PluginOnUnload={}", on_load.is_some(), on_event.is_some(), on_unload.is_some()));
             let (Some(on_load), Some(on_event), Some(on_unload)) =
                 (on_load, on_event, on_unload)
             else {
@@ -368,16 +321,13 @@ mod win {
             let event_fn: OnEvent = unsafe { core::mem::transmute(on_event) };
             let unload_fn: OnUnload = unsafe { core::mem::transmute(on_unload) };
 
-            dbg(format!("Manager::load: calling PluginOnLoad id={id:?}"));
             let ret = unsafe { load_fn(host.as_ptr(), host.len() as u32, emit) };
-            dbg(format!("Manager::load: PluginOnLoad returned {ret}"));
             if ret != 0 {
                 unsafe { nt_free(image, image_sz); }
                 return Err(text::PLUG_ERR_INIT.into());
             }
 
             self.map.insert(id.to_owned(), Plugin { image, image_sz, unload: unload_fn, event: event_fn });
-            dbg(format!("Manager::load: success id={id:?}"));
             Ok(())
         }
 
