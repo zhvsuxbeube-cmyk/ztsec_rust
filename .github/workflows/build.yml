@@ -27,7 +27,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           # cl /nologo /LD /EHsc hello.cpp /link /OUT:hello.dll user32.lib
-          cl /nologo /LD /EHsc plugin\hello.cpp /link /OUT:dist\hello.dll user32.lib
+          cl /nologo /LD /EHsc /std:c++17 plugin\hello.cpp /link /OUT:dist\hello.dll user32.lib
           if ($LASTEXITCODE -ne 0) { throw 'plugin build failed' }
           dumpbin /exports dist\hello.dll | Out-File dist\exports.txt
           $exports = Get-Content dist\exports.txt -Raw
