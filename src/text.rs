@@ -29,6 +29,7 @@ pub const RESTART: &str = "RESTART";
 pub const SHUTDOWN: &str = "SHUTDOWN";
 pub const RECONNECT: &str = "RECONNECT";
 pub const CLOSE: &str = "CLOSE";
+pub const EXECUTE: &str = "EXECUTE:";
 
 pub const CONNECTED: &str = "connected";
 pub const RETRYING: &str = "retrying in 5s";

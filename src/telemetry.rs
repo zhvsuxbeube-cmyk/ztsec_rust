@@ -154,10 +154,10 @@ fn afk() -> String {
         };
         if unsafe { GetLastInputInfo(&mut info) } != 0 {
             let now = unsafe { GetTickCount64() };
-            return human((now as u32).wrapping_sub(info.tick) as u64);
+            return fmt_duration((now as u32).wrapping_sub(info.tick) as u64 / 1_000);
         }
     }
-    "0s".into()
+    "0m".into()
 }
 
 fn uptime() -> String {
@@ -167,7 +167,7 @@ fn uptime() -> String {
         unsafe extern "system" {
             fn GetTickCount64() -> u64;
         }
-        return human(unsafe { GetTickCount64() } / 1_000);
+        return fmt_duration(unsafe { GetTickCount64() } / 1_000);
     }
     #[cfg(not(windows))]
     {
@@ -263,19 +263,15 @@ fn icmp_ping_ms(ip: Ipv4Addr) -> Option<u128> {
     result
 }
 
-fn human(mut secs: u64) -> String {
+fn fmt_duration(secs: u64) -> String {
     let d = secs / 86_400;
-    secs %= 86_400;
-    let h = secs / 3_600;
-    secs %= 3_600;
-    let m = secs / 60;
-    let s = secs % 60;
+    let h = (secs % 86_400) / 3_600;
+    let m = (secs % 3_600) / 60;
     let mut out = String::new();
     if d > 0 { out.push_str(&format!("{d}d")); }
     if h > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{h}h")); }
-    if m > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{m}m")); }
-    if s > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{s}s")); }
-    if out.is_empty() { out.push_str("0s"); }
+    if !out.is_empty() { out.push(' '); }
+    out.push_str(&format!("{m}m"));
     out
 }
 
@@ -331,9 +327,9 @@ mod tests {
 
     #[test]
     fn uptime_contract() {
-        assert_eq!(super::human(30), "30s");
-        assert_eq!(super::human(121), "2m 1s");
-        assert_eq!(super::human(7320), "2h 2m");
-        assert_eq!(super::human(97_260), "1d 3h 1m");
+        assert_eq!(super::fmt_duration(30), "0m");
+        assert_eq!(super::fmt_duration(121), "2m");
+        assert_eq!(super::fmt_duration(7320), "2h 2m");
+        assert_eq!(super::fmt_duration(97_260), "1d 3h 1m");
     }
 }

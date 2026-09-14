@@ -58,6 +58,56 @@ jobs:
           Get-Content agent.err
           $a = Get-Content agent.out -Raw
           if ($a -notmatch 'plugin event: event ping') { throw 'plugin callback' }
+      - name: Execute
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
+          $script = "Write-Output 'ztsec_execute_ok'"
+          $scriptPath = Join-Path $PWD 'dist\test_exec.ps1'
+          Set-Content -Path $scriptPath -Value $script -Encoding UTF8
+          $testPanel = @'
+import base64, socket, os, sys
+def read_line(s):
+    b = bytearray()
+    while True:
+        c = s.recv(1)
+        if not c or c == b"\n":
+            return bytes(b).decode(errors="replace").rstrip("\r")
+        b.extend(c)
+with socket.create_server(("127.0.0.1", 4795)) as srv:
+    conn, _ = srv.accept()
+    with conn:
+        read_line(conn); read_line(conn)
+        with open(sys.argv[1], "rb") as f: data = f.read()
+        b64 = base64.b64encode(data).decode()
+        conn.sendall(f"CMD:EXECUTE:ps1:{b64}\n".encode())
+        while True:
+            line = read_line(conn)
+            if not line: sys.exit(1)
+            if line == "HB": conn.sendall(b"PONG\n"); continue
+            if line.startswith("ACK:EXECUTE:"): break
+            if line.startswith("ERR:"): sys.exit(1)
+        conn.sendall(b"CMD:CLOSE\n")
+        while True:
+            line = read_line(conn)
+            if not line: break
+            if line == "HB": conn.sendall(b"PONG\n"); continue
+            if line.startswith("ACK:CLOSE"): break
+'@
+          $testPanel | Out-File -Encoding utf8 dist\exec_panel.py
+          $panel = Start-Process python -ArgumentList "dist\exec_panel.py","$scriptPath" -NoNewWindow -PassThru -RedirectStandardOutput 'exec_panel.out' -RedirectStandardError 'exec_panel.err'
+          Start-Sleep -Seconds 2
+          $env:ZTSEC_CI = '1'
+          $agent = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4795' -NoNewWindow -PassThru -RedirectStandardOutput 'exec_agent.out' -RedirectStandardError 'exec_agent.err'
+          if (-not $panel.WaitForExit(30000)) { Stop-Process $panel.Id -Force; Stop-Process $agent.Id -Force; throw 'execute panel timeout' }
+          if ($agent.HasExited -eq $false) { Stop-Process $agent.Id -Force }
+          if ($panel.ExitCode -ne 0) {
+            Get-Content exec_panel.out; Get-Content exec_panel.err
+            Get-Content exec_agent.out; Get-Content exec_agent.err
+            throw 'execute test failed'
+          }
+          Write-Host '--- execute panel ---'
+          Get-Content exec_panel.out
       - name: Archive
         shell: pwsh
         run: |
