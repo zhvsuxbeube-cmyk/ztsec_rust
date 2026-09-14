@@ -217,8 +217,6 @@ mod windows_impl {
     const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
     const FILE_TYPE_PIPE: u32 = 0x0003;
     const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
-    const WAIT_OBJECT_0: u32 = 0x0000_0000;
-    const WAIT_TIMEOUT: u32 = 0x0000_0102;
     const INFINITE: u32 = 0xFFFF_FFFF;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
