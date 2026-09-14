@@ -37,6 +37,21 @@ mod win {
     #[repr(C)] struct BaseReloc { va: u32, sz: u32 }
     #[repr(C)] struct ImportDesc { orig_thunk: u32, _ts: u32, _fwd: u32, name: u32, thunk: u32 }
     #[repr(C)] struct ImportByName { hint: u16, name: [u8; 1] }
+    #[repr(C)] struct ApiSetNamespaceV6 {
+        version: u32, size: u32, _flags: u32, count: u32,
+        entry_off: u32, _hash_off: u32, _hash_factor: u32,
+    }
+    #[repr(C)] struct ApiSetNamespaceEntryV6 {
+        _flags: u32, name_off: u32, name_len: u32, _hashed_len: u32,
+        value_off: u32, value_count: u32,
+    }
+    #[repr(C)] struct ApiSetValueEntryV6 {
+        _flags: u32, _name_off: u32, _name_len: u32, value_off: u32, value_len: u32,
+    }
+
+    type DllMain = unsafe extern "system" fn(*mut u8, u32, *mut u8) -> i32;
+    const DLL_PROCESS_ATTACH: u32 = 1;
+    const DLL_PROCESS_DETACH: u32 = 0;
 
     unsafe fn nt_alloc(size: usize, prot: usize) -> *mut u8 {
         let mut base: usize = 0;
@@ -91,6 +106,87 @@ mod win {
         None
     }
 
+    // Resolve an API-set contract (for example api-ms-win-core-processenvironment-l1-1-0)
+    // through the process PEB's ApiSetMap to the concrete host DLL. Windows uses this
+    // namespace for many Kernel32/User32 exports, and API-set names are not ordinary
+    // loaded modules in the PEB loader list.
+    unsafe fn resolve_api_set(module: &str) -> Option<Vec<u8>> {
+        let lower = module.to_ascii_lowercase();
+        let contract = lower.strip_suffix(".dll").unwrap_or(&lower);
+        if !(contract.starts_with("api-ms-") || contract.starts_with("ext-ms-")) {
+            return None;
+        }
+
+        use crate::syscalls::core_impl;
+        let peb = unsafe { core_impl::get_peb() };
+        if peb.is_null() {
+            return None;
+        }
+        // PEB.ApiSetMap is at offset 0x68 on Windows x64.
+        let map = unsafe { *(peb.add(0x68) as *const *const ApiSetNamespaceV6) };
+        if map.is_null() || unsafe { (*map).version } < 6 {
+            return None;
+        }
+
+        for i in 0..unsafe { (*map).count as usize } {
+            let entry = unsafe {
+                &*((map as *const u8).add((*map).entry_off as usize)
+                    .add(i * core::mem::size_of::<ApiSetNamespaceEntryV6>())
+                    as *const ApiSetNamespaceEntryV6)
+            };
+            let name_ptr = unsafe { (map as *const u8).add(entry.name_off as usize) as *const u16 };
+            let name_len = (entry.name_len / 2) as usize;
+            if name_len != contract.len() {
+                continue;
+            }
+            let mut matches = true;
+            for j in 0..name_len {
+                let mut c = unsafe { *name_ptr.add(j) };
+                if c >= b'A' as u16 && c <= b'Z' as u16 {
+                    c += 32;
+                }
+                if c as u8 != contract.as_bytes()[j] {
+                    matches = false;
+                    break;
+                }
+            }
+            if !matches || entry.value_count == 0 {
+                continue;
+            }
+
+            for j in 0..entry.value_count as usize {
+                let value = unsafe {
+                    &*((map as *const u8).add(entry.value_off as usize)
+                        .add(j * core::mem::size_of::<ApiSetValueEntryV6>())
+                        as *const ApiSetValueEntryV6)
+                };
+                if value.value_len == 0 {
+                    continue;
+                }
+                let value_ptr = unsafe {
+                    (map as *const u8).add(value.value_off as usize) as *const u16
+                };
+                let value_len = (value.value_len / 2) as usize;
+                let mut host = Vec::with_capacity(value_len + 4);
+                for k in 0..value_len {
+                    let mut c = unsafe { *value_ptr.add(k) };
+                    if c >= b'A' as u16 && c <= b'Z' as u16 {
+                        c += 32;
+                    }
+                    if c > 0x7f {
+                        return None;
+                    }
+                    host.push(c as u8);
+                }
+                if !host.ends_with(b".dll") {
+                    host.extend_from_slice(b".dll");
+                }
+                return Some(host);
+            }
+        }
+        None
+    }
+
     // Resolve an export, following PE forwarded-export strings such as
     // "KERNELBASE.GetEnvironmentVariableA" to the loaded target module.
     unsafe fn resolve_export(image: *mut u8, name: &str, depth: u32) -> Option<*mut u8> {
@@ -129,7 +225,9 @@ mod win {
         } else {
             format!("{module}.dll").to_ascii_lowercase()
         };
-        let module_hash = crypto::hash_str(module_name.as_bytes());
+        let resolved_name = unsafe { resolve_api_set(&module_name) }
+            .unwrap_or_else(|| module_name.as_bytes().to_vec());
+        let module_hash = crypto::hash_str(&resolved_name);
         let base = unsafe { core_impl::find_module(module_hash) };
         if base.is_null() {
             return None;
@@ -143,7 +241,15 @@ mod win {
         use crate::syscalls::core_impl;
         use crate::syscalls::crypto;
 
-        let h = crypto::hash_str(mod_name);
+        let module_name = core::str::from_utf8(mod_name).ok()?;
+        let module_name = if module_name.to_ascii_lowercase().ends_with(".dll") {
+            module_name.to_ascii_lowercase()
+        } else {
+            format!("{module_name}.dll").to_ascii_lowercase()
+        };
+        let resolved_name = unsafe { resolve_api_set(&module_name) }
+            .unwrap_or_else(|| module_name.as_bytes().to_vec());
+        let h = crypto::hash_str(&resolved_name);
         let base = unsafe { core_impl::find_module(h) };
         if base.is_null() { return None; }
 
@@ -151,7 +257,7 @@ mod win {
     }
 
     // Manual PE loader: maps image, applies relocs, resolves imports, sets protections
-    unsafe fn load_pe(data: &[u8]) -> Option<(*mut u8, usize)> {
+    unsafe fn load_pe(data: &[u8]) -> Option<(*mut u8, usize, Option<DllMain>)> {
         if data.len() < 64 { return None; }
         let dos = unsafe { &*(data.as_ptr() as *const DosHdr) };
         if dos.e_magic != 0x5A4D { return None; }
@@ -235,7 +341,8 @@ mod win {
                     let thunk = unsafe { *(image.add(thunk_off + k * 8) as *const usize) };
                     if thunk == 0 { break; }
                     let fn_addr = if thunk & (1 << 63) != 0 {
-                        // import by ordinal
+                        // The sample ABI uses named imports; unsupported ordinals must
+                        // fail the image load rather than leaving a null IAT entry.
                         None
                     } else {
                         let ibn = unsafe { image.add(thunk & 0x7FFF_FFFF_FFFF_FFFF) } as *const ImportByName;
@@ -245,9 +352,15 @@ mod win {
                         let fn_bytes = unsafe { core::slice::from_raw_parts(fn_name_ptr, fn_len) };
                         unsafe { resolve_import(&mod_name_lc, fn_bytes) }
                     };
+                    let fn_addr = match fn_addr {
+                        Some(p) if !p.is_null() => p,
+                        _ => {
+                            unsafe { nt_free(image, image_sz); }
+                            return None;
+                        }
+                    };
                     unsafe {
-                        *(image.add(iat_off + k * 8) as *mut usize) =
-                            fn_addr.map(|p| p as usize).unwrap_or(0);
+                        *(image.add(iat_off + k * 8) as *mut usize) = fn_addr as usize;
                     }
                     k += 1;
                 }
@@ -270,12 +383,21 @@ mod win {
             let _ = unsafe { nt_protect(image.add(s.va as usize), s.vsize as usize, prot) };
         }
 
-        Some((image, image_sz))
+        let entry = if nt.opt.entry == 0 {
+            None
+        } else if nt.opt.entry as usize >= image_sz {
+            unsafe { nt_free(image, image_sz); }
+            return None;
+        } else {
+            Some(unsafe { core::mem::transmute(image.add(nt.opt.entry as usize)) })
+        };
+        Some((image, image_sz, entry))
     }
 
     pub struct Plugin {
         image:    *mut u8,
         image_sz: usize,
+        entry:    Option<DllMain>,
         unload:   OnUnload,
         event:    OnEvent,
     }
@@ -286,6 +408,9 @@ mod win {
         fn drop(&mut self) {
             unsafe {
                 (self.unload)();
+                if let Some(entry) = self.entry {
+                    let _ = entry(self.image, DLL_PROCESS_DETACH, core::ptr::null_mut());
+                }
                 nt_free(self.image, self.image_sz);
             }
         }
@@ -303,9 +428,16 @@ mod win {
             if id.is_empty() { return Err(text::PLUG_ERR_NAME.into()); }
             self.map.remove(id);
 
-            let (image, image_sz) = unsafe {
+            let (image, image_sz, entry) = unsafe {
                 load_pe(data).ok_or_else(|| text::PLUG_ERR_LOAD.to_owned())?
             };
+
+            if let Some(entry_fn) = entry {
+                if unsafe { entry_fn(image, DLL_PROCESS_ATTACH, core::ptr::null_mut()) } == 0 {
+                    unsafe { nt_free(image, image_sz); }
+                    return Err(text::PLUG_ERR_INIT.into());
+                }
+            }
 
             let on_load   = unsafe { resolve_export(image, "PluginOnLoad", 0) };
             let on_event  = unsafe { resolve_export(image, "PluginOnEvent", 0) };
@@ -313,6 +445,11 @@ mod win {
             let (Some(on_load), Some(on_event), Some(on_unload)) =
                 (on_load, on_event, on_unload)
             else {
+                if entry.is_some() {
+                    if let Some(entry_fn) = entry {
+                        let _ = unsafe { entry_fn(image, DLL_PROCESS_DETACH, core::ptr::null_mut()) };
+                    }
+                }
                 unsafe { nt_free(image, image_sz); }
                 return Err(text::PLUG_ERR_ENTRY.into());
             };
@@ -323,11 +460,14 @@ mod win {
 
             let ret = unsafe { load_fn(host.as_ptr(), host.len() as u32, emit) };
             if ret != 0 {
+                if let Some(entry_fn) = entry {
+                    let _ = unsafe { entry_fn(image, DLL_PROCESS_DETACH, core::ptr::null_mut()) };
+                }
                 unsafe { nt_free(image, image_sz); }
                 return Err(text::PLUG_ERR_INIT.into());
             }
 
-            self.map.insert(id.to_owned(), Plugin { image, image_sz, unload: unload_fn, event: event_fn });
+            self.map.insert(id.to_owned(), Plugin { image, image_sz, entry, unload: unload_fn, event: event_fn });
             Ok(())
         }
 
