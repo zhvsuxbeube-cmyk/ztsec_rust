@@ -334,9 +334,11 @@ mod windows_impl {
             let mut current = unsafe { (*head).flink };
 
             while current != head {
-                let dll_base = unsafe { *(current.cast::<u8>().add(0x20) as *const *mut u8) };
+                // LDR_DATA_TABLE_ENTRY on Windows x64: DllBase is at 0x30 and
+                // BaseDllName is at 0x58 relative to InLoadOrderLinks.
+                let dll_base = unsafe { *(current.cast::<u8>().add(0x30) as *const *mut u8) };
                 if !dll_base.is_null() {
-                    let name = unsafe { current.cast::<u8>().add(0x48) } as *const UnicodeString;
+                    let name = unsafe { current.cast::<u8>().add(0x58) } as *const UnicodeString;
                     let len = unsafe { (*name).length };
                     if len > 0 && unsafe { crypto::hash_wide((*name).buffer, len) } == module_hash {
                         return dll_base;

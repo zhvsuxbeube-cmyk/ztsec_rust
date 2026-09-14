@@ -151,7 +151,7 @@ fn afk() -> String {
         };
         if unsafe { GetLastInputInfo(&mut info) } != 0 {
             let now = unsafe { GetTickCount() };
-            return format_duration(now.wrapping_sub(info.tick) as u64);
+            return human(now.wrapping_sub(info.tick) as u64);
         }
     }
     "0s".into()
@@ -160,11 +160,11 @@ fn afk() -> String {
 fn uptime(v: String) -> String {
     v.trim()
         .parse::<u64>()
-        .map(format_duration)
+        .map(human)
         .unwrap_or_else(|_| "Unknown".into())
 }
 
-fn format_duration(mut secs: u64) -> String {
+fn human(mut secs: u64) -> String {
     let d = secs / 86_400;
     secs %= 86_400;
     let h = secs / 3_600;
@@ -232,9 +232,9 @@ mod tests {
 
     #[test]
     fn uptime_contract() {
-        assert_eq!(super::format_duration(30), "30s");
-        assert_eq!(super::format_duration(121), "2m 1s");
-        assert_eq!(super::format_duration(7320), "2h 2m");
-        assert_eq!(super::format_duration(97_260), "1d 3h 1m");
+        assert_eq!(super::human(30), "30s");
+        assert_eq!(super::human(121), "2m 1s");
+        assert_eq!(super::human(7320), "2h 2m");
+        assert_eq!(super::human(97_260), "1d 3h 1m");
     }
 }
