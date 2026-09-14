@@ -41,34 +41,18 @@ def wait_for_result(conn, timeout=30):
 
 
 def accept_agent(server, timeout=30):
-    deadline = time.time() + timeout
-    last_error = "no complete agent handshake"
-    server.settimeout(min(2.0, timeout))
-    while time.time() < deadline:
-        try:
-            conn, _ = server.accept()
-        except socket.timeout:
-            continue
-        remaining = max(1.0, deadline - time.time())
-        conn.settimeout(min(remaining, 10.0))
-        keep = False
-        try:
-            hello = read_line(conn)
-            if not hello or not hello.startswith("HELLO:FINGERPRINT:"):
-                last_error = f"unexpected hello: {hello!r}"
-                continue
-            data = read_line(conn)
-            if not data or not data.startswith("DATA:"):
-                last_error = f"unexpected data: {data!r}"
-                continue
-            keep = True
-            return conn
-        except (OSError, RuntimeError) as exc:
-            last_error = str(exc)
-        finally:
-            if not keep and conn.fileno() != -1:
-                conn.close()
-    raise RuntimeError(last_error)
+    server.settimeout(timeout)
+    conn, _ = server.accept()
+    conn.settimeout(timeout)
+    hello = read_line(conn)
+    data = read_line(conn)
+    if not hello or not hello.startswith("HELLO:FINGERPRINT:"):
+        conn.close()
+        raise RuntimeError(f"unexpected hello: {hello!r}")
+    if not data or not data.startswith("DATA:"):
+        conn.close()
+        raise RuntimeError(f"unexpected data: {data!r}")
+    return conn
 
 
 def send_update(conn, filename, payload):
