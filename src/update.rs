@@ -171,7 +171,7 @@ mod windows_impl {
     use super::*;
     use std::{
         ffi::{OsStr, OsString},
-        os::windows::{ffi::{OsStrExt, OsStringExt}, process::CommandExt},
+        os::windows::{ffi::OsStringExt, process::CommandExt},
         process::{Child, Command, Stdio},
         sync::mpsc,
         thread,

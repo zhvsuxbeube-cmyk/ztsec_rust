@@ -4,7 +4,6 @@ mod win {
         ffi::OsStr,
         iter,
         os::windows::ffi::OsStrExt,
-        ptr,
         sync::atomic::{AtomicUsize, Ordering},
         thread,
         time::{Duration, Instant},
@@ -40,8 +39,6 @@ mod win {
     const OK: Status = 0;
     const SHUTDOWN: u32 = 19;
 
-    const MUTEX_SYNCHRONIZE: u32 = 0x0010_0000;
-    const MUTEX_MODIFY_STATE: u32 = 0x0000_0001;
     const WAIT_OBJECT_0: u32 = 0;
     const WAIT_TIMEOUT: u32 = 0x0000_0102;
     const WAIT_ABANDONED: u32 = 0x0000_0080;
