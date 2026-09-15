@@ -12,8 +12,11 @@ Completed:
 - Added the required process-image query access for the parent validation call.
 - Added panel Update controls and intentional reconnect handling.
 - Added unit/static contracts, process-level update tests, and a panel-level update test.
-- Hardened the Windows Python harness against TCP coalescing, successful-socket closure, incorrect PONG expectations, subprocess pipe/file-handle leaks, and mutex-probe false assumptions.
+- Hardened the Windows Python harness against TCP coalescing, successful-socket closure, incorrect PONG expectations, subprocess pipe/file-handle leaks, mutex-probe false assumptions, unbounded update sends, and test runs without a global deadline.
+- Replaced the custom `NtCreateMutant` single-instance path with documented `CreateMutexW` ownership semantics and a global mutex name, eliminating ambiguity during successor takeover.
+- Explicitly closed parent-side handoff IPC handles on every preparation/handoff exit path so successor lifetime and EOF are deterministic.
 - Added both update tests to the existing Windows GitHub Actions workflow.
+- Bounded the real panel reconnect `accept()` used after a successful update so the panel cannot wait indefinitely for a successor.
 
 Verified in this environment:
 - Python `compileall` and AST checks for all tools.

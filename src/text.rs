@@ -41,7 +41,7 @@ pub const PLUG_ERR_LOAD: &str = "plugin load failed";
 pub const PLUG_ERR_ENTRY: &str = "plugin entrypoints missing";
 pub const PLUG_ERR_INIT: &str = "plugin init failed";
 
-pub const MUTEX: &str = r"\BaseNamedObjects\ZTSecurity.ztsec_agent";
+pub const MUTEX: &str = r"Global\ZTSecurity.ztsec_agent";
 pub const REG: &str = "reg";
 pub const REG_QUERY: &str = "query";
 pub const REG_VALUE: &str = "/v";

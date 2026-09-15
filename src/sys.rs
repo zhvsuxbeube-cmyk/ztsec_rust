@@ -16,33 +16,8 @@ mod win {
     static SINGLE_HANDLE: AtomicUsize = AtomicUsize::new(0);
     static UPDATE_GATE_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
-    #[repr(C)]
-    struct Unicode {
-        len: u16,
-        max: u16,
-        buf: *mut u16,
-    }
-
-    #[repr(C)]
-    struct Attrs {
-        len: u32,
-        root: Handle,
-        name: *mut Unicode,
-        attrs: u32,
-        sd: *mut core::ffi::c_void,
-        qos: *mut core::ffi::c_void,
-    }
-
     #[link(name = "ntdll")]
     unsafe extern "system" {
-        fn NtCreateMutant(
-            handle: *mut Handle,
-            access: u32,
-            attrs: *mut Attrs,
-            owner: u8,
-        ) -> Status;
-        fn NtClose(handle: Handle) -> Status;
-        fn NtReleaseMutant(handle: Handle, previous_count: *mut i32) -> Status;
         fn RtlAdjustPrivilege(
             privilege: u32,
             enable: u8,
@@ -64,7 +39,6 @@ mod win {
     }
 
     const OK: Status = 0;
-    const ACCESS: u32 = 0x001F0001;
     const SHUTDOWN: u32 = 19;
 
     const UPDATE_GATE: &str = r"Global\ZTSecurity.ztsec_agent.update";
@@ -80,32 +54,31 @@ mod win {
     const S3: i32 = 4;
     const S4: i32 = 5;
 
-    fn create_single_mutant(owner: u8) -> Option<Handle> {
-        let wide: Vec<u16> = OsStr::new(crate::text::MUTEX)
+    fn mutex_name() -> Vec<u16> {
+        OsStr::new(crate::text::MUTEX)
             .encode_wide()
             .chain(iter::once(0))
-            .collect();
-        let mut name = Unicode {
-            len: ((wide.len() - 1) * 2) as u16,
-            max: (wide.len() * 2) as u16,
-            buf: wide.as_ptr() as *mut u16,
-        };
-        let mut attrs = Attrs {
-            len: core::mem::size_of::<Attrs>() as u32,
-            root: ptr::null_mut(),
-            name: &mut name,
-            attrs: 0,
-            sd: ptr::null_mut(),
-            qos: ptr::null_mut(),
-        };
-        let mut handle: Handle = ptr::null_mut();
-        let status = unsafe { NtCreateMutant(&mut handle, ACCESS, &mut attrs, owner) };
-        if status == OK {
+            .collect()
+    }
+
+    fn create_single_mutex() -> Option<Handle> {
+        let wide = mutex_name();
+        let handle = unsafe { CreateMutexW(ptr::null_mut(), 1, wide.as_ptr()) };
+        if handle.is_null() {
+            return None;
+        }
+        if unsafe { GetLastError() } != 183 {
+            return Some(handle);
+        }
+
+        // The mutex already exists. CreateMutexW ignores bInitialOwner for
+        // an existing named mutex, so explicitly acquire ownership without
+        // blocking.
+        let wait = unsafe { WaitForSingleObject(handle, 0) };
+        if matches!(wait, WAIT_OBJECT_0 | WAIT_ABANDONED) {
             Some(handle)
         } else {
-            if !handle.is_null() {
-                unsafe { NtClose(handle); }
-            }
+            unsafe { CloseHandle(handle); }
             None
         }
     }
@@ -114,7 +87,7 @@ mod win {
         if update_gate_held() {
             return false;
         }
-        let Some(handle) = create_single_mutant(1) else {
+        let Some(handle) = create_single_mutex() else {
             return false;
         };
         SINGLE_HANDLE.store(handle as usize, Ordering::Release);
@@ -126,9 +99,9 @@ mod win {
         if handle.is_null() {
             return true;
         }
-        let status = unsafe { NtReleaseMutant(handle, ptr::null_mut()) };
-        let close_status = unsafe { NtClose(handle) };
-        status == OK && close_status == OK
+        let released = unsafe { ReleaseMutex(handle) } != 0;
+        let closed = unsafe { CloseHandle(handle) } != 0;
+        released && closed
     }
 
     pub fn acquire_successor_mutex(timeout: Duration) -> bool {
@@ -137,7 +110,7 @@ mod win {
             if SINGLE_HANDLE.load(Ordering::Acquire) != 0 {
                 return true;
             }
-            if let Some(handle) = create_single_mutant(1) {
+            if let Some(handle) = create_single_mutex() {
                 SINGLE_HANDLE.store(handle as usize, Ordering::Release);
                 return true;
             }

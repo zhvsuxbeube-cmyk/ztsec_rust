@@ -84,7 +84,16 @@ def accept_agent(server, timeout=45, process=None):
 
 def send_update(conn, filename, payload):
     encoded = base64.b64encode(payload).decode("ascii")
-    conn.sendall(f"CMD:UPDATE:{filename}:{encoded}\n".encode("ascii"))
+    previous = conn.gettimeout()
+    conn.settimeout(15)
+    try:
+        conn.sendall(f"CMD:UPDATE:{filename}:{encoded}\n".encode("ascii"))
+    finally:
+        conn.settimeout(previous)
+
+
+def phase(name):
+    print(f"[update-test] {name}", flush=True)
 
 
 def main():
@@ -96,6 +105,7 @@ def main():
     if not agent.is_file():
         raise SystemExit(f"missing agent: {agent}")
 
+    test_deadline = time.monotonic() + 120
     with tempfile.TemporaryDirectory(prefix="ztsec-update-test-") as root_name:
         root = Path(root_name)
         install = root / "install"
@@ -123,7 +133,10 @@ def main():
             )
             try:
                 conn = accept_agent(server, process=proc)
+                phase("connected to initial agent")
                 with conn:
+                    if time.monotonic() > test_deadline:
+                        raise RuntimeError("global update test deadline exceeded")
                     # Invalid PE uses the real command dispatcher and must be rejected in-place.
                     conn.sendall(b"CMD:UPDATE:rejected.exe:AAECAwQF\n")
                     result = wait_for_result(conn)
@@ -163,10 +176,15 @@ def main():
                         raise RuntimeError(f"unexpected update acknowledgement: {result}")
 
                 # The old session intentionally closes; the successor must reconnect.
-                proc.wait(timeout=45)
+                phase("waiting for old process to exit after successful handoff")
+                remaining = max(1, int(test_deadline - time.monotonic()))
+                proc.wait(timeout=min(30, remaining))
                 process_output(proc)
                 proc = None
-                conn2 = accept_agent(server, timeout=45)
+                if time.monotonic() > test_deadline:
+                    raise RuntimeError("global update test deadline exceeded before successor reconnect")
+                phase("successor reconnect")
+                conn2 = accept_agent(server, timeout=min(30, max(1, int(test_deadline - time.monotonic()))))
                 with conn2:
                     conn2.sendall(b"CMD:REQ:DATA\n")
                     if wait_for_result(conn2, timeout=15) != "PONG":
@@ -197,11 +215,12 @@ def main():
                             accepted.close()
                             raise RuntimeError("second normal start reached the network despite mutex protection")
 
+                    phase("closing successor")
                     conn2.sendall(b"CMD:CLOSE\n")
                     if wait_for_result(conn2, timeout=15) != "ACK:CLOSE":
                         raise RuntimeError("successor did not close normally")
 
-                deadline = time.time() + 10
+                deadline = min(time.time() + 10, test_deadline)
                 while time.time() < deadline:
                     names = {p.name for p in install.iterdir()}
                     if names == {new.name}:

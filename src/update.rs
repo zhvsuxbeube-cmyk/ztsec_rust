@@ -17,7 +17,7 @@ const HANDOFF_READY: &str = "READY";
 const HANDOFF_FAIL: &str = "FAIL";
 const HANDOFF_INIT_TIMEOUT_MS: u64 = 10_000;
 const HANDOFF_RELEASE_TIMEOUT_MS: u64 = 15_000;
-const HANDOFF_READY_TIMEOUT_MS: u64 = 30_000;
+const HANDOFF_READY_TIMEOUT_MS: u64 = 15_000;
 
 static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
@@ -425,6 +425,9 @@ mod windows_impl {
                 .ok_or("update handoff status reader is unavailable")?;
             if let Err(err) = wait_status(&mut status, HANDOFF_INIT, &self.token, Duration::from_millis(HANDOFF_INIT_TIMEOUT_MS)) {
                 terminate_child(&mut child);
+                drop(status);
+                drop(self.from_child.take());
+                drop(self.to_child.take());
                 return Err(format!("update IPC initialization failed: {err}"));
             }
 
@@ -434,17 +437,29 @@ mod windows_impl {
                 &self.token,
             ) {
                 terminate_child(&mut child);
+                drop(status);
+                drop(self.from_child.take());
+                drop(self.to_child.take());
                 let _ = reacquire_mutex();
                 return Err(format!("failed to send update release: {err}"));
             }
 
             if !sys::release_single() {
                 terminate_child(&mut child);
+                drop(status);
+                drop(self.from_child.take());
+                drop(self.to_child.take());
                 let _ = reacquire_mutex();
                 return Err("failed to release the normal mutex for update handoff".into());
             }
             match wait_status(&mut status, HANDOFF_READY, &self.token, Duration::from_millis(HANDOFF_READY_TIMEOUT_MS)) {
                 Ok(()) => {
+                    // Close both parent-side IPC handles before terminating this process.
+                    // This prevents the successor from retaining an unnecessary open
+                    // control channel and guarantees deterministic EOF/lifetime behavior.
+                    drop(status);
+                    drop(self.from_child.take());
+                    drop(self.to_child.take());
                     if self.gate_held {
                         sys::release_update_gate();
                         self.gate_held = false;
@@ -455,6 +470,9 @@ mod windows_impl {
                 }
                 Err(err) => {
                     terminate_child(&mut child);
+                    drop(status);
+                    drop(self.from_child.take());
+                    drop(self.to_child.take());
                     if !reacquire_mutex() {
                         return Err(format!("update successor failed and old mutex could not be reacquired: {err}"));
                     }

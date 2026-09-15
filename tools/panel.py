@@ -76,8 +76,14 @@ def execute_cmd(ext, path):
     b64 = base64.b64encode(data).decode()
     return f"CMD:EXECUTE:{ext.lower()}:{b64}"
 
-def accept_agent(server):
-    conn, addr = server.accept()
+def accept_agent(server, timeout=None):
+    previous = server.gettimeout()
+    if timeout is not None:
+        server.settimeout(timeout)
+    try:
+        conn, addr = server.accept()
+    finally:
+        server.settimeout(previous)
     conn.settimeout(15)
     print(f"connected {addr[0]}")
     hello = read_line(conn)
@@ -189,7 +195,7 @@ def main():
                     if result.startswith("ACK:UPDATE:"):
                         print("update handoff accepted; waiting for successor")
                         conn.close()
-                        conn = accept_agent(server)
+                        conn = accept_agent(server, timeout=30)
                         print("update restored")
                         continue
                 if lc in {"close", "exit", "quit"}:
