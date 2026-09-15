@@ -34,6 +34,17 @@ class PanelUpdateTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_wait_result_accepts_ack_before_peer_half_close(self):
+        import socket
+        left, right = socket.socketpair()
+        try:
+            right.sendall(b"ACK:UPDATE:\n")
+            right.shutdown(socket.SHUT_WR)
+            self.assertEqual(panel.wait_result(left), "ACK:UPDATE:")
+        finally:
+            left.close()
+            right.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 use std::{
     io::{BufRead, BufReader, ErrorKind, Write},
+    net::Shutdown,
     net::TcpStream,
     thread,
     time::Duration,
@@ -163,15 +164,22 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                     let target = current_exe;
                     let hash = actual_hash;
 
-                    if update::spawn_successor(staged, target, hash, parent_pid).is_err() {
+                    if let Err(err) = update::spawn_successor(staged, target, hash, parent_pid) {
+                        eprintln!("update successor launch failed: {err}");
                         let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
                         continue;
                     }
 
-                    // The successor waits for this process to exit before promoting the
-                    // staged payload. Return normally so the socket/session state is
-                    // dropped and the process exits cleanly after the ACK is written.
-                    let _ = send(stream, &format!("{}{}", text::ACK, text::UPDATE));
+                    // The acknowledgement is the protocol commit point: the panel must be
+                    // able to consume it before this process closes the socket. Write it,
+                    // then gracefully half-close the connection so the peer observes the
+                    // buffered ACK before the process terminates. The successor is already
+                    // waiting for this process to exit before promoting the staged payload.
+                    if let Err(err) = send(stream, &format!("{}{}", text::ACK, text::UPDATE)) {
+                        eprintln!("update acknowledgement send failed: {err}");
+                        return true;
+                    }
+                    let _ = stream.shutdown(Shutdown::Write);
                     return true;
                 }
 

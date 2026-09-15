@@ -112,8 +112,12 @@ jobs:
           }
           if (-not $agent.HasExited) { Stop-Process $agent.Id -Force }
           if ($panel.ExitCode -ne 0) {
+            Write-Host '--- update process diagnostics ---'
+            Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'ztsec_agent.exe' } | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | Format-List | Out-String | Write-Host
+            Write-Host '--- update panel ---'
             Get-Content (Join-Path $work 'panel.out')
             Get-Content (Join-Path $work 'panel.err')
+            Write-Host '--- update original agent ---'
             Get-Content (Join-Path $work 'agent.out')
             Get-Content (Join-Path $work 'agent.err')
             throw "update e2e failed with exit code $($panel.ExitCode)"

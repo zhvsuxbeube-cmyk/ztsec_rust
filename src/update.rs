@@ -597,4 +597,26 @@ mod tests {
         assert_eq!(sha256_file(&path).unwrap(), hash);
         fs::remove_file(path).unwrap();
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn replacement_keeps_target_path_and_installs_exact_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "ztsec-update-replace-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("candidate.exe");
+        let target = root.join("ztsec_agent.exe");
+        let bytes = b"MZ-zts-test-new-image";
+        fs::write(&source, bytes).unwrap();
+        fs::write(&target, b"MZ-zts-test-old-image").unwrap();
+
+        replace_file(&source, &target).unwrap();
+        assert_eq!(fs::read(&target).unwrap(), bytes);
+        assert!(!source.exists());
+        assert_eq!(target.file_name().unwrap(), "ztsec_agent.exe");
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
