@@ -30,7 +30,6 @@ mod win {
     unsafe extern "system" {
         fn CreateMutexW(attrs: *mut core::ffi::c_void, owner: i32, name: *const u16) -> Handle;
         fn GetLastError() -> u32;
-        fn OpenMutexW(access: u32, inherit: i32, name: *const u16) -> Handle;
         fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
         fn ReleaseMutex(handle: Handle) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
