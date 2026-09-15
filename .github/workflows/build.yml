@@ -103,7 +103,16 @@ jobs:
           }
 
           $panel = Start-Process python -ArgumentList 'tools\panel.py','--ip','127.0.0.1','--port','4796','--update-test',(Join-Path $work 'ztsec_agent_updated.exe'),'--expect-version','Rust-Native/2' -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $work 'panel.out') -RedirectStandardError (Join-Path $work 'panel.err')
-          Start-Sleep -Seconds 2
+          $deadline = (Get-Date).AddSeconds(15)
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path (Join-Path $work 'panel.out')) {
+              $panelLog = Get-Content (Join-Path $work 'panel.out') -Raw
+              if ($panelLog -match 'listening 127\.0\.0\.1 4796|listening 127\.0\.0\.1:4796') { break }
+            }
+            Start-Sleep -Milliseconds 100
+          }
+          if (-not (Test-Path (Join-Path $work 'panel.out')) -or ((Get-Content (Join-Path $work 'panel.out') -Raw) -notmatch 'listening 127\.0\.0\.1:4796')) { throw 'update panel did not become ready' }
+          $env:ZTSEC_CI = '1'
           $agent = Start-Process (Join-Path $work 'ztsec_agent.exe') -ArgumentList '--ip','127.0.0.1','--port','4796' -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $work 'agent.out') -RedirectStandardError (Join-Path $work 'agent.err')
           if (-not $panel.WaitForExit(90000)) {
             if (-not $agent.HasExited) { Stop-Process $agent.Id -Force }

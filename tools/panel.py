@@ -112,14 +112,21 @@ def main():
                 tampered = bytearray(update_bytes)
                 tampered[0] ^= 0xFF
                 bad = base64.b64encode(tampered).decode()
+                print("update phase: sending tampered payload")
                 conn.sendall((f"CMD:UPDATE:{digest}:{bad}" + "\n").encode())
                 bad_result = wait_result(conn)
                 if not bad_result.startswith("ERR:UPDATE:"):
                     raise SystemExit("tampered update was not rejected")
+                print("update phase: sending valid payload")
                 conn.sendall((update_cmd(update_path) + "\n").encode())
                 good_result = wait_result(conn)
                 if not good_result.startswith("ACK:UPDATE:"):
                     raise SystemExit("valid update was not acknowledged")
+                print("update phase: valid payload acknowledged; confirming receipt")
+                conn.sendall(("CMD:UPDATE_ACK\n").encode())
+                confirmation = wait_result(conn)
+                if not confirmation.startswith("ACK:UPDATE_ACK"):
+                    raise SystemExit("update acknowledgement was not confirmed")
                 conn.close()
 
                 server.settimeout(45)

@@ -24,6 +24,13 @@ pub fn run(ip: &str, port: u16) {
                     && send(&mut stream, &format!("{}{}", text::DATA, data)).is_ok()
                 {
                     println!("{}", text::CONNECTED);
+                    if std::env::var_os("ZTSEC_CI").is_some() {
+                        eprintln!(
+                            "agent process pid={} exe={}",
+                            std::process::id(),
+                            std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "<unknown>".into())
+                        );
+                    }
                     plugins.event("agent.connected", host.as_bytes());
                     if session(&mut stream, ip, &fp, &host, &mut plugins) {
                         plugins.clear();
@@ -144,20 +151,70 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                         continue;
                     }
 
+                    if std::env::var_os("ZTSEC_CI").is_some() {
+                        eprintln!("update phase=validated bytes={} hash={}", bytes.len(), actual_hash);
+                    }
+
                     let staged = match update::stage_bytes(&bytes, expected_hash) {
                         Ok(path) => path,
-                        Err(_) => {
+                        Err(err) => {
+                            eprintln!("update staging failed: {err}");
                             let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
                             continue;
                         }
                     };
 
+                    // ACK means that the complete update payload has passed all
+                    // integrity checks and has been durably staged. Do not make
+                    // acknowledgement depend on process creation or Windows
+                    // executable handoff; those are a separate phase.
+                    if let Err(err) = send(stream, &format!("{}{}", text::ACK, text::UPDATE)) {
+                        eprintln!("update acknowledgement send failed: {err}");
+                        let _ = std::fs::remove_file(staged);
+                        return true;
+                    }
+
+                    // Require an application-level confirmation from the panel
+                    // before beginning process handoff. This removes the TCP
+                    // delivery/close race from the update commit sequence.
+                    if std::env::var_os("ZTSEC_CI").is_some() {
+                        eprintln!("update phase=ack-sent");
+                    }
+
+                    match line(&mut reader) {
+                        Ok(Some(value)) if value.eq_ignore_ascii_case(&format!("{}{}", text::CMD, text::UPDATE_ACK)) => {
+                            if std::env::var_os("ZTSEC_CI").is_some() {
+                                eprintln!("update phase=ack-confirmed");
+                            }
+                            if let Err(err) = send(stream, &format!("{}{}", text::ACK, text::UPDATE_ACK)) {
+                                eprintln!("update acknowledgement confirmation failed: {err}");
+                                let _ = std::fs::remove_file(staged);
+                                return true;
+                            }
+                        }
+                        Ok(Some(value)) => {
+                            eprintln!("unexpected update acknowledgement confirmation: {value}");
+                            let _ = std::fs::remove_file(staged);
+                            return false;
+                        }
+                        Ok(None) => {
+                            eprintln!("panel disconnected before update acknowledgement confirmation");
+                            let _ = std::fs::remove_file(staged);
+                            return false;
+                        }
+                        Err(err) => {
+                            eprintln!("update acknowledgement confirmation read failed: {err}");
+                            let _ = std::fs::remove_file(staged);
+                            return false;
+                        }
+                    }
+
                     let current_exe = match std::env::current_exe() {
                         Ok(path) => path,
-                        Err(_) => {
+                        Err(err) => {
+                            eprintln!("update current executable lookup failed: {err}");
                             let _ = std::fs::remove_file(staged);
-                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
-                            continue;
+                            return true;
                         }
                     };
                     let parent_pid = std::process::id();
@@ -166,20 +223,17 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
 
                     if let Err(err) = update::spawn_successor(staged, target, hash, parent_pid) {
                         eprintln!("update successor launch failed: {err}");
-                        let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
-                        continue;
-                    }
-
-                    // The acknowledgement is the protocol commit point: the panel must be
-                    // able to consume it before this process closes the socket. Write it,
-                    // then gracefully half-close the connection so the peer observes the
-                    // buffered ACK before the process terminates. The successor is already
-                    // waiting for this process to exit before promoting the staged payload.
-                    if let Err(err) = send(stream, &format!("{}{}", text::ACK, text::UPDATE)) {
-                        eprintln!("update acknowledgement send failed: {err}");
                         return true;
                     }
-                    let _ = stream.shutdown(Shutdown::Write);
+
+                    if std::env::var_os("ZTSEC_CI").is_some() {
+                        eprintln!("update phase=successor-spawned parent_pid={}", parent_pid);
+                    }
+
+                    // The successor is now responsible for the filesystem handoff.
+                    // Close this session normally so the successor can observe the
+                    // parent process exit and promote the staged payload.
+                    let _ = stream.shutdown(Shutdown::Both);
                     return true;
                 }
 
