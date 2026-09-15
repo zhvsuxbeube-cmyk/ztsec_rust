@@ -1,4 +1,7 @@
-use std::{env, process::Command};
+use std::env;
+
+#[cfg(windows)]
+use std::{process::{Command, Stdio}, thread, time::{Duration, Instant}};
 
 #[cfg(windows)]
 use std::net::{Ipv4Addr, ToSocketAddrs};
@@ -101,12 +104,11 @@ pub fn record(target: &str, ping_ms: Option<u128>, fp: &str) -> String {
 fn machine_id() -> Option<String> {
     #[cfg(windows)]
     {
-        let Ok(out) = Command::new(text::REG)
-            .args([text::REG_QUERY, text::REG_64, text::REG_VALUE, text::REG_QUERY_KEY])
-            .output()
-        else {
-            return None;
-        };
+        let out = run_command_with_timeout(
+            text::REG,
+            &[text::REG_QUERY, text::REG_64, text::REG_VALUE, text::REG_QUERY_KEY],
+            Duration::from_secs(3),
+        )?;
         let s = String::from_utf8_lossy(&out.stdout);
         return s.lines().find_map(|line| {
             let mut p = line.split_whitespace();
@@ -275,14 +277,39 @@ fn fmt_duration(secs: u64) -> String {
     out
 }
 
+#[cfg(windows)]
+fn run_command_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    child.wait_with_output().ok()
+}
+
 fn ps(script: &str) -> String {
     #[cfg(windows)]
     {
-        Command::new(text::PS)
-            .args([text::PS_ARG[0], text::PS_ARG[1], text::PS_ARG[2], script])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .unwrap_or_default()
+        run_command_with_timeout(
+            text::PS,
+            &[text::PS_ARG[0], text::PS_ARG[1], text::PS_ARG[2], script],
+            Duration::from_secs(3),
+        )
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
     }
     #[cfg(not(windows))]
     {

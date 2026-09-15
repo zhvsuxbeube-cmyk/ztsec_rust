@@ -30,16 +30,17 @@ pub fn run_with_handoff(ip: &str, port: u16, mut handoff: Option<update::ChildHa
 
                 // Advertise the agent before the slower Windows telemetry probes.
                 if send(&mut stream, &format!("{}{}", text::HELLO, fp)).is_ok() {
+                    if let Some(handoff) = handoff.take() {
+                        if handoff.signal_ready_and_schedule_cleanup().is_err() {
+                            let _ = stream.shutdown(Shutdown::Both);
+                            let _ = sys::release_single();
+                            return;
+                        }
+                    }
+
                     let ping = telemetry::ping_ms(ip);
                     let data = telemetry::record(ip, ping, &fp);
                     if send(&mut stream, &format!("{}{}", text::DATA, data)).is_ok() {
-                        if let Some(handoff) = handoff.take() {
-                            if handoff.signal_ready_and_schedule_cleanup().is_err() {
-                                let _ = stream.shutdown(Shutdown::Both);
-                                let _ = sys::release_single();
-                                return;
-                            }
-                        }
                         let host = telemetry::host(&fp);
                         println!("{}", text::CONNECTED);
                         plugins.event("agent.connected", host.as_bytes());

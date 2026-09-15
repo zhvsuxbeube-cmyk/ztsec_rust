@@ -78,11 +78,14 @@ def execute_cmd(ext, path):
 
 def accept_agent(server):
     conn, addr = server.accept()
+    conn.settimeout(15)
     print(f"connected {addr[0]}")
     hello = read_line(conn)
-    data = read_line(conn)
+    if not hello:
+        conn.close()
+        raise RuntimeError("agent disconnected before HELLO")
     print(hello)
-    show(data)
+    # DATA may follow HELLO after the Windows telemetry probes; leave it queued for wait_result().
     return conn
 
 

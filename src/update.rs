@@ -16,8 +16,8 @@ const HANDOFF_RELEASE: &str = "RELEASE";
 const HANDOFF_READY: &str = "READY";
 const HANDOFF_FAIL: &str = "FAIL";
 const HANDOFF_INIT_TIMEOUT_MS: u64 = 10_000;
-const HANDOFF_RELEASE_TIMEOUT_MS: u64 = 120_000;
-const HANDOFF_READY_TIMEOUT_MS: u64 = 120_000;
+const HANDOFF_RELEASE_TIMEOUT_MS: u64 = 15_000;
+const HANDOFF_READY_TIMEOUT_MS: u64 = 30_000;
 
 static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
@@ -412,7 +412,6 @@ mod windows_impl {
             // Only the three explicit handoff handles should cross the process boundary.
             make_standard_handles_non_inheritable()?;
             let mut child = Command::new(&self.target_path)
-                .current_dir(self.target_path.parent().ok_or("update target has no directory")?)
                 .stdin(Stdio::from(child_stdin))
                 .stderr(Stdio::from(child_stderr))
                 .stdout(Stdio::null())
@@ -487,7 +486,7 @@ mod windows_impl {
             return Ok(None);
         }
 
-        let mut peek = [0u8; HANDOFF_MAGIC.len()];
+        let mut peek = [0u8; 34];
         let mut available = 0u32;
         let ok = unsafe {
             PeekNamedPipe(
@@ -502,12 +501,25 @@ mod windows_impl {
         if ok == 0 || available < HANDOFF_MAGIC.len() as u32 {
             return Ok(None);
         }
-        if &peek != HANDOFF_MAGIC {
+        if available < peek.len() as u32 || &peek[..HANDOFF_MAGIC.len()] != HANDOFF_MAGIC {
+            return Ok(None);
+        }
+
+        let ip_len = u16::from_le_bytes(peek[30..32].try_into().unwrap()) as usize;
+        let old_len = u16::from_le_bytes(peek[32..34].try_into().unwrap()) as usize;
+        if ip_len == 0 || ip_len > MAX_HANDOFF_IP_BYTES || old_len == 0 || old_len > MAX_HANDOFF_OLD_NAME_UTF16 * 2 {
+            return Err("invalid update handoff metadata".into());
+        }
+        let total = 34usize
+            .checked_add(ip_len)
+            .and_then(|n| n.checked_add(old_len))
+            .ok_or("invalid update handoff length")?;
+        if available < total as u32 {
             return Ok(None);
         }
 
         let mut stdin = std::io::stdin();
-        let mut fixed = [0u8; 34];
+        let mut fixed = peek;
         stdin
             .read_exact(&mut fixed)
             .map_err(|e| format!("failed to read update handoff header: {e}"))?;
@@ -522,12 +534,6 @@ mod windows_impl {
         }
         let parent_pid = u32::from_le_bytes(fixed[24..28].try_into().unwrap());
         let port = u16::from_le_bytes(fixed[28..30].try_into().unwrap());
-        let ip_len = u16::from_le_bytes(fixed[30..32].try_into().unwrap()) as usize;
-        let old_len = u16::from_le_bytes(fixed[32..34].try_into().unwrap()) as usize;
-        if ip_len == 0 || ip_len > MAX_HANDOFF_IP_BYTES || old_len == 0 || old_len > MAX_HANDOFF_OLD_NAME_UTF16 * 2 {
-            return Err("invalid update handoff metadata".into());
-        }
-
         let mut ip_bytes = vec![0u8; ip_len];
         stdin
             .read_exact(&mut ip_bytes)

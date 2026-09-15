@@ -72,11 +72,6 @@ def accept_agent(server, timeout=45, process=None):
                 last_error = f"unexpected hello: {hello!r}"
                 conn.close()
                 continue
-            data = read_line(conn)
-            if not data or not data.startswith("DATA:"):
-                last_error = f"unexpected data: {data!r}"
-                conn.close()
-                continue
             return conn
         except (ConnectionError, OSError) as exc:
             last_error = f"agent connection failed: {exc}"
