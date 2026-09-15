@@ -38,10 +38,14 @@ pub fn run_with_handoff(ip: &str, port: u16, mut handoff: Option<update::ChildHa
                         }
                     }
 
+                    let host = telemetry::host(&fp);
+                    // Keep the connection responsive during startup. The detailed
+                    // Windows probes are individually bounded and are only collected
+                    // for the initial DATA snapshot; the command loop must remain
+                    // reachable even when a probe is slow or unavailable.
                     let ping = telemetry::ping_ms(ip);
                     let data = telemetry::record(ip, ping, &fp);
                     if send(&mut stream, &format!("{}{}", text::DATA, data)).is_ok() {
-                        let host = telemetry::host(&fp);
                         println!("{}", text::CONNECTED);
                         plugins.event("agent.connected", host.as_bytes());
                         match session(&mut stream, ip, port, &fp, &host, &mut plugins) {
@@ -305,6 +309,7 @@ fn line(r: &mut BufReader<TcpStream>) -> io::Result<Option<String>> {
 }
 
 fn send(stream: &mut TcpStream, s: &str) -> std::io::Result<()> {
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     stream.write_all(s.as_bytes())?;
     stream.write_all(b"\n")
 }

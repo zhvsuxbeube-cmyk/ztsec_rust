@@ -82,6 +82,15 @@ def accept_agent(server, timeout=45, process=None):
     raise RuntimeError(last_error)
 
 
+def send_line(conn, line):
+    previous = conn.gettimeout()
+    conn.settimeout(10)
+    try:
+        conn.sendall(line.encode("utf-8"))
+    finally:
+        conn.settimeout(previous)
+
+
 def send_update(conn, filename, payload):
     encoded = base64.b64encode(payload).decode("ascii")
     previous = conn.gettimeout()
@@ -139,14 +148,14 @@ def main():
                         raise RuntimeError("global update test deadline exceeded")
                     phase("invalid PE rejection")
                     # Invalid PE uses the real command dispatcher and must be rejected in-place.
-                    conn.sendall(b"CMD:UPDATE:rejected.exe:AAECAwQF\n")
+                    send_line(conn, "CMD:UPDATE:rejected.exe:AAECAwQF\n")
                     result = wait_for_result(conn)
                     if not result.startswith("ERR:UPDATE:"):
                         raise RuntimeError(f"invalid update was not rejected: {result}")
 
                     phase("path traversal rejection")
                     # Traversal is rejected before any filesystem write.
-                    conn.sendall(b"CMD:UPDATE:..\\escape.exe:AAECAwQF\n")
+                    send_line(conn, "CMD:UPDATE:..\\escape.exe:AAECAwQF\n")
                     result = wait_for_result(conn)
                     if not result.startswith("ERR:UPDATE:"):
                         raise RuntimeError(f"traversal was not rejected: {result}")
@@ -166,7 +175,7 @@ def main():
                 # The old installation must remain running after the successor fails handoff.
                 conn_failed = accept_agent(server, timeout=45)
                 with conn_failed:
-                    conn_failed.sendall(b"CMD:REQ:DATA\n")
+                    send_line(conn_failed, "CMD:REQ:DATA\n")
                     if wait_for_result(conn_failed, timeout=15) != "PONG":
                         raise RuntimeError("old installation was not usable after failed update")
                     if (install / "failed_update.exe").exists():
@@ -190,7 +199,7 @@ def main():
                 phase("successor reconnect")
                 conn2 = accept_agent(server, timeout=min(30, max(1, int(test_deadline - time.monotonic()))))
                 with conn2:
-                    conn2.sendall(b"CMD:REQ:DATA\n")
+                    send_line(conn2, "CMD:REQ:DATA\n")
                     if wait_for_result(conn2, timeout=15) != "PONG":
                         raise RuntimeError("successor did not answer REQ:DATA")
                     # The replacement must own the normal mutex while it is running.
@@ -220,7 +229,7 @@ def main():
                             raise RuntimeError("second normal start reached the network despite mutex protection")
 
                     phase("closing successor")
-                    conn2.sendall(b"CMD:CLOSE\n")
+                    send_line(conn2, "CMD:CLOSE\n")
                     if wait_for_result(conn2, timeout=15) != "ACK:CLOSE":
                         raise RuntimeError("successor did not close normally")
 

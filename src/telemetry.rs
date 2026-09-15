@@ -107,7 +107,7 @@ fn machine_id() -> Option<String> {
         let out = run_command_with_timeout(
             text::REG,
             &[text::REG_QUERY, text::REG_64, text::REG_VALUE, text::REG_QUERY_KEY],
-            Duration::from_secs(3),
+            Duration::from_secs(1),
         )?;
         let s = String::from_utf8_lossy(&out);
         return s.lines().find_map(|line| {
@@ -333,6 +333,19 @@ fn run_command_with_timeout(program: &str, args: &[&str], timeout: Duration) -> 
     drop(output_file);
     let _ = std::fs::remove_file(&path);
     finished.then_some(stdout)
+}
+
+#[cfg(windows)]
+fn ps(script: &str) -> String {
+    let args = [text::PS_ARG[0], text::PS_ARG[1], text::PS_ARG[2], script];
+    run_command_with_timeout(text::PS, &args, Duration::from_secs(1))
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_else(|| "Unknown".into())
+}
+
+#[cfg(not(windows))]
+fn ps(_script: &str) -> String {
+    "Unknown".into()
 }
 
 fn clean(v: String) -> String {
