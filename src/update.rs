@@ -363,6 +363,7 @@ mod windows_impl {
     fn write_final_executable(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let result = (|| {
             let mut file = OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .open(path)
