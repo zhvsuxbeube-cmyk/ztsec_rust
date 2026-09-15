@@ -2,7 +2,12 @@
 fn contract() {
     let source = std::fs::read_to_string("src/text.rs").unwrap();
     for command in [
-        "SLEEP", "HIBERNATE", "RESTART", "SHUTDOWN", "RECONNECT", "CLOSE", "EXECUTE", "UPDATE",
+        "SLEEP",
+        "HIBERNATE",
+        "RESTART",
+        "SHUTDOWN",
+        "RECONNECT",
+        "CLOSE",
     ] {
         assert!(source.contains(command));
     }
@@ -14,33 +19,7 @@ fn contract() {
     assert!(source.contains("PLUGIN:"));
     assert!(source.contains("PLUGIN_EVENT:"));
     assert!(source.contains("PLUGIN_OUT:"));
+    assert!(source.contains(".Caption -replace '^Microsoft\\s+', ''"));
     assert!(source.contains("){'Admin'}else{'User'}"));
     assert!(!source.contains("DisplayVersion"));
-}
-
-#[test]
-fn update_contract_is_minimal() {
-    let source = std::fs::read_to_string("src/update.rs").unwrap();
-    let main = std::fs::read_to_string("src/main.rs").unwrap();
-    let net = std::fs::read_to_string("src/net.rs").unwrap();
-    assert!(source.contains("_update"));
-    assert!(source.contains("success.txt"));
-    assert!(source.contains("failed.txt"));
-    assert!(source.contains("create_new(true)"));
-    assert!(source.contains("release"));
-    assert!(source.contains("acquire"));
-    assert!(source.contains("cmd.exe"));
-    assert!(source.contains("move /Y"));
-    assert!(source.contains("start"));
-    assert!(main.contains("update::is_update()"));
-    assert!(!source.contains("TcpListener"));
-    assert!(!source.contains("BCryptGenRandom"));
-    assert!(!source.contains("update-signal"));
-    assert!(!source.contains("--update-child"));
-    assert!(!source.contains("PeekNamedPipe"));
-    assert!(!source.contains("ChildHandoff"));
-    assert!(source.contains("fn up_name"));
-    assert!(net.contains("send(stream, \"ACK:UPDATE\")"));
-    assert!(net.contains("send(stream, \"ERR:UPDATE:\")"));
-    assert!(source.contains(r#"format!("{stem}{UPDATE_SUFFIX}{ext}")"#));
 }

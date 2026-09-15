@@ -1,21 +1,35 @@
 #[cfg(windows)]
 mod win {
-    use std::{
-        ffi::OsStr,
-        iter,
-        os::windows::ffi::OsStrExt,
-        sync::atomic::{AtomicUsize, Ordering},
-        thread,
-        time::{Duration, Instant},
-    };
+    use std::{ffi::OsStr, iter, os::windows::ffi::OsStrExt, ptr};
 
     type Handle = *mut core::ffi::c_void;
     type Status = i32;
 
-    static SINGLE_HANDLE: AtomicUsize = AtomicUsize::new(0);
+    #[repr(C)]
+    struct Unicode {
+        len: u16,
+        max: u16,
+        buf: *mut u16,
+    }
+
+    #[repr(C)]
+    struct Attrs {
+        len: u32,
+        root: Handle,
+        name: *mut Unicode,
+        attrs: u32,
+        sd: *mut core::ffi::c_void,
+        qos: *mut core::ffi::c_void,
+    }
 
     #[link(name = "ntdll")]
     unsafe extern "system" {
+        fn NtCreateMutant(
+            handle: *mut Handle,
+            access: u32,
+            attrs: *mut Attrs,
+            owner: u8,
+        ) -> Status;
         fn RtlAdjustPrivilege(
             privilege: u32,
             enable: u8,
@@ -26,22 +40,9 @@ mod win {
         fn NtShutdownSystem(action: i32) -> Status;
     }
 
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateMutexW(attrs: *mut core::ffi::c_void, owner: i32, name: *const u16) -> Handle;
-        fn GetLastError() -> u32;
-        fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
-        fn ReleaseMutex(handle: Handle) -> i32;
-        fn CloseHandle(handle: Handle) -> i32;
-    }
-
     const OK: Status = 0;
+    const ACCESS: u32 = 0x001F0001;
     const SHUTDOWN: u32 = 19;
-
-    const WAIT_OBJECT_0: u32 = 0;
-    const WAIT_TIMEOUT: u32 = 0x0000_0102;
-    const WAIT_ABANDONED: u32 = 0x0000_0080;
-    const ERROR_ALREADY_EXISTS: u32 = 183;
     const SLEEP: i32 = 2;
     const HIBERNATE: i32 = 3;
     const REBOOT: i32 = 1;
@@ -49,74 +50,27 @@ mod win {
     const S3: i32 = 4;
     const S4: i32 = 5;
 
-    fn mutex_name() -> Vec<u16> {
-        OsStr::new(crate::text::MUTEX)
+    pub fn single() -> bool {
+        let wide: Vec<u16> = OsStr::new(crate::text::MUTEX)
             .encode_wide()
             .chain(iter::once(0))
-            .collect()
-    }
-
-    fn create_single_mutex() -> Option<Handle> {
-        let wide = mutex_name();
-        let handle = unsafe { CreateMutexW(core::ptr::null_mut(), 1, wide.as_ptr()) };
-        if handle.is_null() {
-            return None;
-        }
-        if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
-            return Some(handle);
-        }
-
-        // For an existing named mutex, explicitly perform a zero-time ownership
-        // attempt. If CreateMutexW supplied a usable handle but ownership is
-        // unavailable, close it rather than ever blocking the caller.
-        let wait = unsafe { WaitForSingleObject(handle, 0) };
-        match wait {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Some(handle),
-            WAIT_TIMEOUT => {
-                unsafe { CloseHandle(handle); }
-                None
-            }
-            _ => {
-                unsafe { CloseHandle(handle); }
-                None
-            }
-        }
-    }
-
-    pub fn single() -> bool {
-        let Some(handle) = create_single_mutex() else {
-            return false;
+            .collect();
+        let mut name = Unicode {
+            len: ((wide.len() - 1) * 2) as u16,
+            max: (wide.len() * 2) as u16,
+            buf: wide.as_ptr() as *mut u16,
         };
-        SINGLE_HANDLE.store(handle as usize, Ordering::Release);
-        true
-    }
+        let mut attrs = Attrs {
+            len: core::mem::size_of::<Attrs>() as u32,
+            root: ptr::null_mut(),
+            name: &mut name,
+            attrs: 0,
+            sd: ptr::null_mut(),
+            qos: ptr::null_mut(),
+        };
+        let mut handle: Handle = ptr::null_mut();
 
-    pub fn release() -> bool {
-        let handle = SINGLE_HANDLE.swap(0, Ordering::AcqRel) as Handle;
-        if handle.is_null() {
-            return true;
-        }
-        let released = unsafe { ReleaseMutex(handle) } != 0;
-        let closed = unsafe { CloseHandle(handle) } != 0;
-        let ok = released && closed;
-        ok
-    }
-
-    pub fn acquire(timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if SINGLE_HANDLE.load(Ordering::Acquire) != 0 {
-                return true;
-            }
-            if let Some(handle) = create_single_mutex() {
-                SINGLE_HANDLE.store(handle as usize, Ordering::Release);
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
+        unsafe { NtCreateMutant(&mut handle, ACCESS, &mut attrs, 0) == OK }
     }
 
     fn privilege() -> bool {
@@ -143,12 +97,13 @@ mod win {
 
 #[cfg(not(windows))]
 mod win {
-    use std::time::Duration;
+    pub fn single() -> bool {
+        true
+    }
 
-    pub fn single() -> bool { true }
-    pub fn release() -> bool { true }
-    pub fn acquire(_: Duration) -> bool { true }
-    pub fn command(_: &str) -> bool { false }
+    pub fn command(_: &str) -> bool {
+        false
+    }
 }
 
-pub use win::{acquire, command, release, single};
+pub use win::{command, single};

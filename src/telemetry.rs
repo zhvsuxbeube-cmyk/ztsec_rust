@@ -1,7 +1,4 @@
-use std::{env, fs::OpenOptions, io::{Read, Seek, SeekFrom}, sync::atomic::{AtomicU64, Ordering as AtomicOrdering}};
-
-#[cfg(windows)]
-use std::{process::{Command, Stdio}, thread, time::{Duration, Instant}};
+use std::{env, process::Command};
 
 #[cfg(windows)]
 use std::net::{Ipv4Addr, ToSocketAddrs};
@@ -104,12 +101,13 @@ pub fn record(target: &str, ping_ms: Option<u128>, fp: &str) -> String {
 fn machine_id() -> Option<String> {
     #[cfg(windows)]
     {
-        let out = run_command_with_timeout(
-            text::REG,
-            &[text::REG_QUERY, text::REG_64, text::REG_VALUE, text::REG_QUERY_KEY],
-            Duration::from_secs(1),
-        )?;
-        let s = String::from_utf8_lossy(&out);
+        let Ok(out) = Command::new(text::REG)
+            .args([text::REG_QUERY, text::REG_64, text::REG_VALUE, text::REG_QUERY_KEY])
+            .output()
+        else {
+            return None;
+        };
+        let s = String::from_utf8_lossy(&out.stdout);
         return s.lines().find_map(|line| {
             let mut p = line.split_whitespace();
             let key = p.next()?;
@@ -156,10 +154,10 @@ fn afk() -> String {
         };
         if unsafe { GetLastInputInfo(&mut info) } != 0 {
             let now = unsafe { GetTickCount64() };
-            return fmt_duration((now as u32).wrapping_sub(info.tick) as u64 / 1_000);
+            return human((now as u32).wrapping_sub(info.tick) as u64);
         }
     }
-    "0m".into()
+    "0s".into()
 }
 
 fn uptime() -> String {
@@ -169,7 +167,7 @@ fn uptime() -> String {
         unsafe extern "system" {
             fn GetTickCount64() -> u64;
         }
-        return fmt_duration(unsafe { GetTickCount64() } / 1_000);
+        return human(unsafe { GetTickCount64() } / 1_000);
     }
     #[cfg(not(windows))]
     {
@@ -265,87 +263,36 @@ fn icmp_ping_ms(ip: Ipv4Addr) -> Option<u128> {
     result
 }
 
-fn fmt_duration(secs: u64) -> String {
+fn human(mut secs: u64) -> String {
     let d = secs / 86_400;
-    let h = (secs % 86_400) / 3_600;
-    let m = (secs % 3_600) / 60;
+    secs %= 86_400;
+    let h = secs / 3_600;
+    secs %= 3_600;
+    let m = secs / 60;
+    let s = secs % 60;
     let mut out = String::new();
     if d > 0 { out.push_str(&format!("{d}d")); }
     if h > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{h}h")); }
-    if !out.is_empty() { out.push(' '); }
-    out.push_str(&format!("{m}m"));
+    if m > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{m}m")); }
+    if s > 0 { if !out.is_empty() { out.push(' '); } out.push_str(&format!("{s}s")); }
+    if out.is_empty() { out.push_str("0s"); }
     out
 }
 
-#[cfg(windows)]
-static TELEMETRY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(windows)]
-fn run_command_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
-    // Avoid stdout=PIPE: PowerShell/WMI can leave descendants holding an inherited
-    // pipe handle open, making wait_with_output() wait forever for EOF. A temporary
-    // file decouples process lifetime from stdout consumption.
-    let id = TELEMETRY_TMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "ztsec-telemetry-{}-{}.out",
-        std::process::id(),
-        id
-    ));
-    let file = OpenOptions::new().create_new(true).read(true).write(true).open(&path).ok()?;
-    let child_stdout = match file.try_clone() {
-        Ok(f) => f,
-        Err(_) => {
-            let _ = std::fs::remove_file(&path);
-            return None;
-        }
-    };
-    let mut child = match Command::new(program)
-        .args(args)
-        .stdout(Stdio::from(child_stdout))
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => {
-            let _ = std::fs::remove_file(&path);
-            return None;
-        }
-    };
-
-    let deadline = Instant::now() + timeout;
-    let finished = loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break true,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break false;
-            }
-        }
-    };
-
-    drop(child);
-    let mut output_file = file;
-    let _ = output_file.seek(SeekFrom::Start(0));
-    let mut stdout = Vec::new();
-    let _ = output_file.read_to_end(&mut stdout);
-    drop(output_file);
-    let _ = std::fs::remove_file(&path);
-    finished.then_some(stdout)
-}
-
-#[cfg(windows)]
 fn ps(script: &str) -> String {
-    let args = [text::PS_ARG[0], text::PS_ARG[1], text::PS_ARG[2], script];
-    run_command_with_timeout(text::PS, &args, Duration::from_secs(1))
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_else(|| "Unknown".into())
-}
-
-#[cfg(not(windows))]
-fn ps(_script: &str) -> String {
-    "Unknown".into()
+    #[cfg(windows)]
+    {
+        Command::new(text::PS)
+            .args([text::PS_ARG[0], text::PS_ARG[1], text::PS_ARG[2], script])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = script;
+        String::new()
+    }
 }
 
 fn clean(v: String) -> String {
@@ -384,9 +331,9 @@ mod tests {
 
     #[test]
     fn uptime_contract() {
-        assert_eq!(super::fmt_duration(30), "0m");
-        assert_eq!(super::fmt_duration(121), "2m");
-        assert_eq!(super::fmt_duration(7320), "2h 2m");
-        assert_eq!(super::fmt_duration(97_260), "1d 3h 1m");
+        assert_eq!(super::human(30), "30s");
+        assert_eq!(super::human(121), "2m 1s");
+        assert_eq!(super::human(7320), "2h 2m");
+        assert_eq!(super::human(97_260), "1d 3h 1m");
     }
 }

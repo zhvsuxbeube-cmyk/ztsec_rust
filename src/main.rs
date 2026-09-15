@@ -6,18 +6,11 @@ mod sys;
 mod syscalls;
 mod telemetry;
 mod text;
-mod update;
 
 fn main() {
-    if update::is_update() {
-        let args = args::get();
-        let _ = update::run(&args.ip, args.port);
-        return;
-    }
-
-    let args = args::get();
     if !sys::single() {
         return;
     }
+    let args = args::get();
     net::run(&args.ip, args.port);
 }
