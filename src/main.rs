@@ -11,7 +11,9 @@ mod update;
 fn main() {
     if update::is_update_child() {
         let args = args::get();
-        if !sys::single() {
+        // The parent releases its mutex only after spawning us, so we must
+        // poll with a generous timeout rather than trying once and giving up.
+        if !sys::acquire_successor_mutex(std::time::Duration::from_secs(30)) {
             eprintln!("update successor could not acquire the normal mutex");
             return;
         }
