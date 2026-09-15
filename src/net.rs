@@ -24,22 +24,30 @@ pub fn run_with_update_signal(ip: &str, port: u16) {
 }
 
 fn run_internal(ip: &str, port: u16, update_child: bool) {
+    eprintln!("[DEBUG][net] phase=start update_child={} ip={} port={}", update_child, ip, port);
     let fp = telemetry::fingerprint();
     let mut plugins = Manager::new();
 
     loop {
+        eprintln!("[DEBUG][net] phase=connect attempt");
         match TcpStream::connect((ip, port)) {
             Ok(mut stream) => {
+                eprintln!("[DEBUG][net] phase=connect result=OK");
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(text::READ)));
 
                 // Advertise the agent before the slower Windows telemetry probes.
-                if send(&mut stream, &format!("{}{}", text::HELLO, fp)).is_ok() {
+                let hello_ok = send(&mut stream, &format!("{}{}", text::HELLO, fp)).is_ok();
+                eprintln!("[DEBUG][net] phase=send_hello result={}", hello_ok);
+                if hello_ok {
                     if update_child {
+                        eprintln!("[DEBUG][net] phase=update_child_signal start");
                         if update::signal_success().is_err() {
+                            eprintln!("[DEBUG][net] phase=update_child_signal result=FAIL");
                             let _ = stream.shutdown(Shutdown::Both);
                             let _ = sys::release_single();
                             return;
                         }
+                        eprintln!("[DEBUG][net] phase=update_child_signal result=OK");
                     }
 
                     let host = telemetry::host(&fp);
@@ -61,11 +69,17 @@ fn run_internal(ip: &str, port: u16, update_child: bool) {
                                 return;
                             }
                             SessionOutcome::Update(pending) => {
+                                eprintln!("[DEBUG][net] phase=update_session result=UPDATE");
                                 let _ = stream.shutdown(Shutdown::Both);
                                 plugins.clear();
+                                eprintln!("[DEBUG][net] phase=finish_after_disconnect start");
                                 match pending.finish_after_disconnect(ip, port) {
-                                    Ok(()) => std::process::exit(0),
+                                    Ok(()) => {
+                                        eprintln!("[DEBUG][net] phase=finish_after_disconnect result=OK");
+                                        std::process::exit(0)
+                                    },
                                     Err(err) => {
+                                        eprintln!("[DEBUG][net] phase=finish_after_disconnect result=FAIL error={err}");
                                         eprintln!("update handoff failed: {err}");
                                     }
                                 }
@@ -74,7 +88,7 @@ fn run_internal(ip: &str, port: u16, update_child: bool) {
                     }
                 }
             }
-            Err(_) => {}
+            Err(err) => { eprintln!("[DEBUG][net] phase=connect result=FAIL error={err}"); }
         }
 
         println!("{}", text::RETRYING);
@@ -118,9 +132,12 @@ fn session(
                         let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
                         continue;
                     };
+                    eprintln!("[DEBUG][net] phase=update_prepare start filename={} bytes={}", filename, bytes.len());
                     match update::prepare(ip, port, filename, &bytes) {
                         Ok(pending) => {
+                            eprintln!("[DEBUG][net] phase=update_prepare result=OK target={}", pending.filename());
                             let _ = send(stream, &format!("{}{}{}", text::ACK, text::UPDATE, pending.filename()));
+                            eprintln!("[DEBUG][net] phase=update_ack sent");
                             return SessionOutcome::Update(pending);
                         }
                         Err(err) => {

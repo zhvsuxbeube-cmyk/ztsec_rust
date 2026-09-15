@@ -201,15 +201,19 @@ mod windows_impl {
             if bytes.is_empty() || bytes.len() > MAX_UPDATE_BYTES {
                 return Err("update payload size is invalid".into());
             }
+            eprintln!("[DEBUG][update] phase=prepare validate_pe start bytes={}", bytes.len());
             validate_pe(bytes)?;
+            eprintln!("[DEBUG][update] phase=prepare validate_pe result=OK");
 
             let normalized = normalize_filename(filename)?;
+            eprintln!("[DEBUG][update] phase=prepare filename normalized={}", normalized);
             let current = current_executable()?;
             let directory = current
                 .parent()
                 .ok_or("current executable has no installation directory")?
                 .to_path_buf();
             let target = directory.join(&normalized);
+            eprintln!("[DEBUG][update] phase=prepare target={} old={}", target.display(), current.display());
 
             if target.file_name() != Some(OsStr::new(&normalized)) {
                 return Err("invalid update target filename".into());
@@ -221,7 +225,9 @@ mod windows_impl {
                 return Err("update target already exists".into());
             }
 
+            eprintln!("[DEBUG][update] phase=prepare write_file start");
             write_final_executable(&target, bytes)?;
+            eprintln!("[DEBUG][update] phase=prepare write_file result=OK");
             created_target = Some(target.clone());
             Ok(PreparedUpdate {
                 target_path: target,
@@ -231,8 +237,12 @@ mod windows_impl {
         })();
 
         match result {
-            Ok(v) => Ok(v),
+            Ok(v) => {
+                eprintln!("[DEBUG][update] phase=prepare result=OK");
+                Ok(v)
+            }
             Err(err) => {
+                eprintln!("[DEBUG][update] phase=prepare result=FAIL error={err}");
                 if let Some(path) = created_target {
                     let _ = fs::remove_file(path);
                 }
@@ -253,6 +263,7 @@ mod windows_impl {
         pub fn finish_after_disconnect(mut self, ip: &str, port: u16) -> Result<(), String> {
             // Minimal handoff: release -> launch -> successor connects -> SUCCESS.
             // There is no token, second mutex, or parent/child control protocol.
+            eprintln!("[DEBUG][update] phase=release_mutex start");
             eprintln!("[update-handoff] releasing normal mutex");
             if !sys::release_single() {
                 return Err("failed to release the normal mutex for update".into());
@@ -269,8 +280,12 @@ mod windows_impl {
                 .spawn();
 
             let mut child = match spawn_result {
-                Ok(child) => child,
+                Ok(child) => {
+                    eprintln!("[DEBUG][update] phase=spawn_successor result=OK pid={}", child.id());
+                    child
+                },
                 Err(err) => {
+                    eprintln!("[DEBUG][update] phase=spawn_successor result=FAIL error={err}");
                     let _ = fs::remove_file(&self.target_path);
                     if !sys::acquire_successor_mutex(Duration::from_secs(5)) {
                         return Err(format!("update launch failed: {err}; original could not reacquire the normal mutex"));
@@ -279,6 +294,7 @@ mod windows_impl {
                 }
             };
 
+            eprintln!("[DEBUG][update] phase=wait_success start timeout_s={}", UPDATE_CHILD_TIMEOUT.as_secs());
             let Some(stdout) = child.stdout.take() else {
                 terminate_child(&mut child);
                 let _ = fs::remove_file(&self.target_path);
@@ -289,6 +305,7 @@ mod windows_impl {
             };
 
             if wait_for_success(stdout, UPDATE_CHILD_TIMEOUT) {
+                eprintln!("[DEBUG][update] phase=wait_success result=SUCCESS");
                 eprintln!("[update-handoff] successor connected successfully");
                 if let Err(err) = schedule_old_image_delete(&self.old_path) {
                     eprintln!("[update-handoff] warning: {err}");
@@ -298,6 +315,7 @@ mod windows_impl {
                 return Ok(());
             }
 
+            eprintln!("[DEBUG][update] phase=wait_success result=TIMEOUT_OR_BAD_SIGNAL");
             eprintln!("[update-handoff] successor did not report SUCCESS within 60 seconds");
             terminate_child(&mut child);
             let _ = fs::remove_file(&self.target_path);
@@ -323,18 +341,23 @@ mod windows_impl {
     }
 
     pub fn signal_success() -> io::Result<()> {
+        eprintln!("[DEBUG][update-child] phase=signal_success start");
         let mut stdout = io::stdout();
         stdout.write_all(UPDATE_SUCCESS.as_bytes())?;
         stdout.write_all(b"\n")?;
-        stdout.flush()
+        let result = stdout.flush();
+        eprintln!("[DEBUG][update-child] phase=signal_success result={:?}", result);
+        result
     }
 
     fn wait_for_success(mut stdout: std::process::ChildStdout, timeout: Duration) -> bool {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
+            eprintln!("[DEBUG][update] phase=child_stdout reader=START");
             let mut buffer = String::new();
-            let result = io::BufReader::new(&mut stdout).read_line(&mut buffer).is_ok()
-                && buffer.trim() == UPDATE_SUCCESS;
+            let read_ok = io::BufReader::new(&mut stdout).read_line(&mut buffer).is_ok();
+            eprintln!("[DEBUG][update] phase=child_stdout reader=LINE read_ok={} raw={:?}", read_ok, buffer.trim_end());
+            let result = read_ok && buffer.trim() == UPDATE_SUCCESS;
             let _ = tx.send(result);
         });
         rx.recv_timeout(timeout).unwrap_or(false)

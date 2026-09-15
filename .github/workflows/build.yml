@@ -81,9 +81,11 @@ jobs:
         run: |
           python tools\python_update_handoff\testpanel.py --timeout 60
           if ($LASTEXITCODE -ne 0) { throw 'minimal Python update handoff failed' }
-      - name: Update handoff
+      - name: Update handoff (verbose debug)
         shell: pwsh
         run: |
+          $env:PYTHONUNBUFFERED = '1'
+          Write-Host '=== UPDATE HANDOFF DEBUG: begin ==='
           $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
           python tools\update_test.py --agent $exe
           if ($LASTEXITCODE -ne 0) { throw 'update handoff test failed' }

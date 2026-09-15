@@ -25,11 +25,13 @@ def read_line(conn):
 
 
 def wait_for_result(conn, timeout=30):
+    phase(f"wait_for_result start timeout={timeout}s")
     conn.settimeout(timeout)
     while True:
         line = read_line(conn)
         if line is None:
             raise RuntimeError("agent disconnected before result")
+        print(f"[DEBUG][update-test] t={time.monotonic():.3f} recv={line!r}", flush=True)
         if line == "HB":
             conn.sendall(b"PONG\n")
             continue
@@ -38,6 +40,7 @@ def wait_for_result(conn, timeout=30):
         if line.startswith("DATA:"):
             continue
         if line.startswith("ACK:") or line.startswith("ERR:"):
+            phase(f"wait_for_result done result={line!r}")
             return line
 
 
@@ -54,6 +57,7 @@ def process_output(process):
 
 
 def accept_agent(server, timeout=45, process=None):
+    phase(f"accept_agent start timeout={timeout}s")
     deadline = time.time() + timeout
     last_error = "timed out"
     server.settimeout(min(2.0, max(0.1, timeout)))
@@ -72,6 +76,7 @@ def accept_agent(server, timeout=45, process=None):
                 last_error = f"unexpected hello: {hello!r}"
                 conn.close()
                 continue
+            phase("accept_agent got valid HELLO")
             return conn
         except (ConnectionError, OSError) as exc:
             last_error = f"agent connection failed: {exc}"
@@ -79,6 +84,7 @@ def accept_agent(server, timeout=45, process=None):
                 conn.close()
             except OSError:
                 pass
+    phase(f"accept_agent timeout error={last_error}")
     raise RuntimeError(last_error)
 
 
@@ -86,9 +92,11 @@ def send_line(conn, line):
     previous = conn.gettimeout()
     conn.settimeout(10)
     try:
+        phase(f"send_line start prefix={line.split(':', 1)[0]}")
         conn.sendall(line.encode("utf-8"))
     finally:
         conn.settimeout(previous)
+    phase("send_line done")
 
 
 def send_update(conn, filename, payload):
@@ -96,13 +104,15 @@ def send_update(conn, filename, payload):
     previous = conn.gettimeout()
     conn.settimeout(15)
     try:
+        phase(f"send_update start filename={filename} bytes={len(payload)}")
         conn.sendall(f"CMD:UPDATE:{filename}:{encoded}\n".encode("ascii"))
     finally:
         conn.settimeout(previous)
+    phase(f"send_update done filename={filename}")
 
 
 def phase(name):
-    print(f"[update-test] {name}", flush=True)
+    print(f"[DEBUG][update-test] t={time.monotonic():.3f} phase={name}", flush=True)
 
 
 def main():
@@ -134,11 +144,12 @@ def main():
             server.listen(4)
             port = server.getsockname()[1]
 
+            phase(f"starting original executable={old}")
             proc = subprocess.Popen(
                 [str(old), "--ip", "127.0.0.1", "--port", str(port)],
                 cwd=str(root),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=None,
+                stderr=None,
             )
             try:
                 conn = accept_agent(server, process=proc)
@@ -172,6 +183,7 @@ def main():
                     if result != "ACK:UPDATE:failed_update.exe":
                         raise RuntimeError(f"unexpected failure-case acknowledgement: {result}")
 
+                phase("failed successor session closed; waiting for original reconnect")
                 # The old installation must remain running after the successor fails handoff.
                 conn_failed = accept_agent(server, timeout=45)
                 with conn_failed:
@@ -191,6 +203,7 @@ def main():
                 # The old session intentionally closes; the successor must reconnect.
                 phase("waiting for old process to exit after successful handoff")
                 remaining = max(1, int(test_deadline - time.monotonic()))
+                phase("waiting for original process to exit")
                 proc.wait(timeout=min(30, remaining))
                 process_output(proc)
                 proc = None

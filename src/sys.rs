@@ -84,24 +84,31 @@ mod win {
     }
 
     pub fn single() -> bool {
+        eprintln!("[DEBUG][sys] phase=mutex_acquire start");
         let Some(handle) = create_single_mutex() else {
+            eprintln!("[DEBUG][sys] phase=mutex_acquire result=FAIL");
             return false;
         };
         SINGLE_HANDLE.store(handle as usize, Ordering::Release);
+        eprintln!("[DEBUG][sys] phase=mutex_acquire result=OK");
         true
     }
 
     pub fn release_single() -> bool {
+        eprintln!("[DEBUG][sys] phase=mutex_release start");
         let handle = SINGLE_HANDLE.swap(0, Ordering::AcqRel) as Handle;
         if handle.is_null() {
             return true;
         }
         let released = unsafe { ReleaseMutex(handle) } != 0;
         let closed = unsafe { CloseHandle(handle) } != 0;
-        released && closed
+        let ok = released && closed;
+        eprintln!("[DEBUG][sys] phase=mutex_release result={} released={} closed={}", ok, released, closed);
+        ok
     }
 
     pub fn acquire_successor_mutex(timeout: Duration) -> bool {
+        eprintln!("[DEBUG][sys] phase=mutex_reacquire start timeout_s={}", timeout.as_secs());
         let deadline = Instant::now() + timeout;
         loop {
             if SINGLE_HANDLE.load(Ordering::Acquire) != 0 {
@@ -109,9 +116,11 @@ mod win {
             }
             if let Some(handle) = create_single_mutex() {
                 SINGLE_HANDLE.store(handle as usize, Ordering::Release);
+                eprintln!("[DEBUG][sys] phase=mutex_reacquire result=OK");
                 return true;
             }
             if Instant::now() >= deadline {
+                eprintln!("[DEBUG][sys] phase=mutex_reacquire result=TIMEOUT");
                 return false;
             }
             thread::sleep(Duration::from_millis(25));
