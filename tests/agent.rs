@@ -31,11 +31,14 @@ fn update_contract_is_single_file_and_simple_handoff() {
     let source = std::fs::read_to_string("src/update.rs").unwrap();
     let sys = std::fs::read_to_string("src/sys.rs").unwrap();
     assert!(source.contains("GetModuleFileNameW"));
-    assert!(source.contains("stdout(Stdio::piped())"));
-    assert!(source.contains("CreateMutexW" ) || sys.contains("CreateMutexW"));
+    assert!(source.contains("TcpListener::bind"));
+    assert!(source.contains("--update-signal-token"));
+    assert!(source.contains("stdout(Stdio::null())"));
+    assert!(source.contains("CreateMutexW") || sys.contains("CreateMutexW"));
     assert!(source.contains("create_new(true)"));
     assert!(source.contains("release_single"));
     assert!(source.contains("signal_success"));
+    assert!(source.contains("BCryptGenRandom"));
     assert!(source.contains("spawn()"));
     assert!(source.contains("cmd.exe"));
     for banned in [

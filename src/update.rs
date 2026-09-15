@@ -171,19 +171,19 @@ mod windows_impl {
     use super::*;
     use std::{
         ffi::{OsStr, OsString},
+        net::{TcpListener, TcpStream},
         os::windows::{ffi::OsStringExt, process::CommandExt},
         process::{Child, Command, Stdio},
-        sync::mpsc,
-        thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use crate::sys;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const UPDATE_CHILD_ARG: &str = "--update-child";
-    const UPDATE_SUCCESS: &str = "SUCCESS";
+    const UPDATE_SUCCESS: &str = "SUCCESS:";
     const UPDATE_CHILD_TIMEOUT: Duration = Duration::from_secs(60);
+    const UPDATE_SIGNAL_HOST: &str = "127.0.0.1";
 
     pub struct PreparedUpdate {
         target_path: PathBuf,
@@ -264,8 +264,20 @@ mod windows_impl {
         }
 
         pub fn finish_after_disconnect(mut self, ip: &str, port: u16) -> Result<(), String> {
-            // Minimal handoff: release -> launch -> successor connects -> SUCCESS.
-            // There is no token, second mutex, or parent/child control protocol.
+            // Handoff is authenticated through a loopback control socket rather than
+            // stdout. The parent can therefore exit immediately after success without
+            // closing a pipe that the successor still expects to write to.
+            let signal_listener = TcpListener::bind((UPDATE_SIGNAL_HOST, 0))
+                .map_err(|err| format!("failed to create update signal listener: {err}"))?;
+            let signal_port = signal_listener
+                .local_addr()
+                .map_err(|err| format!("failed to resolve update signal port: {err}"))?
+                .port();
+            signal_listener
+                .set_nonblocking(true)
+                .map_err(|err| format!("failed to configure update signal listener: {err}"))?;
+            let signal_token = random_signal_token()?;
+
             eprintln!("[DEBUG][update] phase=release_mutex start");
             eprintln!("[update-handoff] releasing normal mutex");
             if !sys::release_single() {
@@ -274,10 +286,17 @@ mod windows_impl {
 
             eprintln!("[update-handoff] launching successor {}", self.target_path.display());
             let port_arg = port.to_string();
+            let signal_port_arg = signal_port.to_string();
             let spawn_result = Command::new(&self.target_path)
-                .args(["--ip", ip, "--port", &port_arg, UPDATE_CHILD_ARG])
+                .args([
+                    "--ip", ip,
+                    "--port", &port_arg,
+                    UPDATE_CHILD_ARG,
+                    "--update-signal-port", &signal_port_arg,
+                    "--update-signal-token", &signal_token,
+                ])
                 .stdin(Stdio::null())
-                .stdout(Stdio::piped())
+                .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn();
@@ -298,16 +317,7 @@ mod windows_impl {
             };
 
             eprintln!("[DEBUG][update] phase=wait_success start timeout_s={}", UPDATE_CHILD_TIMEOUT.as_secs());
-            let Some(stdout) = child.stdout.take() else {
-                terminate_child(&mut child);
-                let _ = fs::remove_file(&self.target_path);
-                if !sys::acquire_successor_mutex(Duration::from_secs(5)) {
-                    return Err("update successor stdout pipe unavailable and original could not reacquire the normal mutex".into());
-                }
-                return Err("update successor stdout pipe unavailable".into());
-            };
-
-            if wait_for_success(stdout, UPDATE_CHILD_TIMEOUT) {
+            if wait_for_success(&signal_listener, &signal_token, UPDATE_CHILD_TIMEOUT) {
                 eprintln!("[DEBUG][update] phase=wait_success result=SUCCESS");
                 eprintln!("[update-handoff] successor connected successfully");
                 if let Err(err) = schedule_old_image_delete(&self.old_path) {
@@ -343,27 +353,61 @@ mod windows_impl {
         std::env::args().any(|arg| arg == UPDATE_CHILD_ARG)
     }
 
-    pub fn signal_success() -> io::Result<()> {
+    pub fn signal_success(port: u16, token: &str) -> io::Result<()> {
         eprintln!("[DEBUG][update-child] phase=signal_success start");
-        let mut stdout = io::stdout();
-        stdout.write_all(UPDATE_SUCCESS.as_bytes())?;
-        stdout.write_all(b"\n")?;
-        let result = stdout.flush();
-        eprintln!("[DEBUG][update-child] phase=signal_success result={:?}", result);
-        result
+        let mut stream = TcpStream::connect_timeout(
+            &format!("{}:{}", UPDATE_SIGNAL_HOST, port)
+                .parse()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid update signal address"))?,
+            Duration::from_secs(5),
+        )?;
+        let line = format!("{}{}\n", UPDATE_SUCCESS, token);
+        stream.write_all(line.as_bytes())?;
+        stream.flush()?;
+        eprintln!("[DEBUG][update-child] phase=signal_success result=OK");
+        Ok(())
     }
 
-    fn wait_for_success(mut stdout: std::process::ChildStdout, timeout: Duration) -> bool {
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            eprintln!("[DEBUG][update] phase=child_stdout reader=START");
-            let mut buffer = String::new();
-            let read_ok = io::BufReader::new(&mut stdout).read_line(&mut buffer).is_ok();
-            eprintln!("[DEBUG][update] phase=child_stdout reader=LINE read_ok={} raw={:?}", read_ok, buffer.trim_end());
-            let result = read_ok && buffer.trim() == UPDATE_SUCCESS;
-            let _ = tx.send(result);
-        });
-        rx.recv_timeout(timeout).unwrap_or(false)
+    fn wait_for_success(listener: &TcpListener, token: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match listener.accept() {
+                Ok((mut stream, peer)) => {
+                    eprintln!("[DEBUG][update] phase=child_signal accepted peer={peer}");
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buffer = String::new();
+                    let read_ok = io::BufReader::new(&mut stream).read_line(&mut buffer).is_ok();
+                    eprintln!("[DEBUG][update] phase=child_signal read_ok={} raw={:?}", read_ok, buffer.trim_end());
+                    if read_ok && buffer.trim() == format!("{}{}", UPDATE_SUCCESS, token) {
+                        return true;
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => {
+                    eprintln!("[DEBUG][update] phase=child_signal accept failed error={err}");
+                    return false;
+                }
+            }
+        }
+    }
+
+    fn random_signal_token() -> Result<String, String> {
+        let mut bytes = [0u8; 16];
+        let status = unsafe { BCryptGenRandom(core::ptr::null_mut(), bytes.as_mut_ptr(), bytes.len() as u32, 0x0000_0002) };
+        if status < 0 {
+            return Err(format!("failed to generate update signal token: NTSTATUS 0x{status:08x}"));
+        }
+        let mut out = String::with_capacity(32);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(&mut out, "{byte:02x}");
+        }
+        Ok(out)
     }
 
     fn schedule_old_image_delete(path: &Path) -> Result<(), String> {
@@ -449,6 +493,16 @@ mod windows_impl {
     unsafe extern "system" {
         fn GetModuleFileNameW(module: *mut core::ffi::c_void, buffer: *mut u16, size: u32) -> u32;
     }
+
+    #[link(name = "bcrypt")]
+    unsafe extern "system" {
+        fn BCryptGenRandom(
+            h_algorithm: *mut core::ffi::c_void,
+            pb_buffer: *mut u8,
+            cb_buffer: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
 }
 
 #[cfg(windows)]
@@ -469,7 +523,7 @@ impl PreparedUpdate {
 pub fn is_update_child() -> bool { false }
 
 #[cfg(not(windows))]
-pub fn signal_success() -> io::Result<()> { Ok(()) }
+pub fn signal_success(_port: u16, _token: &str) -> io::Result<()> { Ok(()) }
 
 #[cfg(not(windows))]
 pub fn prepare(_: &str, _: u16, _: &str, _: &[u8]) -> Result<PreparedUpdate, String> {

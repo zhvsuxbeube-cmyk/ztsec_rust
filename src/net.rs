@@ -16,14 +16,14 @@ enum SessionOutcome {
 }
 
 pub fn run(ip: &str, port: u16) {
-    run_internal(ip, port, false);
+    run_internal(ip, port, false, None);
 }
 
-pub fn run_with_update_signal(ip: &str, port: u16) {
-    run_internal(ip, port, true);
+pub fn run_with_update_signal(ip: &str, port: u16, signal_port: u16, signal_token: &str) {
+    run_internal(ip, port, true, Some((signal_port, signal_token)));
 }
 
-fn run_internal(ip: &str, port: u16, update_child: bool) {
+fn run_internal(ip: &str, port: u16, update_child: bool, update_signal: Option<(u16, &str)>) {
     eprintln!("[DEBUG][net] phase=start update_child={} ip={} port={}", update_child, ip, port);
     let fp = telemetry::fingerprint();
     let mut plugins = Manager::new();
@@ -41,7 +41,13 @@ fn run_internal(ip: &str, port: u16, update_child: bool) {
                 if hello_ok {
                     if update_child {
                         eprintln!("[DEBUG][net] phase=update_child_signal start");
-                        if update::signal_success().is_err() {
+                        let Some((signal_port, signal_token)) = update_signal else {
+                            eprintln!("[DEBUG][net] phase=update_child_signal result=FAIL missing signal configuration");
+                            let _ = stream.shutdown(Shutdown::Both);
+                            let _ = sys::release_single();
+                            return;
+                        };
+                        if update::signal_success(signal_port, signal_token).is_err() {
                             eprintln!("[DEBUG][net] phase=update_child_signal result=FAIL");
                             let _ = stream.shutdown(Shutdown::Both);
                             let _ = sys::release_single();
