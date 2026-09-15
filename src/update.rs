@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -171,7 +171,7 @@ mod windows_impl {
     use super::*;
     use std::{
         ffi::{OsStr, OsString},
-        os::windows::{ffi::OsStrExt, process::CommandExt},
+        os::windows::{ffi::{OsStrExt, OsStringExt}, process::CommandExt},
         process::{Child, Command, Stdio},
         sync::mpsc,
         thread,
