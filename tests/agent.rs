@@ -31,7 +31,7 @@ fn update_contract_is_no_argument_and_single_file() {
     let source = std::fs::read_to_string("src/update.rs").unwrap();
     let sys = std::fs::read_to_string("src/sys.rs").unwrap();
     assert!(source.contains("GetModuleFileNameW"));
-    assert!(source.contains("CreatePipe"));
+    assert!(source.contains("stdout(Stdio::piped())"));
     assert!(sys.contains("CreateMutexW"));
     assert!(source.contains("BCryptGenRandom"));
     assert!(source.contains("create_new(true)"));
