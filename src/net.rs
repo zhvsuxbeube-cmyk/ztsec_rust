@@ -119,7 +119,8 @@ fn session(
                             let _ = send(stream, &format!("{}{}{}", text::ACK, text::UPDATE, pending.filename()));
                             return SessionOutcome::Update(pending);
                         }
-                        Err(_) => {
+                        Err(err) => {
+                            eprintln!("update prepare failed: {err}");
                             let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
                         }
                     }

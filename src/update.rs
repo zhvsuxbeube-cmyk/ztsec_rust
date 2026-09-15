@@ -424,11 +424,17 @@ mod windows_impl {
                 .take()
                 .ok_or("update handoff status reader is unavailable")?;
             if let Err(err) = wait_status(&mut status, HANDOFF_INIT, &self.token, Duration::from_millis(HANDOFF_INIT_TIMEOUT_MS)) {
+                let exit_detail = match child.try_wait() {
+                    Ok(Some(status)) => format!("; successor exited with {status}"),
+                    Ok(None) => String::new(),
+                    Err(wait_err) => format!("; successor status unavailable: {wait_err}"),
+                };
                 terminate_child(&mut child);
                 drop(status);
                 drop(self.from_child.take());
                 drop(self.to_child.take());
-                return Err(format!("update IPC initialization failed: {err}"));
+                let _ = sys::acquire_successor_mutex(Duration::from_millis(10_000));
+                return Err(format!("update IPC initialization failed: {err}{exit_detail}"));
             }
 
             if let Err(err) = write_record_to_file(

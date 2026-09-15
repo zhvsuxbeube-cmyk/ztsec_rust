@@ -47,6 +47,7 @@ mod win {
     const WAIT_OBJECT_0: u32 = 0;
     const WAIT_TIMEOUT: u32 = 0x0000_0102;
     const WAIT_ABANDONED: u32 = 0x0000_0080;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
     const SLEEP: i32 = 2;
     const HIBERNATE: i32 = 3;
     const REBOOT: i32 = 1;
@@ -63,23 +64,28 @@ mod win {
 
     fn create_single_mutex() -> Option<Handle> {
         let wide = mutex_name();
-        let handle = unsafe { CreateMutexW(ptr::null_mut(), 1, wide.as_ptr()) };
+        let handle = unsafe { CreateMutexW(core::ptr::null_mut(), 1, wide.as_ptr()) };
         if handle.is_null() {
             return None;
         }
-        if unsafe { GetLastError() } != 183 {
+        if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
             return Some(handle);
         }
 
-        // The mutex already exists. CreateMutexW ignores bInitialOwner for
-        // an existing named mutex, so explicitly acquire ownership without
-        // blocking.
+        // For an existing named mutex, explicitly perform a zero-time ownership
+        // attempt. If CreateMutexW supplied a usable handle but ownership is
+        // unavailable, close it rather than ever blocking the caller.
         let wait = unsafe { WaitForSingleObject(handle, 0) };
-        if matches!(wait, WAIT_OBJECT_0 | WAIT_ABANDONED) {
-            Some(handle)
-        } else {
-            unsafe { CloseHandle(handle); }
-            None
+        match wait {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Some(handle),
+            WAIT_TIMEOUT => {
+                unsafe { CloseHandle(handle); }
+                None
+            }
+            _ => {
+                unsafe { CloseHandle(handle); }
+                None
+            }
         }
     }
 
