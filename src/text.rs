@@ -12,6 +12,7 @@ pub const SHORT_HELP: &str = "-h";
 pub const USAGE: &str = "ztsec_agent [--ip IP] [--port PORT]";
 
 pub const HELLO: &str = "HELLO:FINGERPRINT:";
+pub const UPDATE_HELLO: &str = "HELLO:UPDATE";
 pub const DATA: &str = "DATA:";
 pub const HB: &str = "HB";
 pub const PONG: &str = "PONG";

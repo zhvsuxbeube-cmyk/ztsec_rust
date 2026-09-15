@@ -25,13 +25,11 @@ def read_line(conn):
 
 
 def wait_for_result(conn, timeout=30):
-    phase(f"wait_for_result start timeout={timeout}s")
     conn.settimeout(timeout)
     while True:
         line = read_line(conn)
         if line is None:
             raise RuntimeError("agent disconnected before result")
-        print(f"[DEBUG][update-test] t={time.monotonic():.3f} recv={line!r}", flush=True)
         if line == "HB":
             conn.sendall(b"PONG\n")
             continue
@@ -40,7 +38,6 @@ def wait_for_result(conn, timeout=30):
         if line.startswith("DATA:"):
             continue
         if line.startswith("ACK:") or line.startswith("ERR:"):
-            phase(f"wait_for_result done result={line!r}")
             return line
 
 
@@ -57,7 +54,6 @@ def process_output(process):
 
 
 def accept_agent(server, timeout=45, process=None):
-    phase(f"accept_agent start timeout={timeout}s")
     deadline = time.time() + timeout
     last_error = "timed out"
     server.settimeout(min(2.0, max(0.1, timeout)))
@@ -72,11 +68,13 @@ def accept_agent(server, timeout=45, process=None):
         conn.settimeout(10)
         try:
             hello = read_line(conn)
+            if hello == "HELLO:UPDATE":
+                conn.close()
+                continue
             if not hello or not hello.startswith("HELLO:FINGERPRINT:"):
                 last_error = f"unexpected hello: {hello!r}"
                 conn.close()
                 continue
-            phase("accept_agent got valid HELLO")
             return conn
         except (ConnectionError, OSError) as exc:
             last_error = f"agent connection failed: {exc}"
@@ -84,7 +82,6 @@ def accept_agent(server, timeout=45, process=None):
                 conn.close()
             except OSError:
                 pass
-    phase(f"accept_agent timeout error={last_error}")
     raise RuntimeError(last_error)
 
 
@@ -92,11 +89,9 @@ def send_line(conn, line):
     previous = conn.gettimeout()
     conn.settimeout(10)
     try:
-        phase(f"send_line start prefix={line.split(':', 1)[0]}")
         conn.sendall(line.encode("utf-8"))
     finally:
         conn.settimeout(previous)
-    phase("send_line done")
 
 
 def send_update(conn, filename, payload):
@@ -104,15 +99,9 @@ def send_update(conn, filename, payload):
     previous = conn.gettimeout()
     conn.settimeout(15)
     try:
-        phase(f"send_update start filename={filename} bytes={len(payload)}")
         conn.sendall(f"CMD:UPDATE:{filename}:{encoded}\n".encode("ascii"))
     finally:
         conn.settimeout(previous)
-    phase(f"send_update done filename={filename}")
-
-
-def phase(name):
-    print(f"[DEBUG][update-test] t={time.monotonic():.3f} phase={name}", flush=True)
 
 
 def main():
@@ -143,8 +132,6 @@ def main():
             server.bind(("127.0.0.1", 0))
             server.listen(4)
             port = server.getsockname()[1]
-
-            phase(f"starting original executable={old}")
             proc = subprocess.Popen(
                 [str(old), "--ip", "127.0.0.1", "--port", str(port)],
                 cwd=str(root),
@@ -153,25 +140,19 @@ def main():
             )
             try:
                 conn = accept_agent(server, process=proc)
-                phase("connected to initial agent")
                 with conn:
                     if time.monotonic() > test_deadline:
                         raise RuntimeError("global update test deadline exceeded")
-                    phase("invalid PE rejection")
                     # Invalid PE uses the real command dispatcher and must be rejected in-place.
                     send_line(conn, "CMD:UPDATE:rejected.exe:AAECAwQF\n")
                     result = wait_for_result(conn)
                     if not result.startswith("ERR:UPDATE:"):
                         raise RuntimeError(f"invalid update was not rejected: {result}")
-
-                    phase("path traversal rejection")
                     # Traversal is rejected before any filesystem write.
                     send_line(conn, "CMD:UPDATE:..\\escape.exe:AAECAwQF\n")
                     result = wait_for_result(conn)
                     if not result.startswith("ERR:UPDATE:"):
                         raise RuntimeError(f"traversal was not rejected: {result}")
-
-                    phase("failed successor handoff")
                     # A valid PE that is not an agent must fail the authenticated handoff
                     # without destroying the currently running installation.
                     system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
@@ -180,20 +161,23 @@ def main():
                         raise RuntimeError(f"missing Windows test payload: {broken}")
                     send_update(conn, "failed_update.exe", broken.read_bytes())
                     result = wait_for_result(conn)
-                    if result != "ACK:UPDATE:failed_update.exe":
+                    if result != f"ACK:UPDATE:{new.name}":
                         raise RuntimeError(f"unexpected failure-case acknowledgement: {result}")
-
-                phase("failed successor session closed; waiting for original reconnect")
                 # The old installation must remain running after the successor fails handoff.
-                conn_failed = accept_agent(server, timeout=45)
+                conn_failed = accept_agent(server, timeout=75)
                 with conn_failed:
                     send_line(conn_failed, "CMD:REQ:DATA\n")
                     if wait_for_result(conn_failed, timeout=15) != "PONG":
                         raise RuntimeError("old installation was not usable after failed update")
-                    if (install / "failed_update.exe").exists():
+                    conn_failed.settimeout(10)
+                    while True:
+                        line = read_line(conn_failed)
+                        if line == "ERR:UPDATE:FAILED":
+                            break
+                        if line is None:
+                            raise RuntimeError("missing failed update message")
+                    if (install / "ztsec_agent_update.exe").exists():
                         raise RuntimeError("failed update left an installed executable behind")
-
-                    phase("successful successor handoff")
                     payload = source.read_bytes()
                     send_update(conn_failed, new.name, payload)
                     result = wait_for_result(conn_failed)
@@ -201,15 +185,12 @@ def main():
                         raise RuntimeError(f"unexpected update acknowledgement: {result}")
 
                 # The old session intentionally closes; the successor must reconnect.
-                phase("waiting for old process to exit after successful handoff")
                 remaining = max(1, int(test_deadline - time.monotonic()))
-                phase("waiting for original process to exit")
                 proc.wait(timeout=min(30, remaining))
                 process_output(proc)
                 proc = None
                 if time.monotonic() > test_deadline:
                     raise RuntimeError("global update test deadline exceeded before successor reconnect")
-                phase("successor reconnect")
                 conn2 = accept_agent(server, timeout=min(30, max(1, int(test_deadline - time.monotonic()))))
                 with conn2:
                     send_line(conn2, "CMD:REQ:DATA\n")
@@ -220,7 +201,7 @@ def main():
                         probe_port = probe_server.getsockname()[1]
                         probe_server.settimeout(1)
                         probe = subprocess.Popen(
-                            [str(new), "--ip", "127.0.0.1", "--port", str(probe_port)],
+                            [str(old), "--ip", "127.0.0.1", "--port", str(probe_port)],
                             cwd=str(root),
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
@@ -240,8 +221,6 @@ def main():
                         else:
                             accepted.close()
                             raise RuntimeError("second normal start reached the network despite mutex protection")
-
-                    phase("closing successor")
                     send_line(conn2, "CMD:CLOSE\n")
                     if wait_for_result(conn2, timeout=15) != "ACK:CLOSE":
                         raise RuntimeError("successor did not close normally")
@@ -249,13 +228,13 @@ def main():
                 deadline = min(time.time() + 10, test_deadline)
                 while time.time() < deadline:
                     names = {p.name for p in install.iterdir()}
-                    if names == {new.name}:
+                    if names == {old.name}:
                         break
                     time.sleep(0.25)
                 names = {p.name for p in install.iterdir()}
-                if names != {new.name}:
+                if names != {old.name}:
                     raise RuntimeError(f"update created or preserved unexpected files: {names}")
-                if new.read_bytes() != source.read_bytes():
+                if old.read_bytes() != source.read_bytes():
                     raise RuntimeError("installed bytes differ from payload")
 
             finally:

@@ -84,18 +84,14 @@ mod win {
     }
 
     pub fn single() -> bool {
-        eprintln!("[DEBUG][sys] phase=mutex_acquire start");
         let Some(handle) = create_single_mutex() else {
-            eprintln!("[DEBUG][sys] phase=mutex_acquire result=FAIL");
             return false;
         };
         SINGLE_HANDLE.store(handle as usize, Ordering::Release);
-        eprintln!("[DEBUG][sys] phase=mutex_acquire result=OK");
         true
     }
 
-    pub fn release_single() -> bool {
-        eprintln!("[DEBUG][sys] phase=mutex_release start");
+    pub fn release() -> bool {
         let handle = SINGLE_HANDLE.swap(0, Ordering::AcqRel) as Handle;
         if handle.is_null() {
             return true;
@@ -103,12 +99,10 @@ mod win {
         let released = unsafe { ReleaseMutex(handle) } != 0;
         let closed = unsafe { CloseHandle(handle) } != 0;
         let ok = released && closed;
-        eprintln!("[DEBUG][sys] phase=mutex_release result={} released={} closed={}", ok, released, closed);
         ok
     }
 
-    pub fn acquire_successor_mutex(timeout: Duration) -> bool {
-        eprintln!("[DEBUG][sys] phase=mutex_reacquire start timeout_s={}", timeout.as_secs());
+    pub fn acquire(timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
             if SINGLE_HANDLE.load(Ordering::Acquire) != 0 {
@@ -116,11 +110,9 @@ mod win {
             }
             if let Some(handle) = create_single_mutex() {
                 SINGLE_HANDLE.store(handle as usize, Ordering::Release);
-                eprintln!("[DEBUG][sys] phase=mutex_reacquire result=OK");
                 return true;
             }
             if Instant::now() >= deadline {
-                eprintln!("[DEBUG][sys] phase=mutex_reacquire result=TIMEOUT");
                 return false;
             }
             thread::sleep(Duration::from_millis(25));
@@ -154,9 +146,9 @@ mod win {
     use std::time::Duration;
 
     pub fn single() -> bool { true }
-    pub fn release_single() -> bool { true }
-    pub fn acquire_successor_mutex(_: Duration) -> bool { true }
+    pub fn release() -> bool { true }
+    pub fn acquire(_: Duration) -> bool { true }
     pub fn command(_: &str) -> bool { false }
 }
 
-pub use win::{acquire_successor_mutex, command, release_single, single};
+pub use win::{acquire, command, release, single};

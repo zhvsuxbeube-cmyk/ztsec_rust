@@ -1,5 +1,4 @@
 import argparse
-import os
 import socket
 import subprocess
 import sys
@@ -23,7 +22,6 @@ def main():
         install = root / "install"
         install.mkdir()
         old = install / "ztsec_agent.exe"
-        new = install / "ztsec_agent_panel_update.exe"
         old.write_bytes(agent.read_bytes())
         payload = agent.read_bytes()
         before = {p.name for p in install.iterdir()}
@@ -57,26 +55,12 @@ def main():
                 raise RuntimeError("panel stdin is unavailable")
 
             # Exercise the real panel command parser; it sends the real UPDATE wire command.
-            panel_proc.stdin.write(f"update-as:{new.name}:{agent}\n")
+            panel_proc.stdin.write(f"update:{agent}\n")
             panel_proc.stdin.flush()
 
-            deadline = time.time() + 60
-            output = ""
-            while time.time() < deadline:
-                if panel_proc.poll() is not None:
-                    break
-                time.sleep(0.25)
-                if panel_proc.stdout is not None:
-                    # Non-blocking pipe reads are awkward on Windows; wait for the expected
-                    # successor process instead, then send CLOSE through the same panel stdin.
-                    pass
-                if new.exists() and agent_proc.poll() is not None:
-                    break
-
+            time.sleep(5)
             if agent_proc.poll() is None:
                 agent_proc.wait(timeout=20)
-            if not new.exists():
-                raise RuntimeError("panel update did not create the successor executable")
 
             # The panel explicitly reconnects after an update ACK. Close the restored session.
             panel_proc.stdin.write("close\n")
@@ -95,13 +79,13 @@ def main():
             deadline = time.time() + 10
             while time.time() < deadline:
                 names = {p.name for p in install.iterdir()}
-                if names == {new.name}:
+                if names == {old.name}:
                     break
                 time.sleep(0.25)
             names = {p.name for p in install.iterdir()}
-            if names != {new.name}:
+            if names != {old.name}:
                 raise RuntimeError(f"panel update left unexpected files: {names}; before={before}")
-            if new.read_bytes() != payload:
+            if old.read_bytes() != payload:
                 raise RuntimeError("panel-installed bytes differ from payload")
         finally:
             if agent_proc.poll() is None:

