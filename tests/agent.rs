@@ -27,16 +27,21 @@ fn contract() {
 }
 
 #[test]
-fn update_contract_is_no_argument_and_single_file() {
+fn update_contract_is_single_file_and_simple_handoff() {
     let source = std::fs::read_to_string("src/update.rs").unwrap();
     let sys = std::fs::read_to_string("src/sys.rs").unwrap();
     assert!(source.contains("GetModuleFileNameW"));
     assert!(source.contains("stdout(Stdio::piped())"));
-    assert!(sys.contains("CreateMutexW"));
-    assert!(source.contains("BCryptGenRandom"));
+    assert!(source.contains("CreateMutexW" ) || sys.contains("CreateMutexW"));
     assert!(source.contains("create_new(true)"));
-    assert!(!source.contains(".args(") && !source.contains(".arg("));
-    for banned in ["CreateTemp", "\".tmp\"", "\".bak\"", "\".new\"", "\".old\"", "update.flag", "update.json", "promote-", "cmd.exe"] {
-        assert!(!source.contains(banned), "unexpected auxiliary update artifact or shell path: {banned}");
+    assert!(source.contains("release_single"));
+    assert!(source.contains("signal_success"));
+    assert!(source.contains("spawn()"));
+    assert!(source.contains("cmd.exe"));
+    for banned in [
+        "CreateTemp", "\".tmp\"", "\".bak\"", "\".new\"", "\".old\"",
+        "update.flag", "update.json", "promote-", "PeekNamedPipe", "ChildHandoff",
+    ] {
+        assert!(!source.contains(banned), "unexpected auxiliary update artifact or old handoff mechanism: {banned}");
     }
 }
