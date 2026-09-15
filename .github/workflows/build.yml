@@ -128,6 +128,11 @@ jobs:
           $out = Get-Content (Join-Path $work 'panel.out') -Raw
           if ($out -notmatch 'ACK:UPDATE:') { throw 'missing update ack' }
           if ($out -notmatch 'Rust-Native/2') { throw 'updated agent did not reconnect with new version' }
+          $finalBytes = [IO.File]::ReadAllBytes($exe)
+          $expectedBytes = [IO.File]::ReadAllBytes((Join-Path $work 'ztsec_agent_updated.exe'))
+          if (-not [Linq.Enumerable]::SequenceEqual($finalBytes, $expectedBytes)) { throw 'original executable path was not replaced with updated bytes' }
+          $finalPath = (Resolve-Path $exe).Path
+          if ([IO.Path]::GetFileName($finalPath) -ne 'ztsec_agent.exe') { throw 'original executable name changed' }
 
       - name: Archive
         shell: pwsh

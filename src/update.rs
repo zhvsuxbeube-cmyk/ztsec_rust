@@ -12,6 +12,7 @@ const SOURCE_ARG: &str = "--ztsec-update-source=";
 const TARGET_ARG: &str = "--ztsec-update-target=";
 const HASH_ARG: &str = "--ztsec-update-hash=";
 const PARENT_ARG: &str = "--ztsec-update-parent=";
+const LAUNCH_ARG: &str = "--ztsec-update-agent-arg=";
 const WAIT_TIMEOUT_MS: u32 = 120_000;
 
 pub(crate) fn max_update_bytes() -> usize {
@@ -193,6 +194,7 @@ struct SuccessorArgs {
     target: PathBuf,
     hash: String,
     parent_pid: u32,
+    launch_args: Vec<std::ffi::OsString>,
 }
 
 fn successor_args(args: &[String]) -> Result<Option<SuccessorArgs>, String> {
@@ -201,6 +203,7 @@ fn successor_args(args: &[String]) -> Result<Option<SuccessorArgs>, String> {
     let mut target = None;
     let mut hash = None;
     let mut parent_pid = None;
+    let mut launch_args = Vec::new();
 
     for arg in args {
         if arg == SUCCESSOR_FLAG {
@@ -211,6 +214,8 @@ fn successor_args(args: &[String]) -> Result<Option<SuccessorArgs>, String> {
             target = Some(PathBuf::from(v));
         } else if let Some(v) = arg.strip_prefix(HASH_ARG) {
             hash = Some(v.to_owned());
+        } else if let Some(v) = arg.strip_prefix(LAUNCH_ARG) {
+            launch_args.push(std::ffi::OsString::from(v));
         } else if let Some(v) = arg.strip_prefix(PARENT_ARG) {
             parent_pid = Some(
                 v.parse::<u32>()
@@ -240,6 +245,7 @@ fn successor_args(args: &[String]) -> Result<Option<SuccessorArgs>, String> {
         target,
         hash,
         parent_pid,
+        launch_args,
     }))
 }
 
@@ -330,46 +336,38 @@ fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn launch_updated(target: &Path) -> io::Result<()> {
+fn launch_updated(target: &Path, launch_args: &[std::ffi::OsString]) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::process::Command::new(target)
+        .args(launch_args)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map(|_| ())
 }
 
 #[cfg(not(windows))]
-fn launch_updated(target: &Path) -> io::Result<()> {
+fn launch_updated(target: &Path, launch_args: &[std::ffi::OsString]) -> io::Result<()> {
     std::process::Command::new(target).spawn().map(|_| ())
-}
-
-fn same_path(left: &Path, right: &Path) -> bool {
-    let left = left.to_string_lossy();
-    let right = right.to_string_lossy();
-    #[cfg(windows)]
-    {
-        left.eq_ignore_ascii_case(&right)
-    }
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
 }
 
 fn rollback_path(target: &Path) -> PathBuf {
     target.with_extension("exe.ztsec-backup")
 }
 
-fn run_successor(successor: SuccessorArgs) -> io::Result<()> {
-    let launched_exe = std::env::current_exe()?;
-    if !same_path(&launched_exe, &successor.target) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "update successor target does not match its own executable",
-        ));
-    }
+fn helper_path() -> PathBuf {
+    let pid = std::process::id();
+    let stamp = format!(
+        "{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    std::env::temp_dir().join(format!("ztsec-agent-update-helper-{pid}-{stamp}.exe"))
+}
 
+fn run_successor(successor: SuccessorArgs) -> io::Result<()> {
     wait_for_process_exit(successor.parent_pid)?;
 
     let staged_hash = sha256_file(&successor.source)?;
@@ -430,7 +428,7 @@ fn run_successor(successor: SuccessorArgs) -> io::Result<()> {
         return Err(err);
     }
 
-    match launch_updated(&successor.target) {
+    match launch_updated(&successor.target, &successor.launch_args) {
         Ok(()) => {
             let _ = fs::remove_file(&backup);
             let _ = fs::remove_file(&successor.source);
@@ -466,18 +464,34 @@ pub(crate) fn spawn_successor(
     #[cfg(windows)]
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+    // The successor must not execute from `target`: on Windows the running
+    // executable is locked and cannot safely replace itself. Copy the current
+    // executable to a temporary helper path, run that helper, and let it
+    // promote the verified staged payload into the original target path.
     let current = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(current);
+    let helper = helper_path();
+    fs::copy(&current, &helper)?;
+
+    let mut cmd = std::process::Command::new(&helper);
     cmd.arg(SUCCESSOR_FLAG)
         .arg(format!("{SOURCE_ARG}{}", staged.display()))
         .arg(format!("{TARGET_ARG}{}", target.display()))
         .arg(format!("{HASH_ARG}{hash}"))
         .arg(format!("{PARENT_ARG}{parent_pid}"));
 
+    let current_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    for arg in current_args {
+        cmd.arg(format!("{LAUNCH_ARG}{}", arg.to_string_lossy()));
+    }
+
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    cmd.spawn().map(|_| ())
+    if let Err(err) = cmd.spawn() {
+        let _ = fs::remove_file(&helper);
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// Handle `--ztsec-update-successor ...` before the normal single-instance
@@ -537,6 +551,7 @@ mod tests {
         let got = successor_args(&args).unwrap().unwrap();
         assert_eq!(got.hash, "a".repeat(64));
         assert_eq!(got.parent_pid, 1234);
+        assert!(got.launch_args.is_empty());
         assert_eq!(got.source, PathBuf::from(r"C:\temp\update.exe"));
         assert_eq!(got.target, PathBuf::from(r"C:\app\ztsec_agent.exe"));
     }
@@ -545,6 +560,29 @@ mod tests {
     fn successor_argument_absent() {
         let args = vec!["ztsec_agent.exe".to_owned()];
         assert_eq!(successor_args(&args).unwrap(), None);
+    }
+
+    #[test]
+    fn successor_preserves_agent_arguments() {
+        let args = vec![
+            "ztsec_agent.exe".to_owned(),
+            SUCCESSOR_FLAG.to_owned(),
+            format!("{SOURCE_ARG}C:\\temp\\update.exe"),
+            format!("{TARGET_ARG}C:\\app\\ztsec_agent.exe"),
+            format!("{HASH_ARG}{}", "b".repeat(64)),
+            format!("{PARENT_ARG}5678"),
+            format!("{LAUNCH_ARG}--ip"),
+            format!("{LAUNCH_ARG}10.0.0.7"),
+            format!("{LAUNCH_ARG}--port"),
+            format!("{LAUNCH_ARG}4796"),
+        ];
+        let got = successor_args(&args).unwrap().unwrap();
+        assert_eq!(got.launch_args, vec![
+            std::ffi::OsString::from("--ip"),
+            std::ffi::OsString::from("10.0.0.7"),
+            std::ffi::OsString::from("--port"),
+            std::ffi::OsString::from("4796"),
+        ]);
     }
 
     #[test]

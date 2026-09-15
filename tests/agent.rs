@@ -39,5 +39,9 @@ fn update_flow_contract() {
     let update = std::fs::read_to_string("src/update.rs").unwrap();
     assert!(update.contains("--ztsec-update-successor"));
     assert!(update.contains("WAIT_TIMEOUT_MS"));
-    assert!(source.contains("ACK:"));
+    assert!(update.contains("--ztsec-update-agent-arg="));
+    assert!(update.contains("helper"));
+    assert!(source.contains("text::ACK"));
+    assert!(source.contains("text::UPDATE"));
+    assert!(source.contains("text::ACK, text::UPDATE"));
 }

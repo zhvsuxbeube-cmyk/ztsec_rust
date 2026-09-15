@@ -41,6 +41,6 @@ The panel can send a replacement executable as file bytes:
 update:C:\path\to\ztsec_agent.exe
 ```
 
-The wire command is `CMD:UPDATE:<sha256>:<base64-bytes>`. The agent verifies the SHA-256 before staging the bytes, re-verifies the staged file, launches a one-shot successor, and exits. The successor waits for the old process to exit, verifies the staged file again, replaces the running executable, and starts the new agent. A failed promotion attempts to restore the previous executable.
+The wire command is `CMD:UPDATE:<sha256>:<base64-bytes>`. The agent verifies the SHA-256 before staging the bytes, re-verifies the staged file, launches a one-shot successor, and exits. The temporary successor helper waits for the old process to exit, verifies the staged file again, replaces the original executable at the same path and filename, and starts the new agent from that original location. A failed promotion attempts to restore the previous executable.
 
 CI exercises this end-to-end on Windows, including rejection of a tampered payload, successful promotion, reconnect of the updated binary, and a clean close handshake.
