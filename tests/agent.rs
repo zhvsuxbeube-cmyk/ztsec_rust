@@ -38,4 +38,6 @@ fn update_contract_is_minimal() {
     assert!(!source.contains("--update-child"));
     assert!(!source.contains("PeekNamedPipe"));
     assert!(!source.contains("ChildHandoff"));
+    assert!(source.contains("fn up_name"));
+    assert!(source.contains("format!("{stem}{UPDATE_SUFFIX}{ext}")"));
 }

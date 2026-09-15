@@ -43,7 +43,7 @@ pub fn run(ip: &str, port: u16) {
 
                 println!("{}", text::CONNECTED);
                 plugins.event("agent.connected", host.as_bytes());
-                match session(&mut stream, ip, port, &fp, &host, &mut plugins) {
+                match session(&mut stream, ip, &fp, &host, &mut plugins) {
                     SessionOutcome::Normal => plugins.clear(),
                     SessionOutcome::Close => {
                         plugins.clear();
@@ -71,7 +71,6 @@ pub fn run(ip: &str, port: u16) {
 fn session(
     stream: &mut TcpStream,
     ip: &str,
-    port: u16,
     fp: &str,
     host: &str,
     plugins: &mut Manager,
@@ -99,21 +98,14 @@ fn session(
                 }
 
                 if raw.to_ascii_uppercase().starts_with(text::UPDATE) {
-                    let rest = raw[text::UPDATE.len()..].trim();
-                    let (filename, b64) = match rest.split_once(':') {
-                        Some((name, data)) => (name.trim(), data.trim()),
-                        None => {
-                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
-                            continue;
-                        }
-                    };
+                    let b64 = raw[text::UPDATE.len()..].trim();
                     let Some(bytes) = update::decode_b64_update(b64) else {
                         let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
                         continue;
                     };
-                    match update::prepare(filename, &bytes) {
+                    match update::prepare(&bytes) {
                         Ok(pending) => {
-                            let _ = send(stream, &format!("{}{}{}", text::ACK, text::UPDATE, pending.filename()));
+                            let _ = send(stream, &format!("{}{}", text::ACK, text::UPDATE));
                             return SessionOutcome::Update(pending);
                         }
                         Err(_) => {

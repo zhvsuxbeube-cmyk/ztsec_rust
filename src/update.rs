@@ -9,49 +9,6 @@ const MAX_UPDATE_B64: usize = ((MAX_UPDATE_BYTES + 2) / 3) * 4 + 4;
 
 static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
-pub fn normalize_filename(input: &str) -> Result<String, String> {
-    let value = input.trim();
-    if value.is_empty() {
-        return Err("update filename is empty".into());
-    }
-    if value.len() > 240 {
-        return Err("update filename is too long".into());
-    }
-    if value == "." || value == ".." || value.ends_with('.') || value.ends_with(' ') {
-        return Err("invalid update filename".into());
-    }
-    if value.chars().any(|c| {
-        c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
-    }) {
-        return Err("invalid update filename".into());
-    }
-
-    let filename = if value.to_ascii_lowercase().ends_with(".exe") {
-        value.to_owned()
-    } else {
-        format!("{value}.exe")
-    };
-
-    let stem = filename
-        .strip_suffix(".exe")
-        .or_else(|| filename.strip_suffix(".EXE"))
-        .unwrap_or(&filename);
-    if is_reserved_device_name(stem) {
-        return Err("invalid update filename".into());
-    }
-    Ok(filename)
-}
-
-fn is_reserved_device_name(value: &str) -> bool {
-    let base = value.split('.').next().unwrap_or(value).to_ascii_uppercase();
-    matches!(
-        base.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5"
-            | "COM6" | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4"
-            | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
-    )
-}
-
 pub fn decode_b64_update(input: &str) -> Option<Vec<u8>> {
     let s = input.trim();
     if s.is_empty() || s.len() > MAX_UPDATE_B64 {
@@ -165,6 +122,31 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.get(offset..offset + 4)?.try_into().ok()?))
 }
 
+fn safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name == Path::new(name).file_name().and_then(|v| v.to_str()).unwrap_or("")
+        && !name.chars().any(|c| {
+            c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        })
+}
+
+const UPDATE_SUFFIX: &str = "_update";
+
+fn up_name(name: &str) -> Result<String, String> {
+    if !safe_name(name) {
+        return Err("invalid executable name".into());
+    }
+    let (stem, ext) = name.rsplit_once('.')
+        .map(|(a, b)| (a, format!(".{b}")))
+        .unwrap_or((name, String::new()));
+    if stem.is_empty() || stem == "." || stem == ".." {
+        return Err("invalid executable name".into());
+    }
+    Ok(format!("{stem}{UPDATE_SUFFIX}{ext}"))
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
@@ -179,7 +161,6 @@ mod windows_impl {
     use crate::sys;
 
     const NO_WINDOW: u32 = 0x0800_0000;
-    const UPDATE_SUFFIX: &str = "_update";
     const UPDATE_TIMEOUT: Duration = Duration::from_secs(60);
 
     pub struct PreparedUpdate {
@@ -187,7 +168,7 @@ mod windows_impl {
         dir: PathBuf,
     }
 
-    pub fn prepare(filename: &str, bytes: &[u8]) -> Result<PreparedUpdate, String> {
+    pub fn prepare(bytes: &[u8]) -> Result<PreparedUpdate, String> {
         if UPDATE_IN_PROGRESS.swap(true, Ordering::AcqRel) {
             return Err("update already in progress".into());
         }
@@ -197,16 +178,13 @@ mod windows_impl {
                 return Err("invalid update size".into());
             }
 
-            normalize_filename(filename)?;
             validate_pe(bytes)?;
 
             let old = current_executable()?;
             let dir = old.parent().ok_or("invalid executable path")?.to_path_buf();
-            let name = old.file_stem().ok_or("invalid executable name")?.to_string_lossy();
-            let ext = old.extension().map(|v| format!(".{}", v.to_string_lossy())).unwrap_or_default();
-            let path = dir.join(format!("{name}{UPDATE_SUFFIX}{ext}"));
-
-            if path == old || path.exists() {
+            let file = old.file_name().ok_or("invalid executable name")?.to_string_lossy();
+            let path = dir.join(up_name(&file)?);
+            if path.parent() != Some(dir.as_path()) || path == old || path.exists() {
                 return Err("update file already exists".into());
             }
 
@@ -226,10 +204,6 @@ mod windows_impl {
     }
 
     impl PreparedUpdate {
-        pub fn filename(&self) -> String {
-            self.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
-        }
-
         pub fn finish(self) -> Result<(), String> {
             if !sys::release() {
                 return Err("failed to release mutex".into());
@@ -289,17 +263,22 @@ mod windows_impl {
     pub fn run(ip: &str, port: u16) -> Result<(), String> {
         let exe = current_executable()?;
         let dir = exe.parent().ok_or("invalid executable path")?.to_path_buf();
+        let file = exe.file_name().ok_or("invalid executable name")?.to_string_lossy();
         let stem = exe.file_stem().ok_or("invalid executable name")?.to_string_lossy();
-        if !stem.to_ascii_lowercase().ends_with(UPDATE_SUFFIX) {
-            return Err("not an update executable".into());
+        if !stem.to_ascii_lowercase().ends_with(UPDATE_SUFFIX) || !safe_name(&file) {
+            return Err("invalid update executable name".into());
         }
 
         let base_stem = &stem[..stem.len() - UPDATE_SUFFIX.len()];
-        if base_stem.is_empty() {
+        if base_stem.is_empty() || base_stem == "." || base_stem == ".." {
             return Err("invalid update executable name".into());
         }
-        let ext = exe.extension().map(|v| format!(".{}", v.to_string_lossy())).unwrap_or_default();
+        let ext = exe.extension().map(|v| format!(".{v}", v = v.to_string_lossy())).unwrap_or_default();
         let base = dir.join(format!("{base_stem}{ext}"));
+        if base.parent() != Some(dir.as_path()) || !safe_name(base.file_name().and_then(|v| v.to_str()).unwrap_or_default()) {
+            let _ = marker(&dir, "failed.txt");
+            return Err("invalid update path".into());
+        }
         if !sys::single() {
             let _ = marker(&dir, "failed.txt");
             return Err("mutex unavailable".into());
@@ -324,16 +303,12 @@ mod windows_impl {
             return Err("original executable is missing".into());
         }
 
-        if schedule_run(&dir, &self_name(&base), &self_name(&exe)).is_err() {
+        if schedule_run(&dir, &base, &exe).is_err() {
             let _ = marker(&dir, "failed.txt");
             return Err("failed to schedule update".into());
         }
         marker(&dir, "success.txt")?;
         Ok(())
-    }
-
-    fn self_name(path: &Path) -> String {
-        path.file_name().map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()
     }
 
     fn marker(dir: &Path, name: &str) -> Result<(), String> {
@@ -359,9 +334,9 @@ mod windows_impl {
 
     enum Marker { Success, Failed, Timeout }
 
-    fn schedule_run(dir: &Path, base: &str, update: &str) -> Result<(), String> {
-        let base = base.replace('%', "%%");
-        let update = update.replace('%', "%%");
+    fn schedule_run(dir: &Path, base: &Path, update: &Path) -> Result<(), String> {
+        let base = base.file_name().and_then(|v| v.to_str()).ok_or("invalid base name")?.replace('%', "%%");
+        let update = update.file_name().and_then(|v| v.to_str()).ok_or("invalid update name")?.replace('%', "%%");
         let cmd = format!(
             "ping 127.0.0.1 -n 3 >nul & move /Y \"{update}\" \"{base}\" >nul & start \"\" \"{base}\""
         );
@@ -417,7 +392,6 @@ pub struct PreparedUpdate;
 
 #[cfg(not(windows))]
 impl PreparedUpdate {
-    pub fn filename(&self) -> String { String::new() }
     pub fn finish(self) -> Result<(), String> { Err("Update is supported only on Windows".into()) }
 }
 
@@ -428,7 +402,7 @@ pub fn is_update() -> bool { false }
 pub fn run(_: &str, _: u16) -> Result<(), String> { Err("Update is supported only on Windows".into()) }
 
 #[cfg(not(windows))]
-pub fn prepare(_: &str, _: &[u8]) -> Result<PreparedUpdate, String> {
+pub fn prepare(_: &[u8]) -> Result<PreparedUpdate, String> {
     Err("Update is supported only on Windows".into())
 }
 
@@ -437,11 +411,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filename_normalization() {
-        assert_eq!(normalize_filename("agent").unwrap(), "agent.exe");
-        assert_eq!(normalize_filename("agent.exe").unwrap(), "agent.exe");
-        assert!(normalize_filename("..\\escape.exe").is_err());
-        assert!(normalize_filename("CON.exe").is_err());
+    fn names() {
+        assert_eq!(up_name("ztsec_agent.exe").unwrap(), "ztsec_agent_update.exe");
+        assert!(safe_name("ztsec_agent.exe"));
+        assert!(!safe_name("..\\escape.exe"));
+        assert!(!safe_name("C:\\escape.exe"));
+        assert!(!safe_name(""));
     }
 
     #[test]

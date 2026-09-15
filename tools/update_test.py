@@ -94,12 +94,12 @@ def send_line(conn, line):
         conn.settimeout(previous)
 
 
-def send_update(conn, filename, payload):
+def send_update(conn, payload):
     encoded = base64.b64encode(payload).decode("ascii")
     previous = conn.gettimeout()
     conn.settimeout(15)
     try:
-        conn.sendall(f"CMD:UPDATE:{filename}:{encoded}\n".encode("ascii"))
+        conn.sendall(f"CMD:UPDATE:{encoded}\n".encode("ascii"))
     finally:
         conn.settimeout(previous)
 
@@ -144,24 +144,22 @@ def main():
                     if time.monotonic() > test_deadline:
                         raise RuntimeError("global update test deadline exceeded")
                     # Invalid PE uses the real command dispatcher and must be rejected in-place.
-                    send_line(conn, "CMD:UPDATE:rejected.exe:AAECAwQF\n")
+                    send_line(conn, "CMD:UPDATE:AAECAwQF\n")
                     result = wait_for_result(conn)
                     if not result.startswith("ERR:UPDATE:"):
                         raise RuntimeError(f"invalid update was not rejected: {result}")
-                    # Traversal is rejected before any filesystem write.
-                    send_line(conn, "CMD:UPDATE:..\\escape.exe:AAECAwQF\n")
-                    result = wait_for_result(conn)
-                    if not result.startswith("ERR:UPDATE:"):
-                        raise RuntimeError(f"traversal was not rejected: {result}")
+                    # The panel does not supply a filename; the agent derives it from its own executable name.
+                    # The derived path is checked as a single filename component before writing.
+
                     # A valid PE that is not an agent must fail the authenticated handoff
                     # without destroying the currently running installation.
                     system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
                     broken = system_root / "System32" / "where.exe"
                     if not broken.is_file():
                         raise RuntimeError(f"missing Windows test payload: {broken}")
-                    send_update(conn, "failed_update.exe", broken.read_bytes())
+                    send_update(conn, broken.read_bytes())
                     result = wait_for_result(conn)
-                    if result != f"ACK:UPDATE:{new.name}":
+                    if result != "ACK:UPDATE":
                         raise RuntimeError(f"unexpected failure-case acknowledgement: {result}")
                 # The old installation must remain running after the successor fails handoff.
                 conn_failed = accept_agent(server, timeout=75)
@@ -179,9 +177,9 @@ def main():
                     if (install / "ztsec_agent_update.exe").exists():
                         raise RuntimeError("failed update left an installed executable behind")
                     payload = source.read_bytes()
-                    send_update(conn_failed, new.name, payload)
+                    send_update(conn_failed, payload)
                     result = wait_for_result(conn_failed)
-                    if result != f"ACK:UPDATE:{new.name}":
+                    if result != "ACK:UPDATE":
                         raise RuntimeError(f"unexpected update acknowledgement: {result}")
 
                 # The old session intentionally closes; the successor must reconnect.
