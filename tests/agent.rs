@@ -22,6 +22,7 @@ fn contract() {
 fn update_contract_is_minimal() {
     let source = std::fs::read_to_string("src/update.rs").unwrap();
     let main = std::fs::read_to_string("src/main.rs").unwrap();
+    let net = std::fs::read_to_string("src/net.rs").unwrap();
     assert!(source.contains("_update"));
     assert!(source.contains("success.txt"));
     assert!(source.contains("failed.txt"));
@@ -39,5 +40,7 @@ fn update_contract_is_minimal() {
     assert!(!source.contains("PeekNamedPipe"));
     assert!(!source.contains("ChildHandoff"));
     assert!(source.contains("fn up_name"));
+    assert!(net.contains("send(stream, \"ACK:UPDATE\")"));
+    assert!(net.contains("send(stream, \"ERR:UPDATE\")"));
     assert!(source.contains(r#"format!("{stem}{UPDATE_SUFFIX}{ext}")"#));
 }

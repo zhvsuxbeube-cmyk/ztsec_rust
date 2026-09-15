@@ -49,7 +49,7 @@ def wait_result(s):
         if line == "HB":
             s.sendall(b"PONG\n")
             continue
-        if line == "ACK:UPDATE:" or line == "ACK:UPDATE":
+        if line == "ACK:UPDATE":
             return line
         print(line)
         if line.startswith("ACK:") or line.startswith("ERR:"):
@@ -180,7 +180,7 @@ def main():
                 if not result:
                     return
                 if lc.startswith("update:"):
-                    if result in {"ACK:UPDATE", "ACK:UPDATE:"}:
+                    if result == "ACK:UPDATE":
                         print("update handoff accepted; waiting for successor")
                         conn.close()
                         conn = accept_agent(server, timeout=30)

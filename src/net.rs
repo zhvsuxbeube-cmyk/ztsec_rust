@@ -100,16 +100,16 @@ fn session(
                 if raw.to_ascii_uppercase().starts_with(text::UPDATE) {
                     let b64 = raw[text::UPDATE.len()..].trim();
                     let Some(bytes) = update::decode_b64_update(b64) else {
-                        let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                        let _ = send(stream, "ERR:UPDATE");
                         continue;
                     };
                     match update::prepare(&bytes) {
                         Ok(pending) => {
-                            let _ = send(stream, &format!("{}{}", text::ACK, text::UPDATE));
+                            let _ = send(stream, "ACK:UPDATE");
                             return SessionOutcome::Update(pending);
                         }
                         Err(_) => {
-                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                            let _ = send(stream, "ERR:UPDATE");
                         }
                     }
                     continue;
