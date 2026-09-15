@@ -411,6 +411,7 @@ mod windows_impl {
 
             // Only the three explicit handoff handles should cross the process boundary.
             make_standard_handles_non_inheritable()?;
+            eprintln!("[update-handoff] launching successor {}", self.target_path.display());
             let mut child = Command::new(&self.target_path)
                 .stdin(Stdio::from(child_stdin))
                 .stderr(Stdio::from(child_stderr))
@@ -423,20 +424,26 @@ mod windows_impl {
                 .from_child
                 .take()
                 .ok_or("update handoff status reader is unavailable")?;
+            eprintln!("[update-handoff] waiting for successor INIT");
             if let Err(err) = wait_status(&mut status, HANDOFF_INIT, &self.token, Duration::from_millis(HANDOFF_INIT_TIMEOUT_MS)) {
                 let exit_detail = match child.try_wait() {
                     Ok(Some(status)) => format!("; successor exited with {status}"),
                     Ok(None) => String::new(),
                     Err(wait_err) => format!("; successor status unavailable: {wait_err}"),
                 };
+                // The original process still owns the normal mutex here: it has not
+                // reached the RELEASE step yet. Never try to reacquire it through a
+                // second handle. Doing so can recursively acquire the mutex, overwrite
+                // SINGLE_HANDLE, and leave ownership bookkeeping inconsistent on the
+                // subsequent retry.
                 terminate_child(&mut child);
                 drop(status);
                 drop(self.from_child.take());
                 drop(self.to_child.take());
-                let _ = sys::acquire_successor_mutex(Duration::from_millis(10_000));
                 return Err(format!("update IPC initialization failed: {err}{exit_detail}"));
             }
 
+            eprintln!("[update-handoff] successor initialized; sending RELEASE");
             if let Err(err) = write_record_to_file(
                 self.to_child.as_mut().ok_or("update handoff command pipe is unavailable")?,
                 HANDOFF_RELEASE,
@@ -450,6 +457,7 @@ mod windows_impl {
                 return Err(format!("failed to send update release: {err}"));
             }
 
+            eprintln!("[update-handoff] releasing normal mutex for successor");
             if !sys::release_single() {
                 terminate_child(&mut child);
                 drop(status);
@@ -458,6 +466,7 @@ mod windows_impl {
                 let _ = reacquire_mutex();
                 return Err("failed to release the normal mutex for update handoff".into());
             }
+            eprintln!("[update-handoff] waiting for successor READY");
             match wait_status(&mut status, HANDOFF_READY, &self.token, Duration::from_millis(HANDOFF_READY_TIMEOUT_MS)) {
                 Ok(()) => {
                     // Close both parent-side IPC handles before terminating this process.
@@ -470,6 +479,7 @@ mod windows_impl {
                         sys::release_update_gate();
                         self.gate_held = false;
                     }
+                    eprintln!("[update-handoff] successor READY; handoff committed");
                     self.committed = true;
                     UPDATE_IN_PROGRESS.store(false, Ordering::Release);
                     Ok(())

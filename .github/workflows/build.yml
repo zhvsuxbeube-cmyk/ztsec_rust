@@ -76,6 +76,11 @@ jobs:
           }
           Write-Host '--- execute panel ---'
           Get-Content exec_panel.out
+      - name: Minimal Python update handoff
+        shell: pwsh
+        run: |
+          python tools\python_update_handoff\testpanel.py --timeout 60
+          if ($LASTEXITCODE -ne 0) { throw 'minimal Python update handoff failed' }
       - name: Update handoff
         shell: pwsh
         run: |
