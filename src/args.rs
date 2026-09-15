@@ -22,6 +22,7 @@ pub fn get() -> Args {
                     Err(_) => fail(),
                 };
             }
+            "--update-child" => {}
             text::HELP | text::SHORT_HELP => {
                 println!("{}", text::USAGE);
                 process::exit(0);

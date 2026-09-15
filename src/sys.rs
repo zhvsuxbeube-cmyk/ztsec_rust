@@ -14,7 +14,6 @@ mod win {
     type Status = i32;
 
     static SINGLE_HANDLE: AtomicUsize = AtomicUsize::new(0);
-    static UPDATE_GATE_HANDLE: AtomicUsize = AtomicUsize::new(0);
 
     #[link(name = "ntdll")]
     unsafe extern "system" {
@@ -41,7 +40,6 @@ mod win {
     const OK: Status = 0;
     const SHUTDOWN: u32 = 19;
 
-    const UPDATE_GATE: &str = r"Global\ZTSecurity.ztsec_agent.update";
     const MUTEX_SYNCHRONIZE: u32 = 0x0010_0000;
     const MUTEX_MODIFY_STATE: u32 = 0x0000_0001;
     const WAIT_OBJECT_0: u32 = 0;
@@ -90,9 +88,6 @@ mod win {
     }
 
     pub fn single() -> bool {
-        if update_gate_held() {
-            return false;
-        }
         let Some(handle) = create_single_mutex() else {
             return false;
         };
@@ -127,70 +122,6 @@ mod win {
         }
     }
 
-    pub fn acquire_update_gate() -> bool {
-        if UPDATE_GATE_HANDLE.load(Ordering::Acquire) != 0 {
-            return false;
-        }
-        let wide: Vec<u16> = OsStr::new(UPDATE_GATE)
-            .encode_wide()
-            .chain(iter::once(0))
-            .collect();
-        let handle = unsafe { CreateMutexW(ptr::null_mut(), 1, wide.as_ptr()) };
-        if handle.is_null() {
-            return false;
-        }
-        let already_exists = unsafe { GetLastError() } == 183;
-        if already_exists {
-            let wait = unsafe { WaitForSingleObject(handle, 0) };
-            if !matches!(wait, WAIT_OBJECT_0 | WAIT_ABANDONED) {
-                unsafe { CloseHandle(handle); }
-                return false;
-            }
-        }
-        UPDATE_GATE_HANDLE.store(handle as usize, Ordering::Release);
-        true
-    }
-
-    pub fn release_update_gate() {
-        let handle = UPDATE_GATE_HANDLE.swap(0, Ordering::AcqRel) as Handle;
-        if handle.is_null() {
-            return;
-        }
-        unsafe {
-            let _ = ReleaseMutex(handle);
-            let _ = CloseHandle(handle);
-        }
-    }
-
-    pub fn update_gate_held() -> bool {
-        let wide: Vec<u16> = OsStr::new(UPDATE_GATE)
-            .encode_wide()
-            .chain(iter::once(0))
-            .collect();
-        let handle = unsafe { OpenMutexW(MUTEX_SYNCHRONIZE | MUTEX_MODIFY_STATE, 0, wide.as_ptr()) };
-        if handle.is_null() {
-            return false;
-        }
-        let wait = unsafe { WaitForSingleObject(handle, 0) };
-        match wait {
-            WAIT_TIMEOUT => {
-                unsafe { CloseHandle(handle); }
-                true
-            }
-            WAIT_OBJECT_0 | WAIT_ABANDONED => {
-                unsafe {
-                    let _ = ReleaseMutex(handle);
-                    let _ = CloseHandle(handle);
-                }
-                false
-            }
-            _ => {
-                unsafe { CloseHandle(handle); }
-                true
-            }
-        }
-    }
-
     fn privilege() -> bool {
         let mut previous = 0u8;
         unsafe { RtlAdjustPrivilege(SHUTDOWN, 1, 0, &mut previous) == OK }
@@ -220,11 +151,7 @@ mod win {
     pub fn single() -> bool { true }
     pub fn release_single() -> bool { true }
     pub fn acquire_successor_mutex(_: Duration) -> bool { true }
-    pub fn acquire_update_gate() -> bool { true }
-    pub fn release_update_gate() {}
-    pub fn update_gate_held() -> bool { false }
-
     pub fn command(_: &str) -> bool { false }
 }
 
-pub use win::{acquire_successor_mutex, acquire_update_gate, command, release_single, release_update_gate, single};
+pub use win::{acquire_successor_mutex, command, release_single, single};

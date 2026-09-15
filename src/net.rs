@@ -16,10 +16,14 @@ enum SessionOutcome {
 }
 
 pub fn run(ip: &str, port: u16) {
-    run_with_handoff(ip, port, None);
+    run_internal(ip, port, false);
 }
 
-pub fn run_with_handoff(ip: &str, port: u16, mut handoff: Option<update::ChildHandoff>) {
+pub fn run_with_update_signal(ip: &str, port: u16) {
+    run_internal(ip, port, true);
+}
+
+fn run_internal(ip: &str, port: u16, update_child: bool) {
     let fp = telemetry::fingerprint();
     let mut plugins = Manager::new();
 
@@ -30,8 +34,8 @@ pub fn run_with_handoff(ip: &str, port: u16, mut handoff: Option<update::ChildHa
 
                 // Advertise the agent before the slower Windows telemetry probes.
                 if send(&mut stream, &format!("{}{}", text::HELLO, fp)).is_ok() {
-                    if let Some(handoff) = handoff.take() {
-                        if handoff.signal_ready_and_schedule_cleanup().is_err() {
+                    if update_child {
+                        if update::signal_success().is_err() {
                             let _ = stream.shutdown(Shutdown::Both);
                             let _ = sys::release_single();
                             return;
@@ -59,7 +63,7 @@ pub fn run_with_handoff(ip: &str, port: u16, mut handoff: Option<update::ChildHa
                             SessionOutcome::Update(pending) => {
                                 let _ = stream.shutdown(Shutdown::Both);
                                 plugins.clear();
-                                match pending.finish_after_disconnect() {
+                                match pending.finish_after_disconnect(ip, port) {
                                     Ok(()) => std::process::exit(0),
                                     Err(err) => {
                                         eprintln!("update handoff failed: {err}");

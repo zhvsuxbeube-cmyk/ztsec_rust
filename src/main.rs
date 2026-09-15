@@ -9,21 +9,14 @@ mod text;
 mod update;
 
 fn main() {
-    match update::accept_handoff() {
-        Ok(Some(mut handoff)) => {
-            let ip = handoff.ip().to_owned();
-            let port = handoff.port();
-            if handoff.initialize_and_wait_for_release().is_err() {
-                return;
-            }
-            net::run_with_handoff(&ip, port, Some(handoff));
+    if update::is_update_child() {
+        let args = args::get();
+        if !sys::single() {
+            eprintln!("update successor could not acquire the normal mutex");
             return;
         }
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("update handoff rejected: {err}");
-            return;
-        }
+        net::run_with_update_signal(&args.ip, args.port);
+        return;
     }
 
     if !sys::single() {
