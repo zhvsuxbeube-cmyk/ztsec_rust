@@ -44,4 +44,7 @@ fn update_flow_contract() {
     assert!(source.contains("text::ACK"));
     assert!(source.contains("text::UPDATE"));
     assert!(source.contains("text::ACK, text::UPDATE"));
+    assert!(source.contains("starts_with_ascii_ci(raw, text::UPDATE)"));
+    assert!(source.contains(r#"let _ = send(stream, &format!("{}{}", text::ACK, text::UPDATE));"#));
+    assert!(!source.contains("std::process::exit(0);"));
 }

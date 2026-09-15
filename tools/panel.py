@@ -28,7 +28,10 @@ HELP_TEXT = """Commands:
 def read_line(s):
     b = bytearray()
     while True:
-        c = s.recv(1)
+        try:
+            c = s.recv(1)
+        except ConnectionResetError:
+            return ""
         if not c or c == b"\n":
             return bytes(b).decode(errors="replace").rstrip("\r")
         b.extend(c)

