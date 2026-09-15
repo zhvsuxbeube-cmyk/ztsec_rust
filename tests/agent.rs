@@ -41,6 +41,6 @@ fn update_contract_is_minimal() {
     assert!(!source.contains("ChildHandoff"));
     assert!(source.contains("fn up_name"));
     assert!(net.contains("send(stream, \"ACK:UPDATE\")"));
-    assert!(net.contains("send(stream, \"ERR:UPDATE\")"));
+    assert!(net.contains("send(stream, \"ERR:UPDATE:\")"));
     assert!(source.contains(r#"format!("{stem}{UPDATE_SUFFIX}{ext}")"#));
 }
