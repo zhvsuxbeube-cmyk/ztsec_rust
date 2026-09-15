@@ -111,7 +111,7 @@ def main():
             stderr_path = root / "old_agent.err"
             proc = subprocess.Popen(
                 [str(old), "--ip", "127.0.0.1", "--port", str(port)],
-                cwd=str(install),
+                cwd=str(root),
                 stdout=stdout_path.open("w", encoding="utf-8"),
                 stderr=stderr_path.open("w", encoding="utf-8"),
             )
@@ -169,7 +169,7 @@ def main():
                     # The replacement must own the normal mutex while it is running.
                     probe = subprocess.Popen(
                         [str(new), "--ip", "127.0.0.1", "--port", str(port + 1)],
-                        cwd=str(install),
+                        cwd=str(root),
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
