@@ -45,28 +45,6 @@ class PanelUpdateTests(unittest.TestCase):
             left.close()
             right.close()
 
-    def test_update_ack_confirmation_command(self):
-        command = "CMD:UPDATE_ACK"
-        self.assertTrue(command.startswith("CMD:UPDATE_ACK"))
-        self.assertEqual("ACK:UPDATE_ACK", "ACK:" + command.split(":", 1)[1])
-
-    def test_update_ack_confirmation_round_trip(self):
-        import socket, threading
-        left, right = socket.socketpair()
-        received = []
-        def server():
-            line = panel.read_line(right)
-            received.append(line)
-            right.sendall(b"ACK:UPDATE_ACK\n")
-        t = threading.Thread(target=server)
-        t.start()
-        try:
-            left.sendall(b"CMD:UPDATE_ACK\n")
-            self.assertEqual(panel.wait_result(left), "ACK:UPDATE_ACK")
-            t.join(timeout=2)
-            self.assertEqual(received, ["CMD:UPDATE_ACK"])
-        finally:
-            left.close(); right.close()
 
 if __name__ == "__main__":
     unittest.main()

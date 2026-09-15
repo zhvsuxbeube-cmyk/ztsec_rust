@@ -43,16 +43,15 @@ fn update_flow_contract() {
     assert!(update.contains("helper"));
     assert!(source.contains("text::ACK"));
     assert!(source.contains("text::UPDATE"));
-    assert!(source.contains("text::UPDATE_ACK"));
     assert!(source.contains("text::ACK, text::UPDATE"));
     assert!(source.contains("starts_with_ascii_ci(raw, text::UPDATE)"));
     assert!(source.contains(r#"send(stream, &format!("{}{}", text::ACK, text::UPDATE))"#));
-    assert!(source.contains("CMD, text::UPDATE_ACK"));
-    assert!(source.contains("ACK, text::UPDATE_ACK"));
     assert!(!source.contains("std::process::exit(0);"));
-    assert!(source.contains("stream.shutdown(Shutdown::Both)"));
     assert!(source.contains("update successor launch failed"));
     assert!(source.contains("update staging failed"));
-    assert!(source.contains("update acknowledgement confirmation failed"));
     assert!(source.contains("update acknowledgement send failed"));
+    assert!(update.contains("let mut buf = vec![0u8; 64 * 1024]"));
+    assert!(!update.contains("let mut buf = [0u8; 1024 * 1024]"));
+    assert!(update.contains("let mut restored = false;"));
+    assert!(update.contains("replace_file(&backup, &successor.target)"));
 }

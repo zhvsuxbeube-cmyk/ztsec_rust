@@ -164,57 +164,17 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                         }
                     };
 
-                    // ACK means that the complete update payload has passed all
-                    // integrity checks and has been durably staged. Do not make
-                    // acknowledgement depend on process creation or Windows
-                    // executable handoff; those are a separate phase.
-                    if let Err(err) = send(stream, &format!("{}{}", text::ACK, text::UPDATE)) {
-                        eprintln!("update acknowledgement send failed: {err}");
-                        let _ = std::fs::remove_file(staged);
-                        return true;
-                    }
-
-                    // Require an application-level confirmation from the panel
-                    // before beginning process handoff. This removes the TCP
-                    // delivery/close race from the update commit sequence.
-                    if std::env::var_os("ZTSEC_CI").is_some() {
-                        eprintln!("update phase=ack-sent");
-                    }
-
-                    match line(&mut reader) {
-                        Ok(Some(value)) if value.eq_ignore_ascii_case(&format!("{}{}", text::CMD, text::UPDATE_ACK)) => {
-                            if std::env::var_os("ZTSEC_CI").is_some() {
-                                eprintln!("update phase=ack-confirmed");
-                            }
-                            if let Err(err) = send(stream, &format!("{}{}", text::ACK, text::UPDATE_ACK)) {
-                                eprintln!("update acknowledgement confirmation failed: {err}");
-                                let _ = std::fs::remove_file(staged);
-                                return true;
-                            }
-                        }
-                        Ok(Some(value)) => {
-                            eprintln!("unexpected update acknowledgement confirmation: {value}");
-                            let _ = std::fs::remove_file(staged);
-                            return false;
-                        }
-                        Ok(None) => {
-                            eprintln!("panel disconnected before update acknowledgement confirmation");
-                            let _ = std::fs::remove_file(staged);
-                            return false;
-                        }
-                        Err(err) => {
-                            eprintln!("update acknowledgement confirmation read failed: {err}");
-                            let _ = std::fs::remove_file(staged);
-                            return false;
-                        }
-                    }
-
+                    // The payload is fully validated and durably staged at this point.
+                    // Start the one-shot handoff before acknowledging the update so an ACK
+                    // means the replacement process is actually scheduled, not merely
+                    // written to a staging file.
                     let current_exe = match std::env::current_exe() {
                         Ok(path) => path,
                         Err(err) => {
                             eprintln!("update current executable lookup failed: {err}");
                             let _ = std::fs::remove_file(staged);
-                            return true;
+                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                            continue;
                         }
                     };
                     let parent_pid = std::process::id();
@@ -223,17 +183,25 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
 
                     if let Err(err) = update::spawn_successor(staged, target, hash, parent_pid) {
                         eprintln!("update successor launch failed: {err}");
-                        return true;
+                        let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                        continue;
                     }
 
                     if std::env::var_os("ZTSEC_CI").is_some() {
                         eprintln!("update phase=successor-spawned parent_pid={}", parent_pid);
                     }
 
+                    if let Err(err) = send(stream, &format!("{}{}", text::ACK, text::UPDATE)) {
+                        eprintln!("update acknowledgement send failed: {err}");
+                        return true;
+                    }
+                    let _ = stream.shutdown(Shutdown::Write);
+                    if std::env::var_os("ZTSEC_CI").is_some() {
+                        eprintln!("update phase=ack-sent");
+                    }
+
                     // The successor is now responsible for the filesystem handoff.
-                    // Close this session normally so the successor can observe the
-                    // parent process exit and promote the staged payload.
-                    let _ = stream.shutdown(Shutdown::Both);
+                    // Return from the agent runtime so the parent PID can exit cleanly.
                     return true;
                 }
 

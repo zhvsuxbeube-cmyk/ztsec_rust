@@ -173,7 +173,10 @@ fn tempfile_path() -> PathBuf {
 fn sha256_file(path: &Path) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut hash = Sha256::new();
-    let mut buf = [0u8; 1024 * 1024];
+    // Keep the I/O buffer on the heap. Windows x64 executables default to a
+    // 1 MiB main-thread stack, so a large stack array here can overflow only
+    // on the real agent while appearing healthy in Rust's larger-stack tests.
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
@@ -367,7 +370,18 @@ fn helper_path() -> PathBuf {
     std::env::temp_dir().join(format!("ztsec-agent-update-helper-{pid}-{stamp}.exe"))
 }
 
+struct HelperCleanup(Option<PathBuf>);
+
+impl Drop for HelperCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 fn run_successor(successor: SuccessorArgs) -> io::Result<()> {
+    let _helper_cleanup = HelperCleanup(std::env::current_exe().ok());
     wait_for_process_exit(successor.parent_pid)?;
 
     let staged_hash = sha256_file(&successor.source)?;
@@ -425,6 +439,7 @@ fn run_successor(successor: SuccessorArgs) -> io::Result<()> {
     if let Some(err) = replacement_error {
         let _ = fs::remove_file(&target_tmp);
         let _ = fs::remove_file(&successor.source);
+        let _ = fs::remove_file(&backup);
         return Err(err);
     }
 
@@ -435,16 +450,20 @@ fn run_successor(successor: SuccessorArgs) -> io::Result<()> {
             Ok(())
         }
         Err(err) => {
-            let _ = fs::remove_file(&successor.target);
+            let mut restored = false;
             if backup.exists() {
                 for attempt in 0..40 {
                     if replace_file(&backup, &successor.target).is_ok() {
+                        restored = true;
                         break;
                     }
                     if attempt < 39 {
                         std::thread::sleep(std::time::Duration::from_millis(250));
                     }
                 }
+            }
+            if !restored {
+                eprintln!("ztsec update rollback failed after launch error: {err}");
             }
             let _ = fs::remove_file(&successor.source);
             Err(err)
@@ -481,7 +500,9 @@ pub(crate) fn spawn_successor(
 
     let current_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     for arg in current_args {
-        cmd.arg(format!("{LAUNCH_ARG}{}", arg.to_string_lossy()));
+        let mut forwarded = std::ffi::OsString::from(LAUNCH_ARG);
+        forwarded.push(arg);
+        cmd.arg(forwarded);
     }
 
     #[cfg(windows)]

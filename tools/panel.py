@@ -122,11 +122,7 @@ def main():
                 good_result = wait_result(conn)
                 if not good_result.startswith("ACK:UPDATE:"):
                     raise SystemExit("valid update was not acknowledged")
-                print("update phase: valid payload acknowledged; confirming receipt")
-                conn.sendall(("CMD:UPDATE_ACK\n").encode())
-                confirmation = wait_result(conn)
-                if not confirmation.startswith("ACK:UPDATE_ACK"):
-                    raise SystemExit("update acknowledgement was not confirmed")
+                print("update phase: valid payload acknowledged")
                 conn.close()
 
                 server.settimeout(45)
