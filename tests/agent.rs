@@ -39,5 +39,5 @@ fn update_contract_is_minimal() {
     assert!(!source.contains("PeekNamedPipe"));
     assert!(!source.contains("ChildHandoff"));
     assert!(source.contains("fn up_name"));
-    assert!(source.contains("format!("{stem}{UPDATE_SUFFIX}{ext}")"));
+    assert!(source.contains(r#"format!("{stem}{UPDATE_SUFFIX}{ext}")"#));
 }
