@@ -137,18 +137,21 @@ def main():
                 with conn:
                     if time.monotonic() > test_deadline:
                         raise RuntimeError("global update test deadline exceeded")
+                    phase("invalid PE rejection")
                     # Invalid PE uses the real command dispatcher and must be rejected in-place.
                     conn.sendall(b"CMD:UPDATE:rejected.exe:AAECAwQF\n")
                     result = wait_for_result(conn)
                     if not result.startswith("ERR:UPDATE:"):
                         raise RuntimeError(f"invalid update was not rejected: {result}")
 
+                    phase("path traversal rejection")
                     # Traversal is rejected before any filesystem write.
                     conn.sendall(b"CMD:UPDATE:..\\escape.exe:AAECAwQF\n")
                     result = wait_for_result(conn)
                     if not result.startswith("ERR:UPDATE:"):
                         raise RuntimeError(f"traversal was not rejected: {result}")
 
+                    phase("failed successor handoff")
                     # A valid PE that is not an agent must fail the authenticated handoff
                     # without destroying the currently running installation.
                     system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
@@ -169,6 +172,7 @@ def main():
                     if (install / "failed_update.exe").exists():
                         raise RuntimeError("failed update left an installed executable behind")
 
+                    phase("successful successor handoff")
                     payload = source.read_bytes()
                     send_update(conn_failed, new.name, payload)
                     result = wait_for_result(conn_failed)

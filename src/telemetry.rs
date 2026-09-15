@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, fs::OpenOptions, io::{Read, Seek, SeekFrom}, sync::atomic::{AtomicU64, Ordering as AtomicOrdering}};
 
 #[cfg(windows)]
 use std::{process::{Command, Stdio}, thread, time::{Duration, Instant}};
@@ -109,7 +109,7 @@ fn machine_id() -> Option<String> {
             &[text::REG_QUERY, text::REG_64, text::REG_VALUE, text::REG_QUERY_KEY],
             Duration::from_secs(3),
         )?;
-        let s = String::from_utf8_lossy(&out.stdout);
+        let s = String::from_utf8_lossy(&out);
         return s.lines().find_map(|line| {
             let mut p = line.split_whitespace();
             let key = p.next()?;
@@ -278,44 +278,61 @@ fn fmt_duration(secs: u64) -> String {
 }
 
 #[cfg(windows)]
-fn run_command_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<std::process::Output> {
-    let mut child = Command::new(program)
+static TELEMETRY_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(windows)]
+fn run_command_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
+    // Avoid stdout=PIPE: PowerShell/WMI can leave descendants holding an inherited
+    // pipe handle open, making wait_with_output() wait forever for EOF. A temporary
+    // file decouples process lifetime from stdout consumption.
+    let id = TELEMETRY_TMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "ztsec-telemetry-{}-{}.out",
+        std::process::id(),
+        id
+    ));
+    let file = OpenOptions::new().create_new(true).read(true).write(true).open(&path).ok()?;
+    let child_stdout = match file.try_clone() {
+        Ok(f) => f,
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    let mut child = match Command::new(program)
         .args(args)
-        .stdout(Stdio::piped())
+        .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+    {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+
     let deadline = Instant::now() + timeout;
-    loop {
+    let finished = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(_)) => break true,
             Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
             Ok(None) | Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                break false;
             }
         }
-    }
-    child.wait_with_output().ok()
-}
+    };
 
-fn ps(script: &str) -> String {
-    #[cfg(windows)]
-    {
-        run_command_with_timeout(
-            text::PS,
-            &[text::PS_ARG[0], text::PS_ARG[1], text::PS_ARG[2], script],
-            Duration::from_secs(3),
-        )
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = script;
-        String::new()
-    }
+    drop(child);
+    let mut output_file = file;
+    let _ = output_file.seek(SeekFrom::Start(0));
+    let mut stdout = Vec::new();
+    let _ = output_file.read_to_end(&mut stdout);
+    drop(output_file);
+    let _ = std::fs::remove_file(&path);
+    finished.then_some(stdout)
 }
 
 fn clean(v: String) -> String {
