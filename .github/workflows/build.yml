@@ -16,6 +16,10 @@ jobs:
           toolchain: stable-x86_64-pc-windows-msvc
       - name: Test
         run: cargo test
+      - name: Panel unit tests
+        shell: pwsh
+        run: |
+          python -m unittest tools.panel_test
       - name: Build
         run: cargo build --release --target x86_64-pc-windows-msvc
       - name: Set up MSVC environment
@@ -76,10 +80,59 @@ jobs:
           }
           Write-Host '--- execute panel ---'
           Get-Content exec_panel.out
+      - name: Update E2E
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
+          $work = Join-Path $PWD 'dist\update-e2e'
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Copy-Item $exe (Join-Path $work 'ztsec_agent.exe') -Force
+
+          $textPath = Join-Path $PWD 'src\text.rs'
+          $original = Get-Content $textPath -Raw
+          try {
+            $updated = $original.Replace('pub const VERSION: &str = "Rust-Native/1";', 'pub const VERSION: &str = "Rust-Native/2";')
+            if ($updated -eq $original) { throw 'failed to set update test version' }
+            Set-Content -Path $textPath -Value $updated -NoNewline
+            cargo build --release --target x86_64-pc-windows-msvc
+            Copy-Item $exe (Join-Path $work 'ztsec_agent_updated.exe') -Force
+          }
+          finally {
+            Set-Content -Path $textPath -Value $original -NoNewline
+          }
+
+          $panel = Start-Process python -ArgumentList 'tools\panel.py','--ip','127.0.0.1','--port','4796','--update-test',(Join-Path $work 'ztsec_agent_updated.exe'),'--expect-version','Rust-Native/2' -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $work 'panel.out') -RedirectStandardError (Join-Path $work 'panel.err')
+          Start-Sleep -Seconds 2
+          $agent = Start-Process (Join-Path $work 'ztsec_agent.exe') -ArgumentList '--ip','127.0.0.1','--port','4796' -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $work 'agent.out') -RedirectStandardError (Join-Path $work 'agent.err')
+          if (-not $panel.WaitForExit(90000)) {
+            if (-not $agent.HasExited) { Stop-Process $agent.Id -Force }
+            Stop-Process $panel.Id -Force
+            throw 'update e2e panel timeout'
+          }
+          if (-not $agent.HasExited) { Stop-Process $agent.Id -Force }
+          if ($panel.ExitCode -ne 0) {
+            Get-Content (Join-Path $work 'panel.out')
+            Get-Content (Join-Path $work 'panel.err')
+            Get-Content (Join-Path $work 'agent.out')
+            Get-Content (Join-Path $work 'agent.err')
+            throw "update e2e failed with exit code $($panel.ExitCode)"
+          }
+
+          Write-Host '--- update panel ---'
+          Get-Content (Join-Path $work 'panel.out')
+          Get-Content (Join-Path $work 'panel.err')
+          Write-Host '--- update agent ---'
+          Get-Content (Join-Path $work 'agent.out')
+          Get-Content (Join-Path $work 'agent.err')
+          $out = Get-Content (Join-Path $work 'panel.out') -Raw
+          if ($out -notmatch 'ACK:UPDATE:') { throw 'missing update ack' }
+          if ($out -notmatch 'Rust-Native/2') { throw 'updated agent did not reconnect with new version' }
+
       - name: Archive
         shell: pwsh
         run: |
-          Copy-Item target\x86_64-pc-windows-msvc\release\ztsec_agent.exe dist\ztsec_agent.exe
+          Copy-Item dist\update-e2e\ztsec_agent.exe dist\ztsec_agent.exe -Force
           Compress-Archive -Path dist\ztsec_agent.exe,dist\hello.dll,dist\exports.txt -DestinationPath ztsec_agent-win64.zip -Force
       - uses: actions/upload-artifact@v4
         with:

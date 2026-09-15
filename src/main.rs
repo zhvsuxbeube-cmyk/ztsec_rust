@@ -6,8 +6,13 @@ mod sys;
 mod syscalls;
 mod telemetry;
 mod text;
+mod update;
 
 fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if update::maybe_run_successor(&argv) {
+        return;
+    }
     if !sys::single() {
         return;
     }
