@@ -119,6 +119,13 @@ fn session(
             Ok(Some(value)) if value.starts_with(text::CMD) => {
                 let raw = value[text::CMD.len()..].trim();
 
+                // CMD:REQ:DATA — telemetry refresh, same semantics as bare REQ:DATA.
+                if raw.to_ascii_uppercase() == text::REQ {
+                    let _ = send(stream, text::PONG);
+                    let _ = send(stream, &format!("{}{}", text::DATA, telemetry::record(ip, None, fp)));
+                    continue;
+                }
+
                 if raw.to_ascii_uppercase().starts_with(text::UPDATE) {
                     let rest = raw[text::UPDATE.len()..].trim();
                     let (filename, b64) = match rest.split_once(':') {

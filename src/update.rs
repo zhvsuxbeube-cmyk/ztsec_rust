@@ -201,12 +201,15 @@ mod windows_impl {
             if bytes.is_empty() || bytes.len() > MAX_UPDATE_BYTES {
                 return Err("update payload size is invalid".into());
             }
+
+            // Validate the filename first: reject path-traversal and illegal names
+            // before doing any PE parsing or filesystem work.
+            let normalized = normalize_filename(filename)?;
+            eprintln!("[DEBUG][update] phase=prepare filename normalized={}", normalized);
+
             eprintln!("[DEBUG][update] phase=prepare validate_pe start bytes={}", bytes.len());
             validate_pe(bytes)?;
             eprintln!("[DEBUG][update] phase=prepare validate_pe result=OK");
-
-            let normalized = normalize_filename(filename)?;
-            eprintln!("[DEBUG][update] phase=prepare filename normalized={}", normalized);
             let current = current_executable()?;
             let directory = current
                 .parent()
