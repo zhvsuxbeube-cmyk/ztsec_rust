@@ -8,6 +8,7 @@ fn contract() {
         "SHUTDOWN",
         "RECONNECT",
         "CLOSE",
+        "EXECUTE",
     ] {
         assert!(source.contains(command));
     }

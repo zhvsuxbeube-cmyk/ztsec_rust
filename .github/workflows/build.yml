@@ -58,6 +58,24 @@ jobs:
           Get-Content agent.err
           $a = Get-Content agent.out -Raw
           if ($a -notmatch 'plugin event: event ping') { throw 'plugin callback' }
+      - name: Execute
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
+          Set-Content -Path 'dist\test_exec.ps1' -Value "Write-Output 'ztsec_execute_ok'" -Encoding UTF8
+          $panel = Start-Process python -ArgumentList 'tools\exec_test.py','4795',"$PWD\dist\test_exec.ps1" -NoNewWindow -PassThru -RedirectStandardOutput 'exec_panel.out' -RedirectStandardError 'exec_panel.err'
+          Start-Sleep -Seconds 2
+          $env:ZTSEC_CI = '1'
+          $agent = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4795' -NoNewWindow -PassThru -RedirectStandardOutput 'exec_agent.out' -RedirectStandardError 'exec_agent.err'
+          if (-not $panel.WaitForExit(30000)) { Stop-Process $panel.Id -Force; Stop-Process $agent.Id -Force; throw 'execute panel timeout' }
+          if ($agent.HasExited -eq $false) { Stop-Process $agent.Id -Force }
+          if ($panel.ExitCode -ne 0) {
+            Get-Content exec_panel.out; Get-Content exec_panel.err
+            Get-Content exec_agent.out; Get-Content exec_agent.err
+            throw 'execute test failed'
+          }
+          Write-Host '--- execute panel ---'
+          Get-Content exec_panel.out
       - name: Archive
         shell: pwsh
         run: |
