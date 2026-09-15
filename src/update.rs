@@ -215,8 +215,12 @@ mod windows_impl {
 
     const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
     const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
     const FILE_TYPE_PIPE: u32 = 0x0003;
+    const FILE_TYPE_DISK: u32 = 0x0001;
     const PROCESS_SYNCHRONIZE: u32 = 0x0010_0000;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x0000_1000;
     const INFINITE: u32 = 0xFFFF_FFFF;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
@@ -281,6 +285,7 @@ mod windows_impl {
         }
 
         let mut gate_held = false;
+        let mut created_target: Option<PathBuf> = None;
         let result = (|| {
             if !sys::acquire_update_gate() {
                 return Err("another update is already in progress".into());
@@ -338,6 +343,7 @@ mod windows_impl {
             }
 
             write_final_executable(&target, bytes)?;
+            created_target = Some(target.clone());
             let (child_stdin, parent_to_child) = create_pipe()?;
             make_non_inheritable(&parent_to_child)?;
             let (parent_from_child, child_stderr) = create_pipe()?;
@@ -373,6 +379,9 @@ mod windows_impl {
         match result {
             Ok(v) => Ok(v),
             Err(e) => {
+                if let Some(path) = created_target {
+                    let _ = fs::remove_file(path);
+                }
                 if gate_held {
                     sys::release_update_gate();
                 }
@@ -399,11 +408,14 @@ mod windows_impl {
                 .child_stderr
                 .take()
                 .ok_or("update handoff status channel is unavailable")?;
+
+            // Only the three explicit handoff handles should cross the process boundary.
+            make_standard_handles_non_inheritable()?;
             let mut child = Command::new(&self.target_path)
                 .current_dir(self.target_path.parent().ok_or("update target has no directory")?)
                 .stdin(Stdio::from(child_stdin))
                 .stderr(Stdio::from(child_stderr))
-                .stdout(Stdio::inherit())
+                .stdout(Stdio::null())
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn()
                 .map_err(|e| format!("update launch failed: {e}"))?;
@@ -543,7 +555,13 @@ mod windows_impl {
             return Err("invalid old executable path in update handoff".into());
         }
 
-        let parent_handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, parent_pid) };
+        let parent_handle = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                parent_pid,
+            )
+        };
         if parent_handle.is_null() {
             return Err("update parent process is no longer available".into());
         }
@@ -612,22 +630,46 @@ mod windows_impl {
     }
 
     fn write_final_executable(path: &Path, bytes: &[u8]) -> Result<(), String> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|e| format!("update write failed: {e}"))?;
-        file.write_all(bytes).map_err(|e| format!("update write failed: {e}"))?;
-        file.flush().map_err(|e| format!("update flush failed: {e}"))?;
-        file.sync_all().map_err(|e| format!("update sync failed: {e}"))?;
-        file.seek(SeekFrom::Start(0)).map_err(|e| format!("update validation seek failed: {e}"))?;
-        let mut read_back = Vec::with_capacity(bytes.len());
-        file.read_to_end(&mut read_back).map_err(|e| format!("update validation read failed: {e}"))?;
-        if read_back != bytes {
-            return Err("update binary integrity check failed after write".into());
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|e| format!("update write failed: {e}"))?;
+            file.write_all(bytes).map_err(|e| format!("update write failed: {e}"))?;
+            file.flush().map_err(|e| format!("update flush failed: {e}"))?;
+            file.sync_all().map_err(|e| format!("update sync failed: {e}"))?;
+            file.seek(SeekFrom::Start(0)).map_err(|e| format!("update validation seek failed: {e}"))?;
+            let mut read_back = Vec::with_capacity(bytes.len());
+            file.read_to_end(&mut read_back).map_err(|e| format!("update validation read failed: {e}"))?;
+            if read_back != bytes {
+                return Err("update binary integrity check failed after write".into());
+            }
+            validate_pe(&read_back)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = fs::remove_file(path);
         }
-        validate_pe(&read_back)?;
+        result
+    }
+
+    fn make_standard_handles_non_inheritable() -> Result<(), String> {
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = unsafe { GetStdHandle(which) };
+            if handle.is_null() || handle as isize == -1 {
+                continue;
+            }
+            let file_type = unsafe { GetFileType(handle) };
+            if file_type != FILE_TYPE_PIPE && file_type != FILE_TYPE_DISK {
+                continue;
+            }
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+                return Err("failed to protect update parent standard handle".into());
+            }
+        }
         Ok(())
     }
 

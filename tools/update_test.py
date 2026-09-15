@@ -14,15 +14,14 @@ MAX_LINE = 96 * 1024 * 1024
 def read_line(conn):
     data = bytearray()
     while True:
-        chunk = conn.recv(4096)
+        chunk = conn.recv(1)
         if not chunk:
             return None
+        if chunk == b"\n":
+            return bytes(data).decode("utf-8", errors="replace").rstrip("\r")
         data.extend(chunk)
         if len(data) > MAX_LINE:
             raise RuntimeError("wire line too large")
-        pos = data.find(b"\n")
-        if pos >= 0:
-            return bytes(data[:pos]).decode("utf-8", errors="replace").rstrip("\r")
 
 
 def wait_for_result(conn, timeout=30):
@@ -34,10 +33,24 @@ def wait_for_result(conn, timeout=30):
         if line == "HB":
             conn.sendall(b"PONG\n")
             continue
+        if line == "PONG":
+            return line
         if line.startswith("DATA:"):
             continue
         if line.startswith("ACK:") or line.startswith("ERR:"):
             return line
+
+
+def process_output(process):
+    stdout = b""
+    stderr = b""
+    if getattr(process, "stdout", None) is not None or getattr(process, "stderr", None) is not None:
+        try:
+            stdout, stderr = process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=5)
+    return stdout.decode("utf-8", errors="replace"), stderr.decode("utf-8", errors="replace")
 
 
 def accept_agent(server, timeout=45, process=None):
@@ -46,8 +59,7 @@ def accept_agent(server, timeout=45, process=None):
     server.settimeout(min(2.0, max(0.1, timeout)))
     while time.time() < deadline:
         if process is not None and process.poll() is not None:
-            stdout = Path(process._ztsec_stdout).read_text(errors="replace") if hasattr(process, "_ztsec_stdout") else ""
-            stderr = Path(process._ztsec_stderr).read_text(errors="replace") if hasattr(process, "_ztsec_stderr") else ""
+            stdout, stderr = process_output(process)
             raise RuntimeError(f"agent exited with code {process.returncode}; stdout={stdout!r}; stderr={stderr!r}")
         try:
             conn, _ = server.accept()
@@ -56,17 +68,18 @@ def accept_agent(server, timeout=45, process=None):
         conn.settimeout(10)
         try:
             hello = read_line(conn)
-            data = read_line(conn)
             if not hello or not hello.startswith("HELLO:FINGERPRINT:"):
                 last_error = f"unexpected hello: {hello!r}"
+                conn.close()
                 continue
+            data = read_line(conn)
             if not data or not data.startswith("DATA:"):
                 last_error = f"unexpected data: {data!r}"
+                conn.close()
                 continue
             return conn
         except (ConnectionError, OSError) as exc:
             last_error = f"agent connection failed: {exc}"
-        finally:
             try:
                 conn.close()
             except OSError:
@@ -107,16 +120,12 @@ def main():
             server.listen(4)
             port = server.getsockname()[1]
 
-            stdout_path = root / "old_agent.out"
-            stderr_path = root / "old_agent.err"
             proc = subprocess.Popen(
                 [str(old), "--ip", "127.0.0.1", "--port", str(port)],
                 cwd=str(root),
-                stdout=stdout_path.open("w", encoding="utf-8"),
-                stderr=stderr_path.open("w", encoding="utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-            proc._ztsec_stdout = stdout_path
-            proc._ztsec_stderr = stderr_path
             try:
                 conn = accept_agent(server, process=proc)
                 with conn:
@@ -160,6 +169,7 @@ def main():
 
                 # The old session intentionally closes; the successor must reconnect.
                 proc.wait(timeout=45)
+                process_output(proc)
                 proc = None
                 conn2 = accept_agent(server, timeout=45)
                 with conn2:
@@ -167,15 +177,30 @@ def main():
                     if wait_for_result(conn2, timeout=15) != "PONG":
                         raise RuntimeError("successor did not answer REQ:DATA")
                     # The replacement must own the normal mutex while it is running.
-                    probe = subprocess.Popen(
-                        [str(new), "--ip", "127.0.0.1", "--port", str(port + 1)],
-                        cwd=str(root),
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    probe.wait(timeout=10)
-                    if probe.returncode != 0:
-                        raise RuntimeError(f"second normal start returned {probe.returncode}")
+                    with socket.create_server(("127.0.0.1", 0)) as probe_server:
+                        probe_port = probe_server.getsockname()[1]
+                        probe_server.settimeout(1)
+                        probe = subprocess.Popen(
+                            [str(new), "--ip", "127.0.0.1", "--port", str(probe_port)],
+                            cwd=str(root),
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        try:
+                            probe.wait(timeout=10)
+                        finally:
+                            if probe.poll() is None:
+                                probe.terminate()
+                                probe.wait(timeout=5)
+                        if probe.returncode != 0:
+                            raise RuntimeError(f"second normal start unexpectedly returned {probe.returncode}")
+                        try:
+                            accepted, _ = probe_server.accept()
+                        except socket.timeout:
+                            pass
+                        else:
+                            accepted.close()
+                            raise RuntimeError("second normal start reached the network despite mutex protection")
 
                     conn2.sendall(b"CMD:CLOSE\n")
                     if wait_for_result(conn2, timeout=15) != "ACK:CLOSE":
@@ -194,13 +219,15 @@ def main():
                     raise RuntimeError("installed bytes differ from payload")
 
             finally:
-                if proc is not None and proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=5)
+                if proc is not None:
+                    if proc.poll() is None:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=5)
+                    process_output(proc)
 
     print("update process test passed")
 

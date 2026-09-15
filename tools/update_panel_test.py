@@ -42,12 +42,14 @@ def main():
         )
         agent_proc = subprocess.Popen(
             [str(old), "--ip", "127.0.0.1", "--port", str(port)],
-            cwd=str(install),
+            cwd=str(root),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         try:
             time.sleep(1.0)
+            if agent_proc.poll() is not None:
+                raise RuntimeError(f"agent exited before panel update: {agent_proc.returncode}")
             if panel_proc.poll() is not None:
                 out, err = panel_proc.communicate(timeout=2)
                 raise RuntimeError(f"panel exited early: {out}\n{err}")
