@@ -52,7 +52,7 @@ fn update_flow_contract() {
     assert!(source.contains("update staging failed"));
     assert!(source.contains("update acknowledgement send failed"));
     assert!(source.contains("handoff.wait_admission"));
-    assert!(source.contains("spawn_probe"));
+    assert!(update.contains("spawn_probe"));
     assert!(update.contains("HELLO:UPDATE-PROBE:"));
     assert!(update.contains("ACK:UPDATE-PROBE:"));
     assert!(update.contains("UPDATE_PROBE_READY:"));
@@ -89,4 +89,13 @@ fn update_compile_contracts() {
     let net = std::fs::read_to_string("src/net.rs").unwrap();
     assert!(net.contains("fn session(stream: &mut TcpStream, ip: &str, port: u16"));
     assert!(net.contains("spawn_successor(staged, target, actual_hash, parent_pid, ip, port, fp)"));
+    assert!(source_is_successor_helper_arg_free_of_duplicate_server_port());
+}
+
+fn source_is_successor_helper_arg_free_of_duplicate_server_port() -> bool {
+    let update = std::fs::read_to_string("src/update.rs").unwrap();
+    let start = update.find("let mut command = Command::new(&helper);").unwrap();
+    let end = update[start..].find("for argument in std::env::args_os()",).map(|o| start+o).unwrap_or(update.len());
+    let section = &update[start..end];
+    section.matches("SERVER_PORT_ARG}").count() == 1
 }
