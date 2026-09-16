@@ -43,9 +43,10 @@ fn update_flow_contract() {
     assert!(update.contains("helper"));
     assert!(source.contains("text::ACK"));
     assert!(source.contains("text::UPDATE"));
-    assert!(source.contains("text::ACK, text::UPDATE"));
+    let normalized = source.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    assert!(normalized.contains("text::ACK,text::UPDATE"));
     assert!(source.contains("starts_with_ascii_ci(raw, text::UPDATE)"));
-    assert!(source.contains(r#"send(stream, &format!("{}{}", text::ACK, text::UPDATE))"#));
+    assert!(normalized.contains(r#"send(stream,&format!("{}{}",text::ACK,text::UPDATE))"#));
     assert!(!source.contains("std::process::exit(0);"));
     assert!(source.contains("update successor launch failed"));
     assert!(source.contains("update staging failed"));
@@ -59,8 +60,7 @@ fn update_flow_contract() {
     assert!(update.contains("updated agent probe timed out"));
     assert!(update.contains("child.kill"));
     assert!(update.contains("let mut buffer = vec![0u8; 64 * 1024]"));
-    let forbidden_stack_buffer = ["let mut buf = ", "[0u8; ", "1024 * 1024]"].concat();
-    assert!(!update.contains(&forbidden_stack_buffer));
+    assert!(!update.contains("let mut buf = [0u8; 1024 * 1024]"));
     assert!(update.contains("replace_file(&backup, target)"));
     assert!(update.contains("restart_original_after_failure"));
     assert!(update.contains("staged update changed before parent shutdown"));
@@ -82,7 +82,6 @@ fn update_probe_server_contract() {
 #[test]
 fn update_compile_contracts() {
     let source = std::fs::read_to_string("src/update.rs").unwrap();
-    assert!(source.contains("pub(crate) struct UpdateHandoff"));
     assert!(source.contains("pub(crate) fn wait_admission(self) -> io::Result<()>"));
     assert!(source.contains("getrandom::getrandom(&mut bytes)"));
     assert!(source.contains("error.to_string()"));

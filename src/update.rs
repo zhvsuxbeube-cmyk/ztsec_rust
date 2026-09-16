@@ -665,6 +665,7 @@ fn spawn_probe(successor: &SuccessorArgs) -> io::Result<Child> {
     command.spawn()
 }
 
+
 fn restart_original_after_failure(
     target: &Path,
     arguments: &[OsString],
@@ -1243,7 +1244,6 @@ mod tests {
     fn heap_hash_buffer() {
         let source = include_str!("update.rs");
         assert!(source.contains("let mut buffer = vec![0u8; 64 * 1024]"));
-        let forbidden_stack_buffer = ["let mut buf = ", "[0u8; ", "1024 * 1024]"].concat();
-        assert!(!source.contains(&forbidden_stack_buffer));
+        assert!(!source.contains("let mut buf = [0u8; 1024 * 1024]"));
     }
 }

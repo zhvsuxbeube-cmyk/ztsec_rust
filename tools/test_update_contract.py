@@ -2,13 +2,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NET = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+NET_NORMALIZED = "".join(NET.split())
 UPDATE = (ROOT / "src" / "update.rs").read_text(encoding="utf-8")
 MAIN = (ROOT / "src" / "main.rs").read_text(encoding="utf-8")
 
 
 def test_update_is_not_acknowledged_before_candidate_admission():
-    admitted = NET.index("handoff.wait_admission()")
-    ack = NET.index("text::ACK,text::UPDATE")
+    normalized = "".join(NET.split())
+    admitted = normalized.index("handoff.wait_admission()")
+    ack = NET_NORMALIZED.index("text::ACK,text::UPDATE")
     assert admitted < ack
 
 
