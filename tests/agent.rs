@@ -35,10 +35,10 @@ fn update_flow_contract() {
     assert!(source.contains("spawn_successor"));
     assert!(source.contains("sha256_hex"));
     let main = std::fs::read_to_string("src/main.rs").unwrap();
-    assert!(main.contains("maybe_run_successor"));
     let update = std::fs::read_to_string("src/update.rs").unwrap();
+    assert!(main.contains("maybe_run_successor"));
     assert!(update.contains("--ztsec-update-successor"));
-    assert!(update.contains("WAIT_TIMEOUT_MS"));
+    assert!(update.contains("PROBE_WAIT"));
     assert!(update.contains("--ztsec-update-agent-arg="));
     assert!(update.contains("helper"));
     assert!(source.contains("text::ACK"));
@@ -50,8 +50,29 @@ fn update_flow_contract() {
     assert!(source.contains("update successor launch failed"));
     assert!(source.contains("update staging failed"));
     assert!(source.contains("update acknowledgement send failed"));
-    assert!(update.contains("let mut buf = vec![0u8; 64 * 1024]"));
+    assert!(source.contains("handoff.wait_admission"));
+    assert!(source.contains("spawn_probe"));
+    assert!(update.contains("HELLO:UPDATE-PROBE:"));
+    assert!(update.contains("ACK:UPDATE-PROBE:"));
+    assert!(update.contains("UPDATE_PROBE_READY:"));
+    assert!(update.contains("ACK:UPDATE_PROBE_READY:"));
+    assert!(update.contains("updated agent probe timed out"));
+    assert!(update.contains("child.kill"));
+    assert!(update.contains("let mut buffer = vec![0u8; 64 * 1024]"));
     assert!(!update.contains("let mut buf = [0u8; 1024 * 1024]"));
-    assert!(update.contains("let mut restored = false;"));
-    assert!(update.contains("replace_file(&backup, &successor.target)"));
+    assert!(update.contains("replace_file(&backup, target)"));
+    assert!(update.contains("restart_original_after_failure"));
+    assert!(update.contains("staged update changed before parent shutdown"));
+    assert!(update.contains("updated agent probe timed out"));
+}
+
+#[test]
+fn update_probe_server_contract() {
+    let update = std::fs::read_to_string("src/update.rs").unwrap();
+    assert!(update.contains("HELLO:UPDATE-PROBE:"));
+    assert!(update.contains("ACK:UPDATE-PROBE:"));
+    assert!(update.contains("UPDATE_PROBE_READY:"));
+    assert!(update.contains("ACK:UPDATE_PROBE_READY:"));
+    assert!(update.contains("notify_handoff_failure"));
+    assert!(update.contains("probe_child" ) || update.contains("spawn_probe"));
 }

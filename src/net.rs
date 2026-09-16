@@ -126,82 +126,48 @@ fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut
                     let rest = raw[text::UPDATE.len()..].trim();
                     let (expected_hash, b64) = match rest.split_once(':') {
                         Some((h, b)) => (h.trim(), b.trim()),
-                        None => {
-                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
-                            continue;
-                        }
+                        None => { let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE)); continue; }
                     };
-
                     let bytes = match update::decode_base64(b64) {
                         Some(bytes) if !bytes.is_empty() && bytes.len() <= update::max_update_bytes() => bytes,
-                        _ => {
-                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
-                            continue;
-                        }
+                        _ => { let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE)); continue; }
                     };
                     #[cfg(windows)]
                     if bytes.len() < 2 || &bytes[..2] != b"MZ" {
                         let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
                         continue;
                     }
-
                     let actual_hash = update::sha256_hex(&bytes);
                     if !update::validate_hash(expected_hash, &actual_hash) {
                         let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
                         continue;
                     }
-
                     if std::env::var_os("ZTSEC_CI").is_some() {
                         eprintln!("update phase=validated bytes={} hash={}", bytes.len(), actual_hash);
                     }
-
                     let staged = match update::stage_bytes(&bytes, expected_hash) {
                         Ok(path) => path,
-                        Err(err) => {
-                            eprintln!("update staging failed: {err}");
-                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
-                            continue;
-                        }
+                        Err(err) => { eprintln!("update staging failed: {err}"); let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE)); continue; }
                     };
-
-                    // The payload is fully validated and durably staged at this point.
-                    // Start the one-shot handoff before acknowledging the update so an ACK
-                    // means the replacement process is actually scheduled, not merely
-                    // written to a staging file.
-                    let current_exe = match std::env::current_exe() {
+                    let target = match std::env::current_exe() {
                         Ok(path) => path,
-                        Err(err) => {
-                            eprintln!("update current executable lookup failed: {err}");
-                            let _ = std::fs::remove_file(staged);
-                            let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
-                            continue;
-                        }
+                        Err(err) => { eprintln!("update current executable lookup failed: {err}"); let _=std::fs::remove_file(&staged); let _=send(stream,&format!("{}{}",text::ERR,text::UPDATE)); continue; }
                     };
                     let parent_pid = std::process::id();
-                    let target = current_exe;
-                    let hash = actual_hash;
-
-                    if let Err(err) = update::spawn_successor(staged, target, hash, parent_pid) {
-                        eprintln!("update successor launch failed: {err}");
-                        let _ = send(stream, &format!("{}{}", text::ERR, text::UPDATE));
+                    let handoff = match update::spawn_successor(staged, target, actual_hash, parent_pid, ip, port, fp) {
+                        Ok(h) => h,
+                        Err(err) => { eprintln!("update successor launch failed: {err}"); let _=send(stream,&format!("{}{}",text::ERR,text::UPDATE)); continue; }
+                    };
+                    if std::env::var_os("ZTSEC_CI").is_some() { eprintln!("update phase=successor-spawned parent_pid={parent_pid}"); }
+                    if let Err(err) = handoff.wait_admission() {
+                        eprintln!("update admission failed: {err}");
+                        let _=send(stream,&format!("{}{}",text::ERR,text::UPDATE));
                         continue;
                     }
-
-                    if std::env::var_os("ZTSEC_CI").is_some() {
-                        eprintln!("update phase=successor-spawned parent_pid={}", parent_pid);
-                    }
-
-                    if let Err(err) = send(stream, &format!("{}{}", text::ACK, text::UPDATE)) {
-                        eprintln!("update acknowledgement send failed: {err}");
-                        return true;
-                    }
-                    let _ = stream.shutdown(Shutdown::Write);
-                    if std::env::var_os("ZTSEC_CI").is_some() {
-                        eprintln!("update phase=ack-sent");
-                    }
-
-                    // The successor is now responsible for the filesystem handoff.
-                    // Return from the agent runtime so the parent PID can exit cleanly.
+                    if std::env::var_os("ZTSEC_CI").is_some() { eprintln!("update phase=admitted"); }
+                    if let Err(err)=send(stream,&format!("{}{}",text::ACK,text::UPDATE)){ eprintln!("update acknowledgement send failed: {err}"); return true; }
+                    let _=stream.shutdown(Shutdown::Write);
+                    if std::env::var_os("ZTSEC_CI").is_some(){eprintln!("update phase=ack-sent");}
                     return true;
                 }
 

@@ -13,6 +13,7 @@ fn main() {
     if update::maybe_run_successor(&argv) {
         return;
     }
+    if update::maybe_run_probe(&argv) { return; }
     if !sys::single() {
         return;
     }
