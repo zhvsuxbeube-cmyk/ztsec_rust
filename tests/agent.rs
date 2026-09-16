@@ -78,7 +78,7 @@ fn update_flow_contract() {
     assert!(update.contains("FINAL_PORT_ARG"));
     assert!(update.contains("request_helper_self_delete"));
     let args = std::fs::read_to_string("src/args.rs").unwrap();
-    assert!(args.contains("arg.starts_with("--ztsec-update-")"));
+    assert!(args.contains(r#"arg.starts_with("--ztsec-update-")"#));
 }
 
 #[test]
