@@ -59,8 +59,14 @@ fn update_flow_contract() {
     assert!(update.contains("ACK:UPDATE_PROBE_READY:"));
     assert!(update.contains("updated agent probe timed out"));
     assert!(update.contains("child.kill"));
-    assert!(update.contains("let mut buffer = vec![0u8; 64 * 1024]"));
-    assert!(!update.contains("let mut buf = [0u8; 1024 * 1024]"));
+    let hash_start = update.find("fn sha256_file(").expect("sha256_file missing");
+    let hash_end = update[hash_start..]
+        .find("\n#[derive(Debug)")
+        .map(|offset| hash_start + offset)
+        .unwrap_or(update.len());
+    let hash_fn = &update[hash_start..hash_end];
+    assert!(hash_fn.contains("let mut buffer = vec![0u8; 64 * 1024]"));
+    assert!(!hash_fn.contains("let mut buf = [0u8; 1024 * 1024]"));
     assert!(update.contains("replace_file(&backup, target)"));
     assert!(update.contains("restart_original_after_failure"));
     assert!(update.contains("staged update changed before parent shutdown"));
