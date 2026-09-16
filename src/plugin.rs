@@ -304,6 +304,13 @@ mod win {
         received: u64,
     }
 
+    fn safe_transfer_component(value: &str) -> Option<String> {
+        if value.is_empty() || value.len() > 128 || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return None;
+        }
+        Some(value.to_owned())
+    }
+
     #[derive(Clone)]
     pub struct PluginOutput {
         pub event: String,
@@ -326,7 +333,6 @@ mod win {
         // Load a plugin from raw DLL bytes supplied in-memory (no disk path).
         pub fn load(&mut self, id: &str, data: &[u8], host: &[u8]) -> Result<(), String> {
             if id.is_empty() { return Err(text::PLUG_ERR_NAME.into()); }
-            self.map.remove(id);
 
             let (image, image_sz) = unsafe {
                 load_pe(data).ok_or_else(|| text::PLUG_ERR_LOAD.to_owned())?
@@ -352,16 +358,31 @@ mod win {
                 return Err(text::PLUG_ERR_INIT.into());
             }
 
-            self.map.insert(id.to_owned(), Plugin { image, image_sz, unload: unload_fn, event: event_fn });
+            let new_plugin = Plugin { image, image_sz, unload: unload_fn, event: event_fn };
+            if let Some(old_plugin) = self.map.insert(id.to_owned(), new_plugin) {
+                drop(old_plugin);
+            }
             Ok(())
         }
 
         pub fn begin_transfer(&mut self, id: &str, transfer_id: &str, size: u64, hash: &str) -> Result<u64, String> {
-            if id.is_empty() || transfer_id.is_empty() || !crate::update::validate_hash(hash, hash) { return Err("invalid plugin transfer metadata".into()); }
+            let safe_id = safe_transfer_component(id).ok_or_else(|| "invalid plugin id".to_string())?;
+            let safe_transfer = safe_transfer_component(transfer_id).ok_or_else(|| "invalid plugin transfer id".to_string())?;
+            if size == 0 || size > 256 * 1024 * 1024 || !crate::update::validate_hash(hash, hash) {
+                return Err("invalid plugin transfer metadata".into());
+            }
             let base = std::env::temp_dir().join("ztsec_plugin_transfers");
             fs::create_dir_all(&base).map_err(|e| e.to_string())?;
-            let path = base.join(format!("{}-{}.part", id, transfer_id));
-            let received = match fs::metadata(&path) { Ok(m) => m.len().min(size), Err(_) => 0 };
+            let path = base.join(format!("{}-{}.part", safe_id, safe_transfer));
+            let received = match fs::metadata(&path) {
+                Ok(m) if m.len() <= size => m.len(),
+                Ok(_) => {
+                    let file = OpenOptions::new().write(true).truncate(true).open(&path).map_err(|e| e.to_string())?;
+                    drop(file);
+                    0
+                }
+                Err(_) => 0,
+            };
             if !path.exists() { File::create(&path).map_err(|e| e.to_string())?; }
             self.transfers.insert(transfer_id.to_owned(), PluginTransfer { id: id.to_owned(), path, size, hash: hash.to_ascii_lowercase(), received });
             Ok(received)
@@ -383,13 +404,18 @@ mod win {
         }
 
         pub fn finish_transfer(&mut self, transfer_id: &str, host: &[u8]) -> Result<String, String> {
-            let tr = self.transfers.get(transfer_id).ok_or_else(|| "unknown plugin transfer".to_string())?;
-            if tr.received != tr.size { return Err("plugin transfer incomplete".into()); }
-            let bytes = fs::read(&tr.path).map_err(|e| e.to_string())?;
-            if bytes.len() as u64 != tr.size || !update::validate_hash(&tr.hash, &update::sha256_hex(&bytes)) { return Err("plugin transfer hash mismatch".into()); }
-            let id = tr.id.clone();
+            // Take an owned snapshot before calling `self.load`, which mutably borrows
+            // the manager. Keeping `tr` borrowed across that call triggers E0502.
+            let (id, path, size, hash, received) = {
+                let tr = self.transfers.get(transfer_id).ok_or_else(|| "unknown plugin transfer".to_string())?;
+                (tr.id.clone(), tr.path.clone(), tr.size, tr.hash.clone(), tr.received)
+            };
+            if received != size { return Err("plugin transfer incomplete".into()); }
+            let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+            if bytes.len() as u64 != size || !update::validate_hash(&hash, &update::sha256_hex(&bytes)) {
+                return Err("plugin transfer hash mismatch".into());
+            }
             self.load(&id, &bytes, host)?;
-            let path = tr.path.clone();
             self.transfers.remove(transfer_id);
             let _ = fs::remove_file(path);
             Ok(id)
@@ -407,6 +433,14 @@ mod win {
                     (p.event)(event.as_ptr(), event.len() as u32, payload.as_ptr(), payload.len() as u32)
                 };
             }
+        }
+
+        pub fn event_one(&self, id: &str, event: &str, payload: &[u8]) -> Result<(), String> {
+            let plugin = self.map.get(id).ok_or_else(|| text::PLUG_ERR_LOAD.to_owned())?;
+            let rc = unsafe {
+                (plugin.event)(event.as_ptr(), event.len() as u32, payload.as_ptr(), payload.len() as u32)
+            };
+            if rc == 0 { Ok(()) } else { Err("plugin event rejected".into()) }
         }
 
         pub fn unload(&mut self, id: &str) -> bool { self.map.remove(id).is_some() }
@@ -430,6 +464,18 @@ mod win {
         -1
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::safe_transfer_component;
+
+        #[test]
+        fn transfer_component_rejects_path_traversal() {
+            assert!(safe_transfer_component("../evil").is_none());
+            assert!(safe_transfer_component("..\\evil").is_none());
+            assert!(safe_transfer_component("ok-plugin_01").is_some());
+        }
+    }
+
     pub use Manager as Host;
 }
 
@@ -446,6 +492,7 @@ impl Host {
     pub fn event(&self, _: &str, _: &[u8]) {}
     pub fn unload(&mut self, _: &str) -> bool { false }
     pub fn clear(&mut self) {}
+
 }
 
 pub use Host as Manager;

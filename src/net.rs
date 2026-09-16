@@ -168,8 +168,10 @@ fn session(stream: &mut TcpStream, ip: &str, port: u16, fp: &str, host: &str, pl
                     let event_bytes = parts.next().unwrap_or(&[]);
                     let data = parts.next().unwrap_or(&[]);
                     let event = match core::str::from_utf8(event_bytes) { Ok(v) if !v.is_empty() => v, _ => { let _=send(stream,&format!("{}{}",text::ERR,text::PMSG)); continue; } };
-                    plugins.event(event, data);
-                    let _ = send(stream, &format!("{}{}{}", text::ACK, text::PMSG, plugin_id.trim()));
+                    match plugins.event_one(plugin_id.trim(), event, data) {
+                        Ok(()) => { let _ = send(stream, &format!("{}{}{}", text::ACK, text::PMSG, plugin_id.trim())); }
+                        Err(_) => { let _ = send(stream, &format!("{}{}{}", text::ERR, text::PMSG, plugin_id.trim())); }
+                    }
                     continue;
                 }
 
