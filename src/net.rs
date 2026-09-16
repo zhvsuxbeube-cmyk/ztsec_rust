@@ -81,7 +81,10 @@ fn session(stream: &mut TcpStream, ip: &str, port: u16, fp: &str, host: &str, pl
             let event = output.event.replace(':', "_").replace('\n', "_");
             let payload = decode_or_empty(output.payload);
             if std::env::var_os("ZTSEC_CI").is_some() {
-                eprintln!("plugin event: {} {}", event, String::from_utf8_lossy(&payload));
+                // CI captures the agent's stdout in its PowerShell variable, while
+                // stderr is still shown in the Actions log. Keep the callback
+                // marker on stdout so the Windows runtime assertion can observe it.
+                println!("plugin event: {} {}", event, String::from_utf8_lossy(&payload));
             }
             let _ = send(stream, &format!("{}{}:{}", text::PLUGOUT, event, encode_b64(&payload)));
         }
