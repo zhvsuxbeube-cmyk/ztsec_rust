@@ -336,7 +336,7 @@ fn successor_args(args: &[String]) -> Result<Option<SuccessorArgs>, String> {
     }))
 }
 
-struct UpdateHandoff {
+pub(crate) struct UpdateHandoff {
     listener: TcpListener,
     token: String,
     hash: String,
@@ -663,12 +663,6 @@ fn spawn_probe(successor: &SuccessorArgs) -> io::Result<Child> {
     command.creation_flags(0x0800_0000);
 
     command.spawn()
-}
-
-fn cleanup_update_artifacts(source: &Path, target_tmp: &Path, backup: &Path) {
-    let _ = fs::remove_file(source);
-    let _ = fs::remove_file(target_tmp);
-    let _ = fs::remove_file(backup);
 }
 
 fn restart_original_after_failure(
@@ -1249,6 +1243,7 @@ mod tests {
     fn heap_hash_buffer() {
         let source = include_str!("update.rs");
         assert!(source.contains("let mut buffer = vec![0u8; 64 * 1024]"));
-        assert!(!source.contains("let mut buf = [0u8; 1024 * 1024]"));
+        let forbidden_stack_buffer = ["let mut buf = ", "[0u8; ", "1024 * 1024]"].concat();
+        assert!(!source.contains(&forbidden_stack_buffer));
     }
 }
