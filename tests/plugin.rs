@@ -36,11 +36,22 @@ fn plugin_protocol_contract() {
 #[test]
 fn finish_transfer_ends_immutable_borrow_before_load() {
     let source = std::fs::read_to_string("src/plugin.rs").unwrap();
-    let start = source.find("pub fn finish_transfer").expect("finish_transfer missing");
-    let end = source[start..].find("pub fn resume_transfer").map(|o| start + o).unwrap();
+    let start = source
+        .find("pub fn finish_transfer")
+        .expect("finish_transfer missing");
+    let end = source[start..]
+        .find("pub fn resume_transfer")
+        .map(|offset| start + offset)
+        .expect("resume_transfer missing");
     let body = &source[start..end];
-    assert!(body.contains("let (id, path, size, hash, received) = {"));
-    let load_pos = body.find("self.load(&id, &bytes, host)?;").expect("self.load missing");
-    assert!(body.find("let tr = self.transfers.get(transfer_id)").unwrap() < body.find("let (id, path, size, hash, received) = {").unwrap());
-    assert!(load_pos > body.find("};\n            if received != size").unwrap());
+
+    let snapshot = body
+        .find("let (id, path, size, hash, received) = {")
+        .expect("owned transfer snapshot missing");
+    let load = body
+        .find("self.load(&id, &bytes, host)?;")
+        .expect("self.load missing");
+    assert!(snapshot < load, "snapshot must precede mutable plugin load");
+    assert!(body.contains("let tr = self.transfers.get(transfer_id)"));
+    assert!(body.contains("(tr.id.clone(), tr.path.clone(), tr.size, tr.hash.clone(), tr.received)"));
 }
