@@ -3,6 +3,9 @@ import base64
 import os
 import socket
 import hashlib
+import queue
+import threading
+import time
 
 MAX_UPDATE_BYTES = 64 * 1024 * 1024
 
@@ -109,39 +112,101 @@ def main():
                 with open(update_path, "rb") as f:
                     update_bytes = f.read()
                 digest = hashlib.sha256(update_bytes).hexdigest()
-                tampered = bytearray(update_bytes)
-                tampered[0] ^= 0xFF
-                bad = base64.b64encode(tampered).decode()
-                print("update phase: sending tampered payload")
-                conn.sendall((f"CMD:UPDATE:{digest}:{bad}" + "\n").encode())
-                bad_result = wait_result(conn)
-                if not bad_result.startswith("ERR:UPDATE:"):
-                    raise SystemExit("tampered update was not rejected")
-                print("update phase: sending valid payload")
-                conn.sendall((update_cmd(update_path) + "\n").encode())
-                good_result = wait_result(conn)
-                if not good_result.startswith("ACK:UPDATE:"):
-                    raise SystemExit("valid update was not acknowledged")
-                print("update phase: valid payload acknowledged")
-                conn.close()
 
-                server.settimeout(45)
-                new_conn, _ = server.accept()
-                with new_conn:
-                    new_hello = read_line(new_conn)
-                    new_data = read_line(new_conn)
-                    print(new_hello)
-                    show(new_data)
-                    if a.expect_version:
-                        vals = new_data[5:].split("|") if new_data.startswith("DATA:") else []
-                        version = vals[FIELDS.index("Version")] if len(vals) > FIELDS.index("Version") else ""
-                        if version != a.expect_version:
-                            raise SystemExit(f"updated version mismatch: {version!r}")
-                    new_conn.sendall(b"CMD:CLOSE\n")
-                    result = wait_result(new_conn)
-                    if not result.startswith("ACK:CLOSE"):
-                        raise SystemExit("updated agent did not close cleanly")
-                return
+                pending = queue.Queue()
+                stop_accept = threading.Event()
+
+                def handle_extra(client):
+                    try:
+                        hello = read_line(client)
+                        data = read_line(client)
+                        if hello.startswith("HELLO:UPDATE-PROBE:"):
+                            fields = hello[len("HELLO:UPDATE-PROBE:"):].split(":")
+                            if len(fields) != 3 or len(data) == 0 or not data.startswith("DATA:"):
+                                client.close()
+                                return
+                            fingerprint, token, candidate_hash = fields
+                            if candidate_hash.lower() != digest.lower():
+                                client.sendall(b"ERR:UPDATE-PROBE\n")
+                                client.close()
+                                return
+                            client.sendall((f"ACK:UPDATE-PROBE:{fingerprint}:{token}\n").encode())
+                            client.close()
+                            return
+                        pending.put((client, hello, data))
+                    except (ConnectionError, OSError):
+                        try:
+                            client.close()
+                        except OSError:
+                            pass
+
+                def accept_extra():
+                    while not stop_accept.is_set():
+                        try:
+                            server.settimeout(0.2)
+                            client, _ = server.accept()
+                        except socket.timeout:
+                            continue
+                        except OSError:
+                            break
+                        threading.Thread(target=handle_extra, args=(client,), daemon=True).start()
+
+                accept_thread = threading.Thread(target=accept_extra, daemon=True)
+                accept_thread.start()
+                try:
+                    print("update phase: sending tampered payload")
+                    tampered = bytearray(update_bytes)
+                    tampered[0] ^= 0xFF
+                    bad = base64.b64encode(tampered).decode()
+                    conn.sendall((f"CMD:UPDATE:{digest}:{bad}\n").encode())
+                    bad_result = wait_result(conn)
+                    if not bad_result.startswith("ERR:UPDATE:"):
+                        raise SystemExit("tampered update was not rejected")
+
+                    print("update phase: sending valid payload")
+                    conn.sendall((update_cmd(update_path) + "\n").encode())
+                    good_result = wait_result(conn)
+                    if not good_result.startswith("ACK:UPDATE:"):
+                        raise SystemExit("valid update was not acknowledged")
+                    print("update phase: valid payload acknowledged")
+                    conn.close()
+
+                    deadline = time.monotonic() + 45
+                    final = None
+                    while time.monotonic() < deadline:
+                        try:
+                            client, hello, data = pending.get(timeout=0.25)
+                        except queue.Empty:
+                            continue
+                        if hello.startswith("HELLO:FINGERPRINT:"):
+                            final = (client, hello, data)
+                            break
+                        try:
+                            client.close()
+                        except OSError:
+                            pass
+                    if final is None:
+                        raise SystemExit("updated agent did not reconnect to the server")
+                    new_conn, new_hello, new_data = final
+                    with new_conn:
+                        print(new_hello)
+                        show(new_data)
+                        if a.expect_version:
+                            vals = new_data[5:].split("|") if new_data.startswith("DATA:") else []
+                            version = vals[FIELDS.index("Version")] if len(vals) > FIELDS.index("Version") else ""
+                            if version != a.expect_version:
+                                raise SystemExit(f"updated version mismatch: {version!r}")
+                        new_conn.sendall(b"CMD:CLOSE\n")
+                        result = wait_result(new_conn)
+                        if not result.startswith("ACK:CLOSE"):
+                            raise SystemExit("updated agent did not close cleanly")
+                    return
+                finally:
+                    stop_accept.set()
+                    try:
+                        server.close()
+                    except OSError:
+                        pass
 
             if a.test:
                 stem = os.path.splitext(os.path.basename(a.test))[0]

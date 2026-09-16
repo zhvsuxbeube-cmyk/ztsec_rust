@@ -41,7 +41,8 @@ def test_hashing_buffer_is_heap_allocated():
 def test_post_parent_failure_attempts_original_restart():
     assert 'fn restart_original_after_failure' in UPDATE
     assert 'restart_original_after_failure(' in UPDATE
-    assert 'updated agent launch failed' in UPDATE
+    assert 'final readiness timed out' in UPDATE
+    assert 'original-agent restart failed' in UPDATE
 
 
 def test_successor_receives_server_port_and_wait_admission_is_visible():

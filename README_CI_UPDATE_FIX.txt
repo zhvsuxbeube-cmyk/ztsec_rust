@@ -1,17 +1,18 @@
-ztsec_agent update CI fix
+ztsec_agent update/CI reliability notes
 
-Fixes the Windows CI cargo-test failure caused by a brittle source-contract assertion that depended on whitespace in the Rust ACK expression.
+The update implementation uses a fail-closed, multi-phase handoff:
+- validate the received hash and payload before staging;
+- durably stage and re-hash the update using a heap-backed 64 KiB buffer;
+- run the staged executable in isolated probe mode;
+- require server probe acknowledgement and a local old-agent admission handshake;
+- acknowledge the panel only after candidate admission succeeds;
+- after the original process exits, replace the original executable path/name;
+- launch the installed image and require final normal-mode connection proof from the new image;
+- if final readiness fails, terminate the candidate, restore the original image, and restart it.
 
-Also keeps the compile-safety fixes required by RUSTFLAGS=-D warnings:
-- UpdateHandoff is pub(crate) because spawn_successor is pub(crate).
-- removed the unused cleanup_update_artifacts helper.
-- getrandom remains pinned to 0.2.17 and uses getrandom::getrandom.
-- update hashing uses a heap-backed 64 KiB buffer instead of a 1 MiB stack buffer.
+The update helper is scheduled for self-cleanup after it exits. Internal final-readiness
+arguments are ignored by the normal command-line parser, so the new image still receives
+the original --ip/--port configuration.
 
-Local verification in the supplied environment:
-- pytest tools/panel_test.py tools/test_update_contract.py: 12 passed
-- Python syntax compilation: PASS
-- update source/static audit: PASS
-- no remaining pub(crate) functions returning private update types
-
-Windows cargo/MSVC runtime verification was not possible in this environment.
+The CI update harness accepts the expected concurrent probe connection and verifies the
+final normal-mode reconnection separately from the original connection.

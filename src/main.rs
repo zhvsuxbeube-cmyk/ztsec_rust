@@ -14,9 +14,16 @@ fn main() {
         return;
     }
     if update::maybe_run_probe(&argv) { return; }
+    let final_ready = match update::final_ready_args(&argv) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("ztsec update final arguments invalid: {error}");
+            std::process::exit(2);
+        }
+    };
     if !sys::single() {
         return;
     }
     let args = args::get();
-    net::run(&args.ip, args.port);
+    net::run(&args.ip, args.port, final_ready);
 }

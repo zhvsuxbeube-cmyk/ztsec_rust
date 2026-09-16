@@ -67,10 +67,18 @@ fn update_flow_contract() {
     let hash_fn = &update[hash_start..hash_end];
     assert!(hash_fn.contains("let mut buffer = vec![0u8; 64 * 1024]"));
     assert!(!hash_fn.contains("let mut buf = [0u8; 1024 * 1024]"));
-    assert!(update.contains("replace_file(&backup, target)"));
+    let normalized_update = update.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    assert!(normalized_update.contains("replace_file(backup,&successor.target)"));
     assert!(update.contains("restart_original_after_failure"));
     assert!(update.contains("staged update changed before parent shutdown"));
     assert!(update.contains("updated agent probe timed out"));
+    assert!(update.contains("UPDATE_FINAL_READY:"));
+    assert!(update.contains("ACK:UPDATE_FINAL_READY:"));
+    assert!(update.contains("notify_final_ready"));
+    assert!(update.contains("FINAL_PORT_ARG"));
+    assert!(update.contains("request_helper_self_delete"));
+    let args = std::fs::read_to_string("src/args.rs").unwrap();
+    assert!(args.contains("arg.starts_with("--ztsec-update-")"));
 }
 
 #[test]
@@ -104,4 +112,19 @@ fn source_is_successor_helper_arg_free_of_duplicate_server_port() -> bool {
     let end = update[start..].find("for argument in std::env::args_os()",).map(|o| start+o).unwrap_or(update.len());
     let section = &update[start..end];
     section.matches("SERVER_PORT_ARG}").count() == 1
+}
+
+#[test]
+fn final_ready_contract() {
+    let update = std::fs::read_to_string("src/update.rs").unwrap();
+    let main = std::fs::read_to_string("src/main.rs").unwrap();
+    let net = std::fs::read_to_string("src/net.rs").unwrap();
+    assert!(update.contains("pub(crate) fn final_ready_args"));
+    assert!(update.contains("final executable hash mismatch"));
+    assert!(update.contains("final executable fingerprint mismatch"));
+    assert!(update.contains("FINAL_READY_WAIT"));
+    let verified = net.find(r#"if send(&mut stream, &format!("{}{}", text::HELLO, fp)).is_ok()"#).unwrap_or(0);
+    let notified = net.find("update::notify_final_ready(context)").unwrap_or(usize::MAX);
+    assert!(notified > verified);
+    assert!(main.find("update::maybe_run_probe").unwrap() < main.find("update::final_ready_args").unwrap());
 }

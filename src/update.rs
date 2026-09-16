@@ -25,6 +25,10 @@ const SERVER_PORT_ARG: &str = "--ztsec-update-server-port=";
 const HANDOFF_PORT_ARG: &str = "--ztsec-update-handoff-port=";
 const HANDOFF_TOKEN_ARG: &str = "--ztsec-update-handoff-token=";
 const FINGERPRINT_ARG: &str = "--ztsec-update-fingerprint=";
+const FINAL_PORT_ARG: &str = "--ztsec-update-final-port=";
+const FINAL_TOKEN_ARG: &str = "--ztsec-update-final-token=";
+const FINAL_HASH_ARG: &str = "--ztsec-update-final-hash=";
+const FINAL_FINGERPRINT_ARG: &str = "--ztsec-update-final-fingerprint=";
 
 const PROBE_WAIT: Duration = Duration::from_secs(45);
 const CHILD_WAIT: Duration = Duration::from_secs(45);
@@ -33,6 +37,7 @@ const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const HANDOFF_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const HANDOFF_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const FINAL_READY_WAIT: Duration = Duration::from_secs(30);
 const REPLACEMENT_RETRIES: usize = 40;
 const REPLACEMENT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
@@ -41,6 +46,8 @@ const PROBE_ACK_PREFIX: &str = "ACK:UPDATE-PROBE:";
 const PROBE_READY_PREFIX: &str = "UPDATE_PROBE_READY:";
 const PROBE_READY_ACK_PREFIX: &str = "ACK:UPDATE_PROBE_READY:";
 const PROBE_FAILED_PREFIX: &str = "UPDATE_PROBE_FAILED:";
+const FINAL_READY_PREFIX: &str = "UPDATE_FINAL_READY:";
+const FINAL_READY_ACK_PREFIX: &str = "ACK:UPDATE_FINAL_READY:";
 
 pub(crate) fn max_update_bytes() -> usize {
     MAX_UPDATE_BYTES
@@ -511,20 +518,18 @@ fn replace_file(source: &Path, target: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn launch_updated(target: &Path, arguments: &[OsString]) -> io::Result<()> {
+fn launch_updated(target: &Path, arguments: &[OsString]) -> io::Result<Child> {
     use std::os::windows::process::CommandExt;
 
     Command::new(target)
         .args(arguments)
-        // Detached child; the helper can terminate immediately after starting the agent.
         .creation_flags(0x0800_0000)
         .spawn()
-        .map(|_| ())
 }
 
 #[cfg(not(windows))]
-fn launch_updated(target: &Path, arguments: &[OsString]) -> io::Result<()> {
-    Command::new(target).args(arguments).spawn().map(|_| ())
+fn launch_updated(target: &Path, arguments: &[OsString]) -> io::Result<Child> {
+    Command::new(target).args(arguments).spawn()
 }
 
 fn rollback_path(target: &Path) -> PathBuf {
@@ -570,6 +575,61 @@ struct ProbeArgs {
     handoff_token: String,
     expected_hash: String,
     expected_fingerprint: String,
+}
+
+pub(crate) struct FinalReadyArgs {
+    pub(crate) port: u16,
+    pub(crate) token: String,
+    pub(crate) hash: String,
+    pub(crate) fingerprint: String,
+}
+
+pub(crate) fn final_ready_args(args: &[String]) -> Result<Option<FinalReadyArgs>, String> {
+    let mut found = false;
+    let mut port = None;
+    let mut token = None;
+    let mut hash = None;
+    let mut fingerprint = None;
+
+    for argument in args {
+        if let Some(value) = argument.strip_prefix(FINAL_PORT_ARG) {
+            if port.is_some() { return Err("duplicate update final port".into()); }
+            port = Some(parse_u16(value, "update final port")?);
+            found = true;
+        } else if let Some(value) = argument.strip_prefix(FINAL_TOKEN_ARG) {
+            if token.is_some() { return Err("duplicate update final token".into()); }
+            token = Some(value.to_owned());
+            found = true;
+        } else if let Some(value) = argument.strip_prefix(FINAL_HASH_ARG) {
+            if hash.is_some() { return Err("duplicate update final hash".into()); }
+            hash = Some(value.to_owned());
+            found = true;
+        } else if let Some(value) = argument.strip_prefix(FINAL_FINGERPRINT_ARG) {
+            if fingerprint.is_some() { return Err("duplicate update final fingerprint".into()); }
+            fingerprint = Some(value.to_owned());
+            found = true;
+        }
+    }
+
+    if !found { return Ok(None); }
+    let token = token.ok_or("missing update final token")?;
+    let hash = hash.ok_or("missing update final hash")?;
+    let fingerprint = fingerprint.ok_or("missing update final fingerprint")?;
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid update final token".into());
+    }
+    if !validate_hash(&hash, &hash) {
+        return Err("invalid update final hash".into());
+    }
+    if !valid_fingerprint(&fingerprint) {
+        return Err("invalid update final fingerprint".into());
+    }
+    Ok(Some(FinalReadyArgs {
+        port: port.ok_or("missing update final port")?,
+        token,
+        hash,
+        fingerprint,
+    }))
 }
 
 fn probe_args(args: &[String]) -> Result<Option<ProbeArgs>, String> {
@@ -645,6 +705,79 @@ fn probe_entry(args: &[String]) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
+pub(crate) fn notify_final_ready(final_args: &FinalReadyArgs) -> io::Result<()> {
+    let address = format!("127.0.0.1:{}", final_args.port)
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid final update address"))?;
+    let actual_hash = std::env::current_exe().and_then(|path| sha256_file(&path))?;
+    if !validate_hash(&final_args.hash, &actual_hash) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "final executable hash mismatch",
+        ));
+    }
+    let fingerprint = telemetry::fingerprint();
+    if !fingerprint.eq_ignore_ascii_case(&final_args.fingerprint) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "final executable fingerprint mismatch",
+        ));
+    }
+
+    let message = format!(
+        "{FINAL_READY_PREFIX}{}:{}:{}",
+        final_args.token, actual_hash, fingerprint
+    );
+    let expected = format!("{FINAL_READY_ACK_PREFIX}{}", final_args.token);
+    let mut last_error = None;
+
+    for attempt in 0..12 {
+        match TcpStream::connect_timeout(&address, HANDOFF_CONNECT_TIMEOUT) {
+            Ok(mut stream) => {
+                if let Err(error) = stream.set_read_timeout(Some(HANDOFF_READ_TIMEOUT)) {
+                    last_error = Some(error);
+                } else if let Err(error) = send_line(&mut stream, &message) {
+                    last_error = Some(error);
+                } else {
+                    let cloned = match stream.try_clone() {
+                        Ok(cloned) => cloned,
+                        Err(error) => {
+                            last_error = Some(error);
+                            continue;
+                        }
+                    };
+                    let mut reader = BufReader::new(cloned);
+                    let mut response = String::new();
+                    match reader.read_line(&mut response) {
+                        Ok(_) if response.trim_end_matches(&['\r', '\n'][..]) == expected => {
+                            return Ok(());
+                        }
+                        Ok(_) => {
+                            last_error = Some(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "update final readiness was not acknowledged",
+                            ));
+                        }
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+
+        if attempt + 1 < 12 {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "update final readiness notification failed",
+        )
+    }))
+}
+
 fn spawn_probe(successor: &SuccessorArgs) -> io::Result<Child> {
     #[cfg(windows)]
     use std::os::windows::process::CommandExt;
@@ -692,7 +825,7 @@ fn restart_original_after_failure(
         }
     }
 
-    let restart_error = launch_updated(target, arguments).err();
+    let restart_error = launch_updated(target, arguments).map(|_| ()).err();
 
     let _ = fs::remove_file(source);
     let _ = fs::remove_file(target_tmp);
@@ -736,10 +869,6 @@ fn replace_and_launch(successor: &SuccessorArgs) -> io::Result<()> {
     ));
     let backup = rollback_path(&successor.target);
 
-    // The original process has already exited when this helper reaches this function.
-    // Therefore every failure below must either restore/restart the original agent or
-    // leave the target untouched and start it again. Never strand the machine without
-    // an agent just because replacement preparation failed.
     let staged_hash = match sha256_file(&successor.source) {
         Ok(hash) => hash,
         Err(error) => {
@@ -864,59 +993,203 @@ fn replace_and_launch(successor: &SuccessorArgs) -> io::Result<()> {
         );
     }
 
-    match launch_updated(&successor.target, &successor.launch_args) {
-        Ok(()) => {
-            let _ = fs::remove_file(&backup);
-            let _ = fs::remove_file(&successor.source);
-            Ok(())
+    // The old agent is already gone, so the helper is now solely responsible for
+    // proving that the installed image actually started in normal mode and reached
+    // the server. The final agent gets a fresh local listener and a second, stronger
+    // readiness token; failure causes rollback and restoration of the old image.
+    let final_listener = match TcpListener::bind(("127.0.0.1", 0)) {
+        Ok(listener) => listener,
+        Err(error) => {
+            return restart_after_final_failure(successor, &target_tmp, &backup, error);
         }
-        Err(launch_error) => {
-            // The replacement succeeded, but the updated agent failed to launch.
-            // Restore the original binary and make a best-effort restart so an update
-            // failure never strands the machine without an agent process.
-            let mut restored = false;
-            if backup.exists() {
-                for attempt in 0..REPLACEMENT_RETRIES {
-                    if replace_file(&backup, &successor.target).is_ok() {
-                        restored = true;
+    };
+    if let Err(error) = final_listener.set_nonblocking(true) {
+        return restart_after_final_failure(successor, &target_tmp, &backup, error);
+    }
+    let final_port = match final_listener.local_addr() {
+        Ok(std::net::SocketAddr::V4(address)) => address.port(),
+        Ok(_) => {
+            return restart_after_final_failure(
+                successor,
+                &target_tmp,
+                &backup,
+                io::Error::new(io::ErrorKind::AddrNotAvailable, "IPv4 final listener required"),
+            );
+        }
+        Err(error) => {
+            return restart_after_final_failure(successor, &target_tmp, &backup, error);
+        }
+    };
+
+    let mut final_args = successor.launch_args.clone();
+    final_args.push(OsString::from(format!("{FINAL_PORT_ARG}{final_port}")));
+    final_args.push(OsString::from(format!("{FINAL_TOKEN_ARG}{}", successor.handoff_token)));
+    final_args.push(OsString::from(format!("{FINAL_HASH_ARG}{}", successor.hash)));
+    final_args.push(OsString::from(format!(
+        "{FINAL_FINGERPRINT_ARG}{}",
+        successor.fingerprint
+    )));
+
+    let mut final_child = match launch_updated(&successor.target, &final_args) {
+        Ok(child) => child,
+        Err(error) => {
+            return restart_after_final_failure(successor, &target_tmp, &backup, error);
+        }
+    };
+
+    let final_deadline = Instant::now() + FINAL_READY_WAIT;
+    let mut final_confirmed = false;
+    let mut final_error = None;
+
+    while Instant::now() < final_deadline {
+        match final_child.try_wait() {
+            Ok(Some(status)) => {
+                final_error = Some(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("updated agent exited before final readiness: {status}"),
+                ));
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                final_error = Some(error);
+                break;
+            }
+        }
+
+        match final_listener.accept() {
+            Ok((mut stream, _)) => {
+                if let Err(error) = stream.set_read_timeout(Some(HANDOFF_READ_TIMEOUT)) {
+                    final_error = Some(error);
+                    break;
+                }
+                let cloned = match stream.try_clone() {
+                    Ok(cloned) => cloned,
+                    Err(error) => {
+                        final_error = Some(error);
                         break;
                     }
-                    if attempt + 1 < REPLACEMENT_RETRIES {
-                        std::thread::sleep(REPLACEMENT_RETRY_DELAY);
+                };
+                let mut reader = BufReader::new(cloned);
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(bytes) if bytes > 0 => {
+                        let message = line.trim_end_matches(&['\r', '\n'][..]);
+                        if let Some(rest) = message.strip_prefix(FINAL_READY_PREFIX) {
+                            let parts: Vec<&str> = rest.split(':').collect();
+                            if parts.len() == 3
+                                && parts[0] == successor.handoff_token
+                                && validate_hash(&successor.hash, parts[1])
+                                && parts[2].eq_ignore_ascii_case(&successor.fingerprint)
+                            {
+                                if let Err(error) = send_line(
+                                    &mut stream,
+                                    &format!("{FINAL_READY_ACK_PREFIX}{}", successor.handoff_token),
+                                ) {
+                                    final_error = Some(error);
+                                    break;
+                                }
+                                final_confirmed = true;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        final_error = Some(error);
+                        break;
                     }
                 }
             }
-
-            let restart_error = if restored {
-                launch_updated(&successor.target, &successor.launch_args).err()
-            } else {
-                None
-            };
-
-            let _ = fs::remove_file(&successor.source);
-            if let Some(error) = restart_error {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "updated agent launch failed: {launch_error}; original-agent restart failed: {error}"
-                    ),
-                ))
-            } else if !restored && backup.exists() {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "updated agent launch failed: {launch_error}; original-agent restore failed"
-                    ),
-                ))
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("updated agent launch failed: {launch_error}"),
-                ))
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                final_error = Some(error);
+                break;
             }
         }
     }
+
+    if final_confirmed {
+        let _ = fs::remove_file(&backup);
+        let _ = fs::remove_file(&successor.source);
+        request_helper_self_delete();
+        Ok(())
+    } else {
+        let error = final_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "updated agent final readiness timed out")
+        });
+        let _ = final_child.kill();
+        let _ = final_child.wait();
+        restart_after_final_failure(successor, &target_tmp, &backup, error)
+    }
 }
+
+fn restart_after_final_failure(
+    successor: &SuccessorArgs,
+    target_tmp: &Path,
+    backup: &Path,
+    original_error: io::Error,
+) -> io::Result<()> {
+    let _ = fs::remove_file(target_tmp);
+    let _ = fs::remove_file(&successor.source);
+
+    let mut restored = false;
+    if backup.exists() {
+        for attempt in 0..REPLACEMENT_RETRIES {
+            match replace_file(backup, &successor.target) {
+                Ok(()) => {
+                    restored = true;
+                    break;
+                }
+                Err(_) if attempt + 1 < REPLACEMENT_RETRIES => {
+                    std::thread::sleep(REPLACEMENT_RETRY_DELAY);
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    let restart_error = if restored {
+        launch_updated(&successor.target, &successor.launch_args)
+            .map(|_| ())
+            .err()
+    } else {
+        None
+    };
+
+    request_helper_self_delete();
+
+    match (restored, restart_error) {
+        (true, None) => Err(original_error),
+        (true, Some(restart)) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("{original_error}; original-agent restart failed: {restart}"),
+        )),
+        (false, _) => Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("{original_error}; original target restore failed"),
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn request_helper_self_delete() {
+    let Ok(exe) = std::env::current_exe() else { return; };
+    use std::os::windows::process::CommandExt;
+    let command = format!(
+        "ping 127.0.0.1 -n 2 > nul & del /f /q \"{}\"",
+        exe.display()
+    );
+    let _ = Command::new("cmd.exe")
+        .args(["/D", "/C", &command])
+        .creation_flags(0x0800_0000)
+        .spawn();
+}
+
+#[cfg(not(windows))]
+fn request_helper_self_delete() {}
 
 fn run_successor(successor: SuccessorArgs) -> io::Result<()> {
     let mut probe_child = match spawn_probe(&successor) {
@@ -1251,5 +1524,27 @@ mod tests {
         let hash_fn = &source[start..end];
         assert!(hash_fn.contains("let mut buffer = vec![0u8; 64 * 1024]"));
         assert!(!hash_fn.contains("let mut buf = [0u8; 1024 * 1024]"));
+    }
+
+    #[test]
+    fn final_ready_args_require_all_authenticated_fields() {
+        let token = "a".repeat(64);
+        let hash = "b".repeat(64);
+        let fingerprint = "c".repeat(64);
+        let args = vec![
+            FINAL_PORT_ARG.to_owned() + "49152",
+            FINAL_TOKEN_ARG.to_owned() + &token,
+            FINAL_HASH_ARG.to_owned() + &hash,
+            FINAL_FINGERPRINT_ARG.to_owned() + &fingerprint,
+        ];
+        let parsed = final_ready_args(&args).expect("valid final args").expect("final args present");
+        assert_eq!(parsed.port, 49152);
+        assert_eq!(parsed.token, token);
+        assert_eq!(parsed.hash, hash);
+        assert_eq!(parsed.fingerprint, fingerprint);
+
+        let mut duplicate = args.clone();
+        duplicate.push(FINAL_HASH_ARG.to_owned() + &"d".repeat(64));
+        assert!(final_ready_args(&duplicate).is_err());
     }
 }

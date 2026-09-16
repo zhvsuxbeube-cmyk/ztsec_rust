@@ -8,7 +8,7 @@ use std::{
 
 use crate::{plugin::Manager, sys, telemetry, text, update};
 
-pub fn run(ip: &str, port: u16) {
+pub fn run(ip: &str, port: u16, mut final_ready: Option<update::FinalReadyArgs>) {
     let fp = telemetry::fingerprint();
     let host = telemetry::host(&fp);
     let mut plugins = Manager::new();
@@ -32,6 +32,21 @@ pub fn run(ip: &str, port: u16) {
                         );
                     }
                     plugins.event("agent.connected", host.as_bytes());
+                    if let Some(context) = final_ready.as_ref() {
+                        match update::notify_final_ready(context) {
+                            Ok(()) => {
+                                if std::env::var_os("ZTSEC_CI").is_some() {
+                                    eprintln!("update phase=final-connected");
+                                }
+                                final_ready = None;
+                            }
+                            Err(error) => {
+                                if std::env::var_os("ZTSEC_CI").is_some() {
+                                    eprintln!("update phase=final-ready-notification-failed error={error}");
+                                }
+                            }
+                        }
+                    }
                     if session(&mut stream, ip, port, &fp, &host, &mut plugins) {
                         plugins.clear();
                         return;
