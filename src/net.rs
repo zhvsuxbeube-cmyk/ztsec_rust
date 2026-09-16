@@ -80,6 +80,9 @@ fn session(stream: &mut TcpStream, ip: &str, port: u16, fp: &str, host: &str, pl
         for output in plugins.drain_outputs() {
             let event = output.event.replace(':', "_").replace('\n', "_");
             let payload = decode_or_empty(output.payload);
+            if std::env::var_os("ZTSEC_CI").is_some() {
+                eprintln!("plugin event: {} {}", event, String::from_utf8_lossy(&payload));
+            }
             let _ = send(stream, &format!("{}{}:{}", text::PLUGOUT, event, encode_b64(&payload)));
         }
         match line(&mut reader) {
