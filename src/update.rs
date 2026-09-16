@@ -1243,7 +1243,13 @@ mod tests {
     #[test]
     fn heap_hash_buffer() {
         let source = include_str!("update.rs");
-        assert!(source.contains("let mut buffer = vec![0u8; 64 * 1024]"));
-        assert!(!source.contains("let mut buf = [0u8; 1024 * 1024]"));
+        let start = source.find("fn sha256_file(").expect("sha256_file missing");
+        let end = source[start..]
+            .find("\n#[derive(Debug)")
+            .map(|offset| start + offset)
+            .unwrap_or(source.len());
+        let hash_fn = &source[start..end];
+        assert!(hash_fn.contains("let mut buffer = vec![0u8; 64 * 1024]"));
+        assert!(!hash_fn.contains("let mut buf = [0u8; 1024 * 1024]"));
     }
 }
