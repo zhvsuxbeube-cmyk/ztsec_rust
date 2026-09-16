@@ -40,3 +40,23 @@ def test_post_parent_failure_attempts_original_restart():
     assert 'fn restart_original_after_failure' in UPDATE
     assert 'restart_original_after_failure(' in UPDATE
     assert 'updated agent launch failed' in UPDATE
+
+
+def test_successor_receives_server_port_and_wait_admission_is_visible():
+    source = Path(__file__).resolve().parents[1] / "src" / "net.rs"
+    text = source.read_text(encoding="utf-8")
+    assert 'session(&mut stream, ip, port, &fp, &host, &mut plugins)' in text
+    assert 'fn session(stream: &mut TcpStream, ip: &str, port: u16' in text
+
+    update = Path(__file__).resolve().parents[1] / "src" / "update.rs"
+    update_text = update.read_text(encoding="utf-8")
+    assert 'pub(crate) fn wait_admission(self)' in update_text
+    assert 'getrandom::fill(&mut bytes)' in update_text
+
+
+def test_successor_setup_cleans_helper_on_prelaunch_failures():
+    update = Path(__file__).resolve().parents[1] / "src" / "update.rs"
+    text = update.read_text(encoding="utf-8")
+    section = text[text.index("pub(crate) fn spawn_successor"):text.index("pub(crate) fn maybe_run_probe")]
+    assert 'let _ = fs::remove_file(&helper);' in section
+    assert 'if let Err(error) = command.spawn()' in section

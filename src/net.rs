@@ -32,7 +32,7 @@ pub fn run(ip: &str, port: u16) {
                         );
                     }
                     plugins.event("agent.connected", host.as_bytes());
-                    if session(&mut stream, ip, &fp, &host, &mut plugins) {
+                    if session(&mut stream, ip, port, &fp, &host, &mut plugins) {
                         plugins.clear();
                         return;
                     }
@@ -57,7 +57,7 @@ fn starts_with_ascii_ci(value: &str, prefix: &str) -> bool {
             .all(|(a, b)| a.to_ascii_uppercase() == b.to_ascii_uppercase())
 }
 
-fn session(stream: &mut TcpStream, ip: &str, fp: &str, host: &str, plugins: &mut Manager) -> bool {
+fn session(stream: &mut TcpStream, ip: &str, port: u16, fp: &str, host: &str, plugins: &mut Manager) -> bool {
     let Ok(clone) = stream.try_clone() else { return false; };
     let mut reader = BufReader::new(clone);
 

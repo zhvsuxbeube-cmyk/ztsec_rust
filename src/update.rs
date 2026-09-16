@@ -365,7 +365,7 @@ impl UpdateHandoff {
         }
     }
 
-    fn wait_admission(self) -> io::Result<()> {
+    pub(crate) fn wait_admission(self) -> io::Result<()> {
         let deadline = Instant::now() + PROBE_WAIT;
 
         while Instant::now() < deadline {
@@ -419,8 +419,8 @@ impl UpdateHandoff {
 
 fn random_token() -> io::Result<String> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    getrandom::fill(&mut bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
     Ok(bytes
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -1019,10 +1019,25 @@ pub(crate) fn spawn_successor(
     use std::os::windows::process::CommandExt;
 
     let helper = helper_path();
-    fs::copy(std::env::current_exe()?, &helper)?;
+    if let Err(error) = fs::copy(std::env::current_exe()?, &helper) {
+        let _ = fs::remove_file(&helper);
+        return Err(error);
+    }
 
-    let handoff = UpdateHandoff::new(hash.clone(), fingerprint.to_owned())?;
-    let handoff_port = handoff.port()?;
+    let handoff = match UpdateHandoff::new(hash.clone(), fingerprint.to_owned()) {
+        Ok(handoff) => handoff,
+        Err(error) => {
+            let _ = fs::remove_file(&helper);
+            return Err(error);
+        }
+    };
+    let handoff_port = match handoff.port() {
+        Ok(port) => port,
+        Err(error) => {
+            let _ = fs::remove_file(&helper);
+            return Err(error);
+        }
+    };
 
     let mut command = Command::new(&helper);
     command
