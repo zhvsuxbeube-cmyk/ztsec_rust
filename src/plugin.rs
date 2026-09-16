@@ -3,7 +3,10 @@ use std::collections::HashMap;
 #[cfg(windows)]
 mod win {
     use super::*;
-    use crate::{syscall, text};
+    use crate::{syscall, text, update};
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::mpsc::{self, Receiver, Sender};
 
     // NT constants
     const MEM_COMMIT: usize    = 0x1000;
@@ -293,12 +296,32 @@ mod win {
         }
     }
 
+    struct PluginTransfer {
+        id: String,
+        path: std::path::PathBuf,
+        size: u64,
+        hash: String,
+        received: u64,
+    }
+
+    #[derive(Clone)]
+    pub struct PluginOutput {
+        pub event: String,
+        pub payload: Vec<u8>,
+    }
+
     pub struct Manager {
         map: HashMap<String, Plugin>,
+        transfers: HashMap<String, PluginTransfer>,
+        rx: Receiver<PluginOutput>,
     }
 
     impl Manager {
-        pub fn new() -> Self { Self { map: HashMap::new() } }
+        pub fn new() -> Self {
+            let (tx, rx) = mpsc::channel();
+            set_emit_sender(tx.clone());
+            Self { map: HashMap::new(), transfers: HashMap::new(), rx }
+        }
 
         // Load a plugin from raw DLL bytes supplied in-memory (no disk path).
         pub fn load(&mut self, id: &str, data: &[u8], host: &[u8]) -> Result<(), String> {
@@ -333,6 +356,51 @@ mod win {
             Ok(())
         }
 
+        pub fn begin_transfer(&mut self, id: &str, transfer_id: &str, size: u64, hash: &str) -> Result<u64, String> {
+            if id.is_empty() || transfer_id.is_empty() || !crate::update::validate_hash(hash, hash) { return Err("invalid plugin transfer metadata".into()); }
+            let base = std::env::temp_dir().join("ztsec_plugin_transfers");
+            fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+            let path = base.join(format!("{}-{}.part", id, transfer_id));
+            let received = match fs::metadata(&path) { Ok(m) => m.len().min(size), Err(_) => 0 };
+            if !path.exists() { File::create(&path).map_err(|e| e.to_string())?; }
+            self.transfers.insert(transfer_id.to_owned(), PluginTransfer { id: id.to_owned(), path, size, hash: hash.to_ascii_lowercase(), received });
+            Ok(received)
+        }
+
+        pub fn append_transfer(&mut self, transfer_id: &str, offset: u64, data: &[u8]) -> Result<u64, String> {
+            let tr = self.transfers.get_mut(transfer_id).ok_or_else(|| "unknown plugin transfer".to_string())?;
+            if offset.saturating_add(data.len() as u64) > tr.size { return Err("invalid plugin chunk offset".into()); }
+            if offset < tr.received {
+                if offset.saturating_add(data.len() as u64) <= tr.received { return Ok(tr.received); }
+                return Err("plugin chunk overlaps committed data".into());
+            }
+            if offset != tr.received { return Err("invalid plugin chunk offset".into()); }
+            let mut f = OpenOptions::new().write(true).open(&tr.path).map_err(|e| e.to_string())?;
+            f.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+            f.write_all(data).map_err(|e| e.to_string())?;
+            tr.received += data.len() as u64;
+            Ok(tr.received)
+        }
+
+        pub fn finish_transfer(&mut self, transfer_id: &str, host: &[u8]) -> Result<String, String> {
+            let tr = self.transfers.get(transfer_id).ok_or_else(|| "unknown plugin transfer".to_string())?;
+            if tr.received != tr.size { return Err("plugin transfer incomplete".into()); }
+            let bytes = fs::read(&tr.path).map_err(|e| e.to_string())?;
+            if bytes.len() as u64 != tr.size || !update::validate_hash(&tr.hash, &update::sha256_hex(&bytes)) { return Err("plugin transfer hash mismatch".into()); }
+            let id = tr.id.clone();
+            self.load(&id, &bytes, host)?;
+            let path = tr.path.clone();
+            self.transfers.remove(transfer_id);
+            let _ = fs::remove_file(path);
+            Ok(id)
+        }
+
+        pub fn resume_transfer(&self, transfer_id: &str) -> Option<u64> { self.transfers.get(transfer_id).map(|t| t.received) }
+
+        pub fn drain_outputs(&mut self) -> Vec<PluginOutput> {
+            self.rx.try_iter().collect()
+        }
+
         pub fn event(&self, event: &str, payload: &[u8]) {
             for p in self.map.values() {
                 let _ = unsafe {
@@ -342,17 +410,24 @@ mod win {
         }
 
         pub fn unload(&mut self, id: &str) -> bool { self.map.remove(id).is_some() }
-        pub fn clear(&mut self) { self.map.clear(); }
+        pub fn clear(&mut self) { self.map.clear(); self.transfers.clear(); }
+    }
+
+    static EMIT_SENDER: std::sync::OnceLock<std::sync::Mutex<Option<Sender<PluginOutput>>>> = std::sync::OnceLock::new();
+
+    fn set_emit_sender(tx: Sender<PluginOutput>) {
+        let cell = EMIT_SENDER.get_or_init(|| std::sync::Mutex::new(None));
+        if let Ok(mut guard) = cell.lock() { *guard = Some(tx); }
     }
 
     unsafe extern "C" fn emit(event: *const u8, event_len: u32, payload: *const u8, payload_len: u32) -> i32 {
         let ev = if event.is_null() || event_len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(event, event_len as usize) } };
         let pl = if payload.is_null() || payload_len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(payload, payload_len as usize) } };
-        let event_s = String::from_utf8_lossy(ev);
-        let payload_s = String::from_utf8_lossy(pl);
-        if payload_s.is_empty() { println!("plugin event: {event_s}"); }
-        else { println!("plugin event: {event_s} {payload_s}"); }
-        0
+        let output = PluginOutput { event: String::from_utf8_lossy(ev).into_owned(), payload: pl.to_vec() };
+        if let Some(cell) = EMIT_SENDER.get() {
+            if let Ok(guard) = cell.lock() { if let Some(tx) = guard.as_ref() { let _ = tx.send(output); return 0; } }
+        }
+        -1
     }
 
     pub use Manager as Host;

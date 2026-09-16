@@ -22,6 +22,11 @@ pub const ERR: &str = "ERR:";
 pub const PLUGIN: &str = "PLUGIN:";
 pub const PLUGOUT: &str = "PLUGIN_OUT:";
 pub const PEVENT: &str = "PLUGIN_EVENT:";
+pub const PMSG: &str = "PLUGIN_MSG:";
+pub const PBEGIN: &str = "PLUGIN_BEGIN:";
+pub const PCHUNK: &str = "PLUGIN_CHUNK:";
+pub const PEND: &str = "PLUGIN_END:";
+pub const PRESUME: &str = "PLUGIN_RESUME:";
 
 pub const SLEEP: &str = "SLEEP";
 pub const HIBERNATE: &str = "HIBERNATE";
