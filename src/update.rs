@@ -419,7 +419,7 @@ impl UpdateHandoff {
 
 fn random_token() -> io::Result<String> {
     let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes)
+    getrandom::getrandom(&mut bytes)
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
     Ok(bytes
         .iter()

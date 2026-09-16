@@ -51,7 +51,7 @@ def test_successor_receives_server_port_and_wait_admission_is_visible():
     update = Path(__file__).resolve().parents[1] / "src" / "update.rs"
     update_text = update.read_text(encoding="utf-8")
     assert 'pub(crate) fn wait_admission(self)' in update_text
-    assert 'getrandom::fill(&mut bytes)' in update_text
+    assert 'getrandom::getrandom(&mut bytes)' in update_text
 
 
 def test_successor_setup_cleans_helper_on_prelaunch_failures():
@@ -60,3 +60,13 @@ def test_successor_setup_cleans_helper_on_prelaunch_failures():
     section = text[text.index("pub(crate) fn spawn_successor"):text.index("pub(crate) fn maybe_run_probe")]
     assert 'let _ = fs::remove_file(&helper);' in section
     assert 'if let Err(error) = command.spawn()' in section
+
+
+def test_getrandom_api_matches_pinned_version():
+    cargo = Path(__file__).resolve().parents[1] / "Cargo.toml"
+    cargo_text = cargo.read_text(encoding="utf-8")
+    update = Path(__file__).resolve().parents[1] / "src" / "update.rs"
+    update_text = update.read_text(encoding="utf-8")
+    assert 'getrandom = "=0.2.17"' in cargo_text
+    assert 'getrandom::getrandom(&mut bytes)' in update_text
+    assert 'getrandom::fill(&mut bytes)' not in update_text

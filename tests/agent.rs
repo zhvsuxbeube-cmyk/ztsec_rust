@@ -76,3 +76,16 @@ fn update_probe_server_contract() {
     assert!(update.contains("notify_handoff_failure"));
     assert!(update.contains("probe_child" ) || update.contains("spawn_probe"));
 }
+
+
+#[test]
+fn update_compile_contracts() {
+    let source = std::fs::read_to_string("src/update.rs").unwrap();
+    assert!(source.contains("pub(crate) fn wait_admission(self) -> io::Result<()>"));
+    assert!(source.contains("getrandom::getrandom(&mut bytes)"));
+    assert!(source.contains("error.to_string()"));
+
+    let net = std::fs::read_to_string("src/net.rs").unwrap();
+    assert!(net.contains("fn session(stream: &mut TcpStream, ip: &str, port: u16"));
+    assert!(net.contains("spawn_successor(staged, target, actual_hash, parent_pid, ip, port, fp)"));
+}
