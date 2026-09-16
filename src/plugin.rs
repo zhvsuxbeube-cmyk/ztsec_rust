@@ -383,13 +383,14 @@ mod win {
         }
 
         pub fn finish_transfer(&mut self, transfer_id: &str, host: &[u8]) -> Result<String, String> {
-            let tr = self.transfers.get(transfer_id).ok_or_else(|| "unknown plugin transfer".to_string())?;
-            if tr.received != tr.size { return Err("plugin transfer incomplete".into()); }
-            let bytes = fs::read(&tr.path).map_err(|e| e.to_string())?;
-            if bytes.len() as u64 != tr.size || !update::validate_hash(&tr.hash, &update::sha256_hex(&bytes)) { return Err("plugin transfer hash mismatch".into()); }
-            let id = tr.id.clone();
+            let (id, path, size, hash, received) = {
+                let tr = self.transfers.get(transfer_id).ok_or_else(|| "unknown plugin transfer".to_string())?;
+                (tr.id.clone(), tr.path.clone(), tr.size, tr.hash.clone(), tr.received)
+            };
+            if received != size { return Err("plugin transfer incomplete".into()); }
+            let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+            if bytes.len() as u64 != size || !update::validate_hash(&hash, &update::sha256_hex(&bytes)) { return Err("plugin transfer hash mismatch".into()); }
             self.load(&id, &bytes, host)?;
-            let path = tr.path.clone();
             self.transfers.remove(transfer_id);
             let _ = fs::remove_file(path);
             Ok(id)
