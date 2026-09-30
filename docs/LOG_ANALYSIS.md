@@ -103,3 +103,13 @@ No `vendor/arti` source was modified.
 The Dockerfile used a BuildKit `type=cache` mount for `/src/target` during the release build, then attempted to access the generated binary from a later `RUN`. Docker documents cache mounts as build-time cache directories whose contents are not committed as normal image-layer filesystem changes. citeturn909897search0turn909897search11
 
 The release build and copy to `/out/ztsec-server` now happen in the same mounted `RUN`, with explicit non-empty checks. This preserves the target cache while making the exported artifact part of the image filesystem.
+
+
+## CI failure: scratch Docker artifact image had no command
+
+The Docker `artifacts` stage intentionally uses `FROM scratch`, so the image has no default `CMD` or `ENTRYPOINT`. `docker create ztsec-rust-builder` therefore fails with `no command specified` before `docker cp` can extract `/ztsec-server`. The workflow now creates the container with `/ztsec-server` as its command; `docker create` does not execute the command, and the existing `docker cp` extraction remains unchanged.
+
+
+## CI failure: Docker scratch image had no command
+
+The artifacts image uses `FROM scratch`, so it has no implicit shell or default `CMD`. The CI previously called `docker create ztsec-rust-builder` without a command, which Docker rejected with `no command specified`. The workflow now calls `docker create ztsec-rust-builder /ztsec-server`; this creates a stopped container configuration and does not execute the server, allowing `docker cp` to extract the ELF binary. The Docker build step also uses `set -euo pipefail` so extraction failures stop the job immediately.

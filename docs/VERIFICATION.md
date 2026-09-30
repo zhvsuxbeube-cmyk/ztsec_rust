@@ -155,3 +155,13 @@ The Docker dependency layer now copies all five ZTSEC workspace manifests before
 - `tools/load-test/Cargo.toml`
 
 The lockfile layer then seeds minimal targets for those packages. The actual application source is copied afterward and the real `ztsec-server` release binary is built in the final compile layer. A static verifier checks that every workspace member manifest is copied before `cargo generate-lockfile` so this failure cannot recur from a missing manifest copy.
+
+
+### Docker artifact extraction
+
+Because the final Docker artifact image uses `FROM scratch` and has no default command, CI must invoke `docker create ztsec-rust-builder /ztsec-server` before `docker cp`. A workspace verifier checks this exact requirement.
+
+
+### Docker scratch artifact extraction
+
+The final `artifacts` image intentionally uses `FROM scratch` and contains only `/ztsec-server`. Because `scratch` has no default command, CI must create the extraction container with `/ztsec-server` explicitly before calling `docker cp`.

@@ -74,6 +74,11 @@ def verify_docker_artifact_copy() -> None:
         raise SystemExit("Dockerfile must verify the built Linux server binary")
     if "test -s /out/ztsec-server" not in dockerfile:
         raise SystemExit("Dockerfile must verify the exported Linux server binary")
+    workflow = (ROOT / ".github" / "workflows" / "build.yml").read_text(encoding="utf-8")
+    if "docker create ztsec-rust-builder /ztsec-server" not in workflow:
+        raise SystemExit("Docker artifact extraction must provide /ztsec-server because the scratch image has no default command")
+    if "docker create ztsec-rust-builder)" in workflow:
+        raise SystemExit("Docker artifact extraction must not call docker create without a command")
     print("OK: Docker copies ztsec-server from the target cache within the build RUN")
 
 verify_docker_artifact_copy()
