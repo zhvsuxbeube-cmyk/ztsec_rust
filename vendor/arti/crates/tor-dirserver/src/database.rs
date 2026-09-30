@@ -1,0 +1,1698 @@
+//! Access to the database schema.
+//!
+//! This module is not intended to provide a high-level ORM, instead it serves
+//! the purpose of initializing and upgrading the database, if necessary.
+//!
+//! # Synchronous or Asynchronous?
+//!
+//! The question on whether the database and access to it shall be synchronous
+//! or asynchronous has been fairly long debate that eventually got settled
+//! after realizing that an asynchronous approach does not work.  This comment
+//! should serve as a reminder for future devs, wondering why we use certain
+//! synchronous primitives in an otherwise asynchronous codebase.
+//!
+//! Early on, it was clear that we would need some sort of connection pool,
+//! primarily for two reasons:
+//! 1. Performing frequent open and close calls in every task would be costly.
+//! 2. Sharing a single connection object with a Mutex would be a waste
+//!
+//! Because the application itself is primarily asynchronous, we decided to go
+//! with an asynchronous connection pool as well, leading to the choose of
+//! `deadpool` initially.
+//!
+//! However, soon thereafter, problems with `deadpool` became evident.  Those
+//! problems mostly stemmed from the synchronous nature of SQLite itself.  In our
+//! case, this problem was initially triggered by figuring out a way to solve
+//! `SQLITE_BUSY` handling.  In the end, we decided to settle upon the following
+//! approach: Set `PRAGMA busy_timeout` to a certain value and create write
+//! transactions with `BEGIN EXCLUSIVE`.  This way, SQLite would try to obtain
+//! a write transaction for `busy_timeout` milliseconds by blocking the current
+//! thread.  Due to this blocking, async no longer made any sense and was in
+//! fact quite counter-productive because those potential sleep could screw a
+//! lot of things up, which became very evident while trying to test this.
+//!
+//! Besides, throughout refactoring the code base, we realized that, even while
+//! still using `deadpool`, the actual "asynchronous" calls interfacing with the
+//! database became smaller and smaller.  In the end, the asynchronous code just
+//! involved parts of obtaining a connection and creating a transaction,
+//! eventually resulting in a calling a synchronous function taking the
+//! transaction handle to perform the lion's share of the operation.
+
+// TODO DIRMIRROR: This could benefit from methods by wrapping the pool into a
+// custom type.
+
+use std::{
+    collections::HashSet,
+    fmt::Display,
+    io::{Cursor, Write},
+    marker::PhantomData,
+    num::NonZero,
+    ops::{Add, Sub},
+    path::Path,
+    time::{Duration, SystemTime},
+};
+
+use digest::Digest;
+use educe::Educe;
+use flate2::write::{DeflateEncoder, GzEncoder};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
+use rand::Rng;
+use rusqlite::{
+    ToSql, Transaction, TransactionBehavior, named_params, params,
+    types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef},
+};
+use saturating_time::SaturatingTime;
+use tor_basic_utils::RngExt;
+use tor_error::{internal, into_internal};
+use tor_netdoc::doc::{authcert::AuthCert, netstatus::ConsensusFlavor};
+
+use crate::{
+    err::DatabaseError,
+    types::{FlavoredConsensusBody, FlavoredConsensusSignatures, FlavoredConsensusUnverified},
+};
+
+/// Version 1 of the database schema.
+///
+/// TODO DIRMIRROR: Before the release, figure out where to use rowid and where
+/// to use docid.
+const V1_SCHEMA: &str = include_str!("schema_v1.sql");
+
+/// Global options set in every connection.
+const GLOBAL_OPTIONS: &str = sql!(
+    "
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=1000;
+"
+);
+
+/// Convenience macro for implementing a hash type in a rusqlite compatible fashion.
+///
+/// This macro accepts the following parameters:
+/// 1. `name` for specifying an identifier of the type, such as [`Sha256`].
+/// 2. `algo` for specifying the type from the rust-crypto [`digest`] ecosystem,
+///    such as [`tor_llcrypto::d::Sha256`].
+/// 3. The size in bytes of the hash output, such as `32` for [`Sha256`].
+///     * Unfortunately, we cannot use something like [`Digest::output_size()`]
+///       because it is not a constant.
+///
+/// It generates a struct with `name` as the identifier, which implements the
+/// following methods:
+/// * `digest` for wrapping around [`Digest::digest()`].
+///
+/// It also implements the following traits:
+/// * [`Display`]
+/// * [`FromSql`]
+/// * [`ToSql`]
+/// * [`PartialEq<&str>`] for base16 comparisons
+/// * [`From<u8; $size>`]
+macro_rules! impl_hash_wrapper {
+    ($name:ident, $algo:ty, $size:literal) => {
+        /// Database wrapper type for $name.
+        ///
+        /// Serves as a database friendly wrapper around [`tor_llcrypto::d`]
+        /// with features such as SQL support.
+        #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+        pub(crate) struct $name(pub [u8; $size]);
+
+        impl $name {
+            /// Computes the hash from arbitrary data.
+            pub(crate) fn digest(data: &[u8]) -> Self {
+                Self(<$algo>::digest(data).into())
+            }
+        }
+
+        impl Display for $name {
+            /// Formats the hash in uppercase hexadecimal.
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", hex::encode_upper(self.0))
+            }
+        }
+
+        impl FromSql for $name {
+            fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+                // We read the hash as a hexadecimal string from the database.
+                // Convert it to binary data and check length afterwards.
+                let data: [u8; $size] = value
+                    .as_str()
+                    .map(hex::decode)?
+                    .map_err(|e| {
+                        FromSqlError::Other(Box::new(tor_error::internal!(
+                            "non hex data in database? {e}"
+                        )))
+                    })?
+                    .try_into()
+                    .map_err(|_| {
+                        FromSqlError::Other(Box::new(tor_error::internal!(
+                            "$name with invalid length in database?"
+                        )))
+                    })?;
+
+                Ok(Self(data))
+            }
+        }
+
+        impl ToSql for $name {
+            fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+                // Because Self is only constructed with FromSql and digest
+                // data, it is safe to assume it is valid.
+                Ok(ToSqlOutput::from(self.to_string()))
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.to_string() == other.to_uppercase()
+            }
+        }
+
+        impl From<[u8; $size]> for $name {
+            fn from(value: [u8; $size]) -> Self {
+                Self(value)
+            }
+        }
+    };
+}
+
+impl_hash_wrapper!(Sha1, tor_llcrypto::d::Sha1, 20);
+impl_hash_wrapper!(Sha256, tor_llcrypto::d::Sha256, 32);
+impl_hash_wrapper!(Sha3_256, tor_llcrypto::d::Sha3_256, 32);
+
+/// The identifier for documents in the content-addressable cache.
+///
+/// Right now, this is a [`Sha256`] hash, but this may change in future.
+pub(crate) type DocumentId = Sha256;
+
+/// The supported content encodings.
+#[derive(Debug, Clone, Copy, PartialEq, strum::EnumString, strum::Display, strum::EnumIter)]
+#[strum(serialize_all = "kebab-case", ascii_case_insensitive)]
+pub(crate) enum ContentEncoding {
+    /// RFC2616 section 3.5.
+    Identity,
+    /// RFC2616 section 3.5.
+    Deflate,
+    /// RFC2616 section 3.5.
+    Gzip,
+    /// The zstandard compression algorithm (www.zstd.net).
+    XZstd,
+    /// The lzma compression algorithm with a "present" value no higher than 6.
+    XTorLzma,
+}
+
+/// A wrapper around [`SystemTime`] with convenient features.
+///
+/// Please use this type throughout the crate internally, instead of
+/// [`SystemTime`].
+///
+/// # Conversion
+///
+/// This type can be safely converted from and into a [`SystemTime`], because
+/// it is just a wrapper type.
+///
+/// # Saturating Arithmetic
+///
+/// This type implements [`Add`] and [`Sub`] for [`Duration`] and [`Timestamp`]
+/// ([`Sub`] only) using saturating arithmetic from the [`saturating_time`]
+/// crate.  It means that addition and subtraction can be safely performed
+/// without the potential risk of an unexpected panic, instead wrapping to
+/// a local maximum/minimum or [`Duration::ZERO`] depending on the type.
+///
+/// Note that we don't provide a saturating version of [`Duration`], so addition
+/// or subtraction of two [`Duration`]s still needs care to avoid panics.
+///
+/// # SQLite Interaction
+///
+/// This type implements [`FromSql`] and [`ToSql`], making it convenient to
+/// integrate into SQL statements, as the database schema represents timestamps
+/// internally using a non-negative [`i64`] storing the seconds since the epoch.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub(crate) struct Timestamp(SystemTime);
+
+impl From<SystemTime> for Timestamp {
+    fn from(value: SystemTime) -> Self {
+        Self(value)
+    }
+}
+
+impl From<Timestamp> for SystemTime {
+    fn from(value: Timestamp) -> Self {
+        value.0
+    }
+}
+
+impl Add<Duration> for Timestamp {
+    type Output = Self;
+
+    /// Performs a saturating addition wrapping to [`SystemTime::max_value()`].
+    fn add(self, rhs: Duration) -> Self::Output {
+        Self(self.0.saturating_add(rhs))
+    }
+}
+
+impl Sub<Duration> for Timestamp {
+    type Output = Self;
+
+    /// Performs a saturating subtraction wrapping to [`SystemTime::min_value()`].
+    fn sub(self, rhs: Duration) -> Self::Output {
+        Self(self.0.saturating_sub(rhs))
+    }
+}
+
+impl Sub<Timestamp> for Timestamp {
+    type Output = Duration;
+
+    /// Performs a saturating duration_since wrapping to [`Duration::ZERO`].
+    fn sub(self, rhs: Timestamp) -> Self::Output {
+        #[allow(unstable_name_collisions)]
+        self.0.saturating_duration_since(rhs.0)
+    }
+}
+
+impl FromSql for Timestamp {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let mut res = SystemTime::UNIX_EPOCH;
+        res = res.saturating_add(Duration::from_secs(value.as_i64()?.try_into().unwrap_or(0)));
+        Ok(Self(res))
+    }
+}
+
+impl ToSql for Timestamp {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        #[allow(unstable_name_collisions)]
+        Ok(ToSqlOutput::from(
+            self.0
+                .saturating_duration_since(SystemTime::UNIX_EPOCH)
+                .as_secs()
+                .try_into()
+                .unwrap_or(i64::MAX),
+        ))
+    }
+}
+
+/// Representation of consensus metadata from the database.
+#[derive(Educe)]
+#[educe(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConsensusMeta<T> {
+    /// The document id uniquely identifying the consensus.
+    pub docid: DocumentId,
+
+    /// The SHA3 of the unsigned part of the consensus.
+    pub unsigned_sha3_256: Sha3_256,
+
+    /// The time after which this consensus is valid.
+    pub valid_after: Timestamp,
+
+    /// The time after which this consensus stops being fresh.
+    pub fresh_until: Timestamp,
+
+    /// The time after which this consensus stops being valid.
+    pub valid_until: Timestamp,
+
+    /// The flavor of the consensus; determined at compile time.
+    flavor: PhantomData<T>,
+}
+
+impl<T: FlavoredConsensusUnverified> ConsensusMeta<T> {
+    /// Select the missing router descriptors.
+    ///
+    /// A router descriptor is considered missing if it exists in
+    /// `consensus_router_descriptor_member` but not in `router_descriptor`
+    /// because the first entry is added once the consensus got parsed,
+    /// whereas the second entry is added once we have actually retrieved it.
+    ///
+    /// It works by doing a left join on router_descriptor and filtering for
+    /// all entries where the join is NULL, as that implies we are aware of
+    /// the descriptor but not have it stored.
+    ///
+    /// Parameters:
+    /// :docid - The docid of the consensus.
+    /// :limit - The maximum number of descriptors to return.
+    //
+    // TODO DIRMIRROR: Potentially constify more queries.
+    const MISSING_SERVERS_QUERY: &'static str = sql!(
+        "
+        SELECT cr.unsigned_sha1, RANDOM() AS rand
+        FROM consensus_router_descriptor_member AS cr
+          LEFT JOIN router_descriptor AS server ON cr.unsigned_sha1 = server.unsigned_sha1
+        WHERE
+          cr.consensus_docid = :docid
+          AND cr.unsigned_sha1 IS NOT NULL
+          AND server.unsigned_sha1 IS NULL
+        ORDER BY rand
+        LIMIT :limit
+        "
+    );
+
+    /// Obtains all consensuses found in the database.
+    ///
+    /// This should be reasonable size-wise, given that a ConsensusMeta instance
+    /// is very small and that the garbage collector removes old consensuses
+    /// anyways.  If this becomes a problem, we may want to add an optional
+    /// limit.
+    pub(crate) fn query(tx: &Transaction) -> Result<Vec<Self>, DatabaseError> {
+        // Select the most recent flavored consensus document from the database.
+        let mut meta_stmt = tx.prepare_cached(sql!(
+            "
+            SELECT docid, unsigned_sha3_256, valid_after, fresh_until, valid_until
+            FROM consensus
+            WHERE
+              flavor = :flavor
+            ORDER BY valid_after DESC
+            "
+        ))?;
+
+        // Actually execute the query.
+        let rows = meta_stmt.query_map(
+            named_params! {
+                ":flavor": T::flavor().name(),
+            },
+            |row| {
+                Ok(Self {
+                    docid: row.get(0)?,
+                    unsigned_sha3_256: row.get(1)?,
+                    valid_after: row.get(2)?,
+                    fresh_until: row.get(3)?,
+                    valid_until: row.get(4)?,
+                    flavor: Default::default(),
+                })
+            },
+        )?;
+
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Queries the raw data of a [`ConsensusMeta`].
+    pub(crate) fn data(&self, tx: &Transaction<'_>) -> Result<String, DatabaseError> {
+        let mut stmt = tx.prepare_cached(sql!(
+            "
+            SELECT content
+            FROM store
+            WHERE docid = :docid
+            "
+        ))?;
+
+        let raw = stmt.query_one(named_params! {":docid": self.docid}, |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        let raw = String::from_utf8(raw).map_err(into_internal!("utf-8 constraint violated?"))?;
+        Ok(raw)
+    }
+
+    /// Calculates the [`Timestamp`] at which the authorities will be queried again.
+    ///
+    /// # Specifications
+    ///
+    /// * <https://spec.torproject.org/dir-spec/directory-cache-operation.html#download-ns-from-auth>
+    pub(crate) fn ttl<R: Rng>(&self, rng: &mut R) -> Timestamp {
+        assert!(self.fresh_until < self.valid_until);
+
+        let offset = rng
+            .gen_range_checked(0..=((self.valid_until - self.fresh_until).as_secs() / 2))
+            .expect("invalid range?");
+
+        self.fresh_until + Duration::from_secs(offset)
+    }
+
+    /// Returns the missing server descriptors for this consensus.
+    ///
+    /// `limit` may be given to specify an optional upper limit, in which case
+    /// the result will contain at most `limit` missing descriptors.
+    ///
+    /// # Performance
+    ///
+    /// The performance here is O(n * log n) for each 64-element batch, leading
+    /// to an overall performance of O(n^2 * (log n)/64) per consensus period,
+    /// which sould be acceptable.  See the link below for a further discussion
+    /// on performance related matters:
+    ///
+    /// <https://gitlab.torproject.org/tpo/core/arti/-/merge_requests/4378#note_3467300>
+    pub(crate) fn missing_servers(
+        &self,
+        tx: &Transaction<'_>,
+        limit: Option<u64>,
+    ) -> Result<HashSet<Sha1>, DatabaseError> {
+        if T::flavor() != ConsensusFlavor::Plain {
+            return Ok(HashSet::new());
+        }
+
+        let mut stmt = tx.prepare_cached(Self::MISSING_SERVERS_QUERY)?;
+
+        let limit = limit.map_or(-1, |n| n.try_into().unwrap_or(i64::MAX));
+        let missing = stmt
+            .query_map(
+                named_params! {":docid": self.docid, ":limit": limit},
+                |row| row.get(0),
+            )?
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(missing)
+    }
+
+    /// Returns the missing extra infos for this consensus to the best of our abilities.
+    ///
+    /// Keep in mind that this does not return **all** missing extra infos but
+    /// only the missing extra infos of server descriptors we have.
+    ///
+    /// `limit` may be given to specify an optional upper limit, in which case
+    /// the result will contain at most `limit` missing extra-infos.
+    ///
+    /// See [`ConsensusMeta::missing_servers()`] for a discussion on
+    /// performance.
+    pub(crate) fn missing_extras(
+        &self,
+        tx: &Transaction<'_>,
+        limit: Option<u64>,
+    ) -> Result<HashSet<Sha1>, DatabaseError> {
+        if T::flavor() != ConsensusFlavor::Plain {
+            return Ok(HashSet::new());
+        }
+
+        // Select the missing extra infos for this consensus.
+        //
+        // This return value is not complete because we only know the missing
+        // extra-infos to the best of our abilities.  In other words: We are
+        // only aware of a missing extra-info if we have parsed the respective
+        // server descriptor.
+        //
+        // It works by doing an inner join from
+        // `consensus_router_descriptor_member` to `router_descriptor` because
+        // we can only know about the extra-infos of which we have the server
+        // descriptors from.  Afterwards, we do a left join with the
+        // `router_extra_info` table and filter for all results where the left
+        // join result is null, hence where we have a server descriptor but not
+        // the respective extra-info.
+        //
+        // Parameters:
+        // :docid - The docid of the consensus.
+        // :limit - The maximum number of descriptors to return.
+        let mut stmt = tx.prepare_cached(sql!(
+            "
+            SELECT server.extra_unsigned_sha1, RANDOM() AS rand
+            FROM consensus_router_descriptor_member AS cr
+              INNER JOIN router_descriptor AS server ON cr.unsigned_sha1 = server.unsigned_sha1
+              LEFT JOIN router_extra_info AS extra ON server.extra_unsigned_sha1 = extra.unsigned_sha1
+            WHERE
+              cr.consensus_docid = :docid
+              AND server.extra_unsigned_sha1 IS NOT NULL
+              AND extra.unsigned_sha1 IS NULL
+            ORDER BY rand
+            LIMIT :limit
+            "
+        ))?;
+
+        let limit = limit.map_or(-1, |n| n.try_into().unwrap_or(i64::MAX));
+        let missing = stmt
+            .query_map(
+                named_params! {":docid": self.docid, ":limit": limit},
+                |row| row.get(0),
+            )?
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(missing)
+    }
+
+    /// Returns the missing micro descriptors for this consensus.
+    ///
+    /// `limit` may be given to specify an optional upper limit, in which case
+    /// the result will contain at most `limit` missing descriptors.
+    ///
+    /// See [`ConsensusMeta::missing_servers()`] for a discussion on
+    /// performance.
+    pub(crate) fn missing_micros(
+        &self,
+        tx: &Transaction<'_>,
+        limit: Option<u64>,
+    ) -> Result<HashSet<Sha256>, DatabaseError> {
+        if T::flavor() != ConsensusFlavor::Microdesc {
+            return Ok(HashSet::new());
+        }
+
+        // Select the missing micro descriptors.
+        //
+        // A micro descriptor is considered missing if it exists in
+        // `consensus_router_descriptor_member` but not in `router_descriptor`
+        // because the first entry is added once the consensus got parsed,
+        // whereas the second entry is added once we have actually retrieved it.
+        //
+        // It works by doing a left join on router_descriptor and filtering for
+        // all entries where the join is NULL, as that implies we are aware of
+        // the descriptor but not have it stored.
+        //
+        // Parameters:
+        // :docid - The docid of the consensus.
+        // :limit - The maximum number of descriptors to return.
+        let mut stmt = tx.prepare_cached(sql!(
+            "
+            SELECT cr.unsigned_sha2, RANDOM() AS rand
+            FROM consensus_router_descriptor_member AS cr
+              LEFT JOIN router_descriptor AS micro ON cr.unsigned_sha2 = micro.unsigned_sha2
+            WHERE
+              cr.consensus_docid = :docid
+              AND cr.unsigned_sha2 IS NOT NULL
+              AND micro.unsigned_sha2 IS NULL
+            ORDER BY rand
+            LIMIT :limit
+            "
+        ))?;
+
+        let limit = limit.map_or(-1, |n| n.try_into().unwrap_or(i64::MAX));
+        let missing = stmt
+            .query_map(
+                named_params! {":docid": self.docid, ":limit": limit},
+                |row| row.get(0),
+            )?
+            .collect::<Result<HashSet<_>, _>>()?;
+        Ok(missing)
+    }
+
+    /// Inserts a verified consensus into the database.
+    ///
+    /// This method *DOES NOT* compute any consensus diffs but populates
+    /// associated meta tables such as `consensus_router_descriptor_member`
+    /// and `consensus_authority_voter` properly.
+    pub(crate) fn insert<I>(
+        tx: &Transaction<'_>,
+        encodings: I,
+        (body, sigs): (&T::Body, &T::Signatures),
+        data: &str,
+    ) -> Result<ConsensusMeta<T>, DatabaseError>
+    where
+        I: Iterator<Item = ContentEncoding>,
+    {
+        // Insert a consensus into the consensus meta table.
+        //
+        // This requires the consensus to already be present in the `store`
+        // table.
+        //
+        // Parameters:
+        // :docid - The docid of the consensus.
+        // :unsigned_sha3_256 - The SHA3-256 sum of the part of the consensus
+        //   without signatures but a trailing `\ndirectory-signature<SPACE>`.
+        // :flavor - The consensus flavor to use.
+        // :valid_after, :fresh_until, :valid_until - The respective validities.
+        let mut cons_stmt = tx.prepare_cached(sql!(
+            "
+            INSERT INTO consensus
+            (docid, unsigned_sha3_256, flavor, valid_after, fresh_until, valid_until)
+            VALUES
+            (:docid, :unsigned_sha3_256, :flavor, :valid_after, :fresh_until, :valid_until)
+            ON CONFLICT DO NOTHING
+            "
+        ))?;
+
+        // Insert the relationship between a router status to a consensus.
+        //
+        // Parameters:
+        // :docid - The consensus docid.
+        // :sha1 - The server descriptor digest (plain consensus only, NULL otherwise).
+        // :sha2 - The micro descriptor digest (microdesc consensus only, NULL otherwise).
+        let mut cons_rs_member_stmt = tx.prepare_cached(sql!(
+            "
+            INSERT INTO consensus_router_descriptor_member
+            (consensus_docid, unsigned_sha1, unsigned_sha2)
+            VALUES
+            (:docid, :sha1, :sha2)
+            ON CONFLICT DO NOTHING
+            "
+        ))?;
+
+        // Insert the relationship between authority certificate to consensus votes.
+        //
+        // Parameters:
+        // :cons - The consensus docid.
+        // :auth - The authority certificate docid.
+        let mut cons_auth_voter = tx.prepare_cached(sql!(
+            "
+            INSERT INTO consensus_authority_voter
+            (consensus_docid, kp_auth_id_rsa_sha1)
+            VALUES
+            (:consensus_docid, :id_rsa)
+            ON CONFLICT DO NOTHING
+            "
+        ))?;
+
+        // First, insert the consensus as is.
+        let docid = store_insert(tx, data.as_bytes(), encodings)?;
+
+        // TODO DIRMIRROR: We *need* this in tor-netdoc!!!
+        let unsigned_sha3_256 = Sha3_256::digest(
+            data.split_inclusive("\ndirectory-signature ")
+                .next()
+                .ok_or(internal!("verified document without signatures?"))?
+                .as_bytes(),
+        );
+
+        let lifetime = body.lifetime();
+        let meta = ConsensusMeta {
+            docid,
+            unsigned_sha3_256,
+            valid_after: lifetime.valid_after.0.into(),
+            fresh_until: lifetime.fresh_until.0.into(),
+            valid_until: lifetime.valid_until.0.into(),
+            flavor: Default::default(),
+        };
+        cons_stmt.execute(named_params! {
+            ":docid": meta.docid,
+            ":unsigned_sha3_256": meta.unsigned_sha3_256,
+            ":valid_after": meta.valid_after,
+            ":fresh_until": meta.fresh_until,
+            ":valid_until": meta.valid_until,
+            ":flavor": T::flavor().name(),
+        })?;
+
+        // Insert all router descriptor member relationships.
+        //
+        // Many small queries are fast in sqlite, so this shouldn't be a perf problem.
+        // https://sqlite.org/np1queryprob.html
+        //
+        // Depending on the flavor, we map the document digests to an iterator
+        // of a tuple of Option's, where one of the values is always None.
+        // This represents the fact that router descriptors use SHA-1 and micro
+        // descriptors SHA-256.
+        for (sha1, sha2) in body.doc_digests() {
+            cons_rs_member_stmt.execute(named_params! {
+                ":docid": docid,
+                ":sha1": sha1,
+                ":sha2": sha2,
+            })?;
+        }
+
+        for sig in sigs.signatories() {
+            cons_auth_voter.execute(named_params! {
+                ":consensus_docid": docid,
+                ":id_rsa": Sha1(sig.id_fingerprint.to_bytes()),
+            })?;
+        }
+
+        Ok(meta)
+    }
+}
+
+/// Representation of authority certificate metadata from the database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AuthCertMeta {
+    /// The document id uniquely identifying the consensus.
+    pub docid: DocumentId,
+
+    /// The SHA-1 fingerprint of the identity key.
+    // TODO DIRMIRROR: Change this to RsaIdentity.
+    pub kp_auth_id_rsa_sha1: Sha1,
+
+    /// The SHA-1 fingerprint of the signign key.
+    // TODO DIRMIRROR: Change this to RsaIdentity.
+    pub kp_auth_sign_rsa_sha1: Sha1,
+
+    /// The timestamp after which this certificate will be valid.
+    pub dir_key_published: Timestamp,
+
+    /// The timestamp until this certificate will be valid.
+    pub dir_key_expires: Timestamp,
+}
+
+impl AuthCertMeta {
+    /// Obtains the authority certificates from the database.
+    pub(crate) fn query(tx: &Transaction) -> Result<Vec<Self>, DatabaseError> {
+        // Obtain all certificates from the database.
+        //
+        // This is okay because the set is not very big.
+        //
+        // In the unlikely edge case of on identity-signing key pair having
+        // multiple certificates, the most recently published certificate is
+        // going to be used.
+        //
+        // TODO DIRMIRROR: Perhaps we should modify the auth_certs table to
+        // add a UNIQUE constraint on that combination, while modifying the
+        // insertion logic to replace with the newer one in the case of a
+        // conflict.
+        let mut stmt = tx.prepare_cached(sql!(
+            "
+            SELECT docid, kp_auth_id_rsa_sha1, kp_auth_sign_rsa_sha1,
+              dir_key_published, dir_key_expires
+            FROM authority_key_certificate
+            GROUP BY kp_auth_id_rsa_sha1, kp_auth_sign_rsa_sha1
+            ORDER BY MAX(dir_key_published)
+            "
+        ))?;
+
+        let certs = stmt
+            .query_map(params![], |row| {
+                Ok(Self {
+                    docid: row.get(0)?,
+                    kp_auth_id_rsa_sha1: row.get(1)?,
+                    kp_auth_sign_rsa_sha1: row.get(2)?,
+                    dir_key_published: row.get(3)?,
+                    dir_key_expires: row.get(4)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        Ok(certs)
+    }
+
+    /// Queries the raw data of an [`AuthCertMeta`].
+    pub(crate) fn data(&self, tx: &Transaction<'_>) -> Result<String, DatabaseError> {
+        let mut stmt = tx.prepare_cached(sql!(
+            "
+            SELECT content
+            FROM store
+            WHERE docid = :docid
+            "
+        ))?;
+
+        let raw = stmt.query_one(named_params! {":docid": self.docid}, |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        let raw = String::from_utf8(raw).map_err(into_internal!("utf-8 constraint violated?"))?;
+        Ok(raw)
+    }
+
+    /// Inserts a new authority certificate into the database.
+    ///
+    /// Keep in mind that the data in the [`AuthCert`] should correspond to the
+    /// data found in `data`, as this method performs no parsing.
+    pub(crate) fn insert<I: Iterator<Item = ContentEncoding>>(
+        tx: &Transaction<'_>,
+        encodings: I,
+        cert: &AuthCert,
+        data: &str,
+    ) -> Result<(), DatabaseError> {
+        // Inserts a new certificate into the meta table.
+        //
+        // Parameters:
+        // :docid - The document id.
+        // :id_rsa - The identity key fingerprint.
+        // :sign_rsa - The signing key fingerprint
+        // :published - The published timestamp.
+        // :expires - The expires timestamp.
+        let mut stmt = tx.prepare_cached(sql!(
+            "
+            INSERT INTO authority_key_certificate
+            (docid, kp_auth_id_rsa_sha1, kp_auth_sign_rsa_sha1, dir_key_published, dir_key_expires)
+            VALUES
+            (:docid, :id_rsa, :sign_rsa, :published, :expires)
+            ON CONFLICT DO NOTHING
+            "
+        ))?;
+
+        let docid = store_insert(tx, data.as_bytes(), encodings)?;
+        stmt.execute(named_params! {
+            ":docid": docid,
+            ":id_rsa": cert.dir_identity_key.to_rsa_identity().as_hex_upper(),
+            ":sign_rsa": cert.dir_signing_key.to_rsa_identity().as_hex_upper(),
+            ":published": Timestamp::from(cert.dir_key_published.0),
+            ":expires": Timestamp::from(cert.dir_key_expires.0),
+        })?;
+
+        Ok(())
+    }
+}
+
+/// A no-op macro just returning the supplied.
+///
+/// The purpose of this macro is to semantically mark [`str`] literals to be
+/// SQL statement.
+///
+/// Keep in mind that the compiler will not notice if you forget this macro.
+/// Unfortunately, you have to ensure it yourself.
+macro_rules! sql {
+    ($s:literal) => {
+        $s
+    };
+}
+
+pub(crate) use sql;
+
+/// Opens a database from disk, creating a [`Pool`] for it.
+///
+/// This function should be the entry point for all things requiring a database
+/// handle, as this function prepares all necessary steps required for operating
+/// on the database correctly, such as:
+/// * Schema initialization.
+/// * Schema upgrade.
+/// * Setting connection specific settings.
+///
+/// # `SQLITE_BUSY` Caveat
+///
+/// There is a problem with the handling of `SQLITE_BUSY` when opening an
+/// SQLite database.  In WAL, opening a database might acquire an exclusive lock
+/// for a very short amount of time, in order to perform clean-up from previous
+/// connections alongside other tasks for maintaining database integrity?  This
+/// means, that opening multiple SQLite databases simultaneously will result in
+/// a busy error regardless of a busy handler, as setting a busy handler will
+/// require an existing connection, something we are unable to obtain in the
+/// first place.
+///
+/// In order to mitigate this issue, the recommended way in the SQLite community
+/// is to simply ensure that database connections are opened sequentially,
+/// by urging calling applications to just use a single [`Pool`] instance.
+///
+/// Testing this is hard unfortunately.
+pub(crate) fn open<P: AsRef<Path>>(
+    path: P,
+) -> Result<Pool<SqliteConnectionManager>, DatabaseError> {
+    let num_cores = std::thread::available_parallelism()
+        .unwrap_or(NonZero::new(8).expect("8 == 0?"))
+        .get() as u32;
+
+    let manager = r2d2_sqlite::SqliteConnectionManager::file(&path);
+    let pool = Pool::builder().max_size(num_cores).build(manager)?;
+
+    rw_tx(&pool, |tx| {
+        // Prepare the database, doing the following steps:
+        // 1. Checking the database schema.
+        // 2. Upgrading (in future) or initializing the database schema (if empty).
+
+        let has_arti_dirserver_schema_version = match tx.query_one(
+            sql!(
+                "
+                SELECT name
+                FROM sqlite_master
+                  WHERE type = 'table'
+                    AND name = 'arti_dirserver_schema_version'
+                "
+            ),
+            params![],
+            |_| Ok(()),
+        ) {
+            Ok(()) => true,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => return Err(DatabaseError::LowLevel(e)),
+        };
+
+        if has_arti_dirserver_schema_version {
+            let version = tx.query_one(
+                sql!("SELECT version FROM arti_dirserver_schema_version WHERE rowid = 1"),
+                params![],
+                |row| row.get::<_, String>(0),
+            )?;
+
+            match version.as_ref() {
+                "1" => {}
+                unknown => {
+                    return Err(DatabaseError::IncompatibleSchema {
+                        version: unknown.into(),
+                    });
+                }
+            }
+        } else {
+            tx.execute_batch(V1_SCHEMA)?;
+        }
+
+        Ok::<_, DatabaseError>(())
+    })??;
+
+    Ok(pool)
+}
+
+/// Executes a closure `op` with a given read-only [`Transaction`].
+///
+/// The [`Transaction`] always gets rolled back the moment `op` returns.
+///
+/// The [`Transaction`] gets initialized with the global pragma options set.
+///
+/// **The closure shall not perform write operations!**
+/// Not only do they get rolled back anyways, but upgrading the [`Transaction`]
+/// from a read to a write transaction will lead to other simultaneous write upgrades
+/// to fail.  Unfortunately, there is no real programmatic way to ensure this.
+pub(crate) fn read_tx<U, F>(pool: &Pool<SqliteConnectionManager>, op: F) -> Result<U, DatabaseError>
+where
+    F: FnOnce(&Transaction<'_>) -> U,
+{
+    let mut conn = pool.get()?;
+    conn.execute_batch(GLOBAL_OPTIONS)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    let res = op(&tx);
+    tx.rollback()?;
+    Ok(res)
+}
+
+/// Executes a closure `op` with a given read-write [`Transaction`].
+///
+/// The [`Transaction`] always gets committed the moment `op` returns.
+///
+/// The [`Transaction`] gets initialized with the global pragma options set.
+///
+/// The [`Transaction`] gets created with [`TransactionBehavior::Immediate`],
+/// meaning it will immediately exist as a write connection, retrying in the
+/// case of a [`rusqlite::ErrorCode::DatabaseBusy`] until it failed after 1s.
+pub(crate) fn rw_tx<U, F>(pool: &Pool<SqliteConnectionManager>, op: F) -> Result<U, DatabaseError>
+where
+    F: FnOnce(&Transaction<'_>) -> U,
+{
+    let mut conn = pool.get()?;
+    conn.execute_batch(GLOBAL_OPTIONS)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    let res = op(&tx);
+    tx.commit()?;
+    Ok(res)
+}
+
+/// Inserts `data` into store while also compressing it with given encodings.
+///
+/// Returns the [`DocumentId`] of `data`.
+///
+/// This function inserts `data` into store and also compresses it into all
+/// given compression formats.
+///
+/// Duplicates get re-encoded and replaced in the database, including
+/// [`ContentEncoding::Identity`].
+pub(crate) fn store_insert<I: Iterator<Item = ContentEncoding>>(
+    tx: &Transaction,
+    data: &[u8],
+    encodings: I,
+) -> Result<DocumentId, DatabaseError> {
+    // The statement to insert some data into the store.
+    //
+    // Parameters:
+    // :docid - The docid.
+    // :content - The binary data.
+    let mut store_stmt = tx.prepare_cached(sql!(
+        "
+        INSERT INTO store (docid, content)
+        VALUES
+        (:docid, :content)
+        ON CONFLICT DO NOTHING
+        "
+    ))?;
+
+    // The statement to insert a compressed document into the metatable.
+    //
+    // Parameters:
+    // :algorithm - The name of the encoding algorithm.
+    // :identity_docid - The docid of the plain-text document in the store.
+    // :compressed_docid - The docid of the encoded document in the store.
+    let mut compressed_stmt = tx.prepare_cached(sql!(
+        "
+        INSERT INTO compressed_document (algorithm, identity_docid, compressed_docid)
+        VALUES
+        (:algorithm, :identity_docid, :compressed_docid)
+        ON CONFLICT DO NOTHING
+        "
+    ))?;
+
+    // Insert the plain document into the store.
+    let identity_docid = DocumentId::digest(data);
+    store_stmt.execute(named_params! {
+        ":docid": identity_docid,
+        ":content": data
+    })?;
+
+    // Compress it into all formats and insert it into store and compressed.
+    for encoding in encodings {
+        if encoding == ContentEncoding::Identity {
+            // Ignore identity because we inserted that above.
+            continue;
+        }
+
+        // We map a compression error to a bug because there is no good reason
+        // on why it should fail, given that we compress from memory data to
+        // memory data.  Probably because it uses the std::io::Writer interface
+        // which itself demands use of std::io::Result.
+        let compressed = compress(data, encoding).map_err(into_internal!("{encoding} failed?"))?;
+        let compressed_docid = DocumentId::digest(&compressed);
+        store_stmt.execute(named_params! {
+            ":docid": compressed_docid,
+            ":content": compressed,
+        })?;
+        compressed_stmt.execute(named_params! {
+            ":algorithm": encoding.to_string(),
+            ":identity_docid": identity_docid,
+            ":compressed_docid": compressed_docid,
+        })?;
+    }
+
+    Ok(identity_docid)
+}
+
+/// Compresses `data` into a specified [`ContentEncoding`].
+///
+/// Returns a [`Vec`] containing the encoded data.
+fn compress(data: &[u8], encoding: ContentEncoding) -> Result<Vec<u8>, std::io::Error> {
+    match encoding {
+        ContentEncoding::Identity => Ok(data.to_vec()),
+        ContentEncoding::Deflate => {
+            let mut w = DeflateEncoder::new(Vec::new(), Default::default());
+            w.write_all(data)?;
+            w.finish()
+        }
+        ContentEncoding::Gzip => {
+            let mut w = GzEncoder::new(Vec::new(), Default::default());
+            w.write_all(data)?;
+            w.finish()
+        }
+        ContentEncoding::XZstd => zstd::encode_all(data, Default::default()),
+        ContentEncoding::XTorLzma => {
+            let mut res = Vec::new();
+            lzma_rs::lzma_compress(&mut Cursor::new(data), &mut res)?;
+            Ok(res)
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_time_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+    use std::{
+        collections::HashSet,
+        io::Read,
+        iter,
+        sync::{Arc, Once},
+    };
+
+    use flate2::read::{DeflateDecoder, GzDecoder};
+    use rusqlite::Connection;
+    use strum::IntoEnumIterator;
+    use tempfile::tempdir;
+    use tor_basic_utils::test_rng::testing_rng;
+    use tor_netdoc::doc::netstatus::{md, plain};
+
+    use crate::testdata2::{self, current_consensus_ns};
+
+    use super::*;
+
+    type Plain = plain::NetworkStatusUnverified;
+    type Md = md::NetworkStatusUnverified;
+
+    #[test]
+    fn open_test() {
+        let db_dir = tempdir().unwrap();
+        let db_path = db_dir.path().join("db");
+
+        open(&db_path).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+
+        // Check if the version was initialized properly.
+        let version = conn
+            .query_one(
+                "SELECT version FROM arti_dirserver_schema_version WHERE rowid = 1",
+                params![],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap();
+        assert_eq!(version, "1");
+
+        // Set the version to something unknown.
+        conn.execute(
+            "UPDATE arti_dirserver_schema_version SET version = 42",
+            params![],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            open(&db_path).unwrap_err().to_string(),
+            "incompatible schema version: 42"
+        );
+    }
+
+    #[test]
+    fn read_tx_test() {
+        let db_dir = tempdir().unwrap();
+        let db_path = db_dir.path().join("db");
+
+        let pool = open(&db_path).unwrap();
+
+        // Do a write transaction despite forbidden.
+        read_tx(&pool, |tx| {
+            tx.execute_batch("DELETE FROM arti_dirserver_schema_version")
+                .unwrap();
+            let e = tx
+                .query_one(
+                    sql!("SELECT version FROM arti_dirserver_schema_version"),
+                    params![],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_err();
+            assert_eq!(e, rusqlite::Error::QueryReturnedNoRows);
+        })
+        .unwrap();
+
+        // Normal check.
+        let version: String = read_tx(&pool, |tx| {
+            tx.query_one(
+                sql!("SELECT version FROM arti_dirserver_schema_version"),
+                params![],
+                |row| row.get(0),
+            )
+            .unwrap()
+        })
+        .unwrap();
+        assert_eq!(version, "1");
+    }
+
+    #[test]
+    fn rw_tx_test() {
+        let db_dir = tempdir().unwrap();
+        let db_path = db_dir.path().join("db");
+
+        let pool = open(&db_path).unwrap();
+
+        // Do a write transaction.
+        rw_tx(&pool, |tx| {
+            tx.execute_batch("DELETE FROM arti_dirserver_schema_version")
+                .unwrap();
+        })
+        .unwrap();
+
+        // Check that it was deleted.
+        read_tx(&pool, |tx| {
+            let e = tx
+                .query_one(
+                    sql!("SELECT version FROM arti_dirserver_schema_version"),
+                    params![],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap_err();
+            assert_eq!(e, rusqlite::Error::QueryReturnedNoRows);
+        })
+        .unwrap();
+    }
+
+    /// Tests whether our SQLite busy error handling works in normal situations.
+    ///
+    /// A normal situations means a situation where a lock is never held for
+    /// more than 1000ms.  In our case, we will work with two threads.
+    /// t1 will acquire an exclusive lock and inform t2 about it.  t2 waits
+    /// until t1 has acquired this lock and then immediately informs t1, that
+    /// it will now wait for a lock too.  Now, t1 will immediately terminate,
+    /// thereby releasing the lock and leading t2 to eventually acquire it.
+    #[test]
+    fn rw_tx_busy_timeout_working() {
+        let db_dir = tempdir().unwrap();
+        let db_path = db_dir.path().join("db");
+        let pool = open(db_path).unwrap();
+
+        // t2 will wait on this before it starts doing stuff.
+        let t1_acquired_lock = Arc::new(Once::new());
+        // t1 will wait on this in order to terminate properly.
+        let t2_is_waiting = Arc::new(Once::new());
+
+        let t1 = std::thread::spawn({
+            let pool = pool.clone();
+            let t1_acquired_lock = t1_acquired_lock.clone();
+            let t2_is_waiting = t2_is_waiting.clone();
+            move || {
+                rw_tx(&pool, move |_tx| {
+                    // Inform t2 we have write lock.
+                    t1_acquired_lock.call_once(|| ());
+                    println!("t1 acquired write lock");
+
+                    // Wait for t2 to start waiting.
+                    t2_is_waiting.wait();
+                })
+                .unwrap();
+                println!("t2 released write lock");
+            }
+        });
+
+        println!("t2 waits for t1 to acquire write lock");
+        t1_acquired_lock.wait();
+        t2_is_waiting.call_once(|| ());
+        rw_tx(&pool, |_| ()).unwrap();
+        println!("t2 acquired and released write lock");
+        t1.join().unwrap();
+    }
+
+    /// Tests whether our SQLite busy error handlings fails as expected.
+    ///
+    /// We configure SQLite to fail after 1000ms.  This test works with two
+    /// threads.  t1 will acquire an exclusive lock on the database and will
+    /// inform t2 about it, which itself will wait until t1 has acquired the
+    /// lock.  t2 will then immediately try to also obtain an exclusive lock,
+    /// which should fail after about 1000ms.  After the failure, t2 informs
+    /// t1 that it has failed, causing t1 to terminate.
+    #[test]
+    fn rw_tx_busy_timeout_busy() {
+        let db_dir = tempdir().unwrap();
+        let db_path = db_dir.path().join("db");
+        let pool = open(db_path).unwrap();
+
+        // t2 will wait on this before it starts doing stuff.
+        let t1_acquired_lock = Arc::new(Once::new());
+        // t1 will wait on this in order to terminate properly.
+        let t2_gave_up = Arc::new(Once::new());
+
+        let t1 = std::thread::spawn({
+            let pool = pool.clone();
+            let t1_acquired_lock = t1_acquired_lock.clone();
+            let t2_gave_up = t2_gave_up.clone();
+
+            move || {
+                rw_tx(&pool, move |_tx| {
+                    // Inform t2 we have the write lock.
+                    t1_acquired_lock.call_once(|| ());
+                    println!("t1 acquired write lock");
+                    // Wait for t2 to give up before we release (how mean from us).
+                    t2_gave_up.wait();
+                })
+                .unwrap();
+                println!("t1 released write lock");
+            }
+        });
+
+        println!("t2 waits for t1 to acquire write lock");
+        t1_acquired_lock.wait();
+        let e = rw_tx(&pool, |_| ()).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "low-level rusqlite error: database is locked"
+        );
+        println!("t2 gave up on acquiring write lock");
+        t2_gave_up.call_once(|| ());
+        t1.join().unwrap();
+    }
+
+    #[test]
+    fn store_insert_test() {
+        let db_dir = tempdir().unwrap();
+        let db_path = db_dir.path().join("db");
+
+        open(&db_path).unwrap();
+        let mut conn = Connection::open(&db_path).unwrap();
+        let tx = conn.transaction().unwrap();
+
+        let docid = store_insert(&tx, "foobar".as_bytes(), ContentEncoding::iter()).unwrap();
+        assert_eq!(
+            docid,
+            "C3AB8FF13720E8AD9047DD39466B3C8974E592C2FA383D4A3960714CAEF0C4F2"
+        );
+
+        let res = tx
+            .query_one(
+                sql!(
+                    "
+                    SELECT content
+                    FROM store
+                    WHERE docid = 'C3AB8FF13720E8AD9047DD39466B3C8974E592C2FA383D4A3960714CAEF0C4F2'
+                    "
+                ),
+                params![],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        assert_eq!(res, "foobar".as_bytes());
+
+        let mut stmt = tx.prepare_cached(sql!(
+            "
+            SELECT algorithm
+            FROM compressed_document
+            WHERE identity_docid = 'C3AB8FF13720E8AD9047DD39466B3C8974E592C2FA383D4A3960714CAEF0C4F2'
+            "
+        )).unwrap();
+
+        let algorithms = stmt
+            .query_map(params![], |row| row.get::<_, String>(0))
+            .unwrap();
+
+        let algorithms = algorithms.map(|x| x.unwrap()).collect::<HashSet<_>>();
+        assert_eq!(
+            algorithms,
+            HashSet::from([
+                "deflate".to_string(),
+                "gzip".to_string(),
+                "x-zstd".to_string(),
+                "x-tor-lzma".to_string()
+            ])
+        );
+
+        // Now insert the same thing a second time again and see whether the
+        // ON CONFLICT magic works.
+        let docid_second = store_insert(&tx, "foobar".as_bytes(), ContentEncoding::iter()).unwrap();
+        assert_eq!(docid, docid_second);
+
+        // Remove a few compressed entries and get them again.
+        let n = tx
+            .execute(
+                sql!(
+                    "
+                    DELETE FROM
+                    compressed_document
+                    WHERE algorithm IN ('deflate', 'x-zstd')
+                    "
+                ),
+                params![],
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+
+        let docid_third = store_insert(&tx, "foobar".as_bytes(), ContentEncoding::iter()).unwrap();
+        assert_eq!(docid, docid_third);
+        let algorithms = stmt
+            .query_map(params![], |row| row.get::<_, String>(0))
+            .unwrap();
+        let algorithms = algorithms.map(|x| x.unwrap()).collect::<HashSet<_>>();
+        assert_eq!(
+            algorithms,
+            HashSet::from([
+                "deflate".to_string(),
+                "gzip".to_string(),
+                "x-zstd".to_string(),
+                "x-tor-lzma".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn compress_test() {
+        /// Asserts that `res` contains `encoding`.
+        fn contains(encoding: ContentEncoding, res: &[(ContentEncoding, Vec<u8>)]) {
+            assert!(res.iter().any(|x| x.0 == encoding));
+        }
+
+        const INPUT: &[u8] = "foobar".as_bytes();
+
+        // Check whether everything was encoded.
+        let res = ContentEncoding::iter()
+            .map(|encoding| (encoding, compress(INPUT, encoding).unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(res.len(), 5);
+        contains(ContentEncoding::Identity, &res);
+        contains(ContentEncoding::Deflate, &res);
+        contains(ContentEncoding::Gzip, &res);
+        contains(ContentEncoding::XTorLzma, &res);
+        contains(ContentEncoding::XZstd, &res);
+
+        // Check if we can decode it.
+        for (encoding, compressed) in res {
+            let mut decompressed = Vec::new();
+
+            match encoding {
+                ContentEncoding::Identity => decompressed = compressed,
+                ContentEncoding::Deflate => {
+                    DeflateDecoder::new(Cursor::new(compressed))
+                        .read_to_end(&mut decompressed)
+                        .unwrap();
+                }
+                ContentEncoding::Gzip => {
+                    GzDecoder::new(Cursor::new(compressed))
+                        .read_to_end(&mut decompressed)
+                        .unwrap();
+                }
+                ContentEncoding::XTorLzma => {
+                    lzma_rs::lzma_decompress(&mut Cursor::new(compressed), &mut decompressed)
+                        .unwrap();
+                }
+                ContentEncoding::XZstd => {
+                    decompressed = zstd::decode_all(Cursor::new(compressed)).unwrap();
+                }
+            }
+
+            assert_eq!(decompressed, INPUT);
+        }
+    }
+
+    /// Verify that the insertion of a consensus works.
+    ///
+    /// For this, we do not use the test database but rather a fresh one and
+    /// call ConsensusMeta::insert().  After, we verify that the consensus
+    /// can be queried as well as that the missing descriptors are properly
+    /// calculated.
+    #[test]
+    fn consensus_insert() {
+        let pool = open("").unwrap();
+        let mut conn = pool.get().unwrap();
+        let tx = conn.transaction().unwrap();
+        let (body, sigs, data) = current_consensus_ns();
+        let meta = ConsensusMeta::<Plain>::insert(
+            &tx,
+            iter::once(ContentEncoding::Identity),
+            (&body, &sigs),
+            data,
+        )
+        .unwrap();
+
+        assert_eq!(
+            meta,
+            ConsensusMeta::<Plain> {
+                docid: Sha256::digest(data.as_bytes()),
+                unsigned_sha3_256: testdata2::consensus_sha3(data),
+                valid_after: body.preamble.lifetime.valid_after.0.into(),
+                fresh_until: body.preamble.lifetime.fresh_until.0.into(),
+                valid_until: body.preamble.lifetime.valid_until.0.into(),
+                flavor: Default::default()
+            }
+        );
+        let meta2 = ConsensusMeta::<Plain>::query(&tx).unwrap();
+        assert_eq!(meta2, vec![meta]);
+        let missing_descs = meta.missing_servers(&tx, None).unwrap();
+        let missing_descs2 = body.routers.iter().map(|r| Sha1(*r.doc_digest())).collect();
+        assert_eq!(missing_descs, missing_descs2);
+    }
+
+    /// Tests whether the timeout computation lies within the proper interval.
+    ///
+    /// Because this involves randomness, it performs the test several thousand
+    /// times.  This should be okay performance wise, as it takes about ~250ms
+    /// with a debug build on my machine.
+    #[test]
+    fn sync_timeout() {
+        // We repeat the tests a few thousand times to go over many random values.
+        let docid = Sha256::digest(testdata2::current_consensus_ns().2.as_bytes());
+        let lifetime = testdata2::current_consensus_ns().0.preamble.lifetime;
+        let unsigned_sha3_256 = testdata2::consensus_sha3(testdata2::current_consensus_ns().2);
+        let cons = ConsensusMeta::<Plain> {
+            docid,
+            unsigned_sha3_256,
+            valid_after: lifetime.valid_after.0.into(),
+            fresh_until: lifetime.fresh_until.0.into(),
+            valid_until: lifetime.valid_until.0.into(),
+            flavor: Default::default(),
+        };
+        for _ in 0..10000 {
+            let when = cons.ttl(&mut testing_rng());
+            assert!(when >= lifetime.fresh_until.0.into());
+            // Computes the half between fresh_until and valid_until.
+            assert!(
+                when <= (lifetime.fresh_until.0
+                    + (lifetime
+                        .valid_until
+                        .0
+                        .duration_since(lifetime.fresh_until.0)
+                        .unwrap()
+                        / 2))
+                    .into()
+            );
+        }
+    }
+
+    /// Tests whether the missing router descriptor queue is computed properly.
+    ///
+    /// For this, we remove existing router descriptors from the database and
+    /// see whether they are determined as missing properly.
+    #[test]
+    fn missing_server_descriptors() {
+        let pool = testdata2::test_db();
+        let meta = read_tx(&pool, ConsensusMeta::<Plain>::query)
+            .unwrap()
+            .unwrap()[0];
+        // Ensure that the returned consensus matches the one from testdata2.
+        assert_eq!(
+            meta.docid,
+            DocumentId::digest(testdata2::current_consensus_ns().2.as_bytes())
+        );
+
+        // Delete a single router descriptor, so we can determine a missing one
+        // using it.
+        let removed_descriptor = *testdata2::current_consensus_ns().0.routers[0].doc_digest();
+        let removed_descriptor = Sha1::from(removed_descriptor);
+        pool.get()
+            .unwrap()
+            .execute(
+                sql!(
+                    "
+                    DELETE FROM router_descriptor
+                    WHERE unsigned_sha1 = ?1
+                    "
+                ),
+                params![removed_descriptor],
+            )
+            .unwrap();
+
+        // Only one should be returned.
+        let missing_servers = read_tx(&pool, |tx| meta.missing_servers(tx, None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(missing_servers, HashSet::from([removed_descriptor]));
+
+        // If we delete all router descriptors we have, we should get all.
+        rw_tx(&pool, |tx| {
+            tx.execute(sql!("DELETE FROM router_descriptor"), params![])
+        })
+        .unwrap()
+        .unwrap();
+
+        // Now all should be returned; we verify this by checking that the
+        // result is present in all_descriptors, which is a superset.
+        let missing_servers = read_tx(&pool, |tx| meta.missing_servers(tx, None))
+            .unwrap()
+            .unwrap();
+        // This is a superset of missing_servers because it includes router
+        // descriptors that are not a part of the current consensus.
+        let all_descriptors = testdata2::current_router_descs()
+            .iter()
+            .map(|x| Sha1::from(x.1.hashes.sha1.unwrap()))
+            .collect::<HashSet<_>>();
+        assert!(
+            missing_servers
+                .iter()
+                .all(|sha1| all_descriptors.contains(sha1))
+        );
+    }
+
+    /// Tests whether or not the missing descriptors are actually random.
+    #[test]
+    fn missing_descriptors_are_random() {
+        let pool = testdata2::test_db();
+        rw_tx(&pool, |tx| {
+            tx.execute(sql!("DELETE FROM router_descriptor"), ())
+                .unwrap();
+            let meta = ConsensusMeta::<Plain>::query(tx).unwrap()[0];
+
+            // Ensure there are more than 1 missing descriptors now.
+            let n = meta.missing_servers(tx, None).unwrap().len();
+            assert!(n > 1);
+
+            let mut prev = HashSet::new();
+            let mut randomness_works = false;
+            for _ in 0..100 {
+                let cur = meta.missing_servers(tx, Some(1)).unwrap();
+                if prev != cur {
+                    randomness_works = true;
+                    break;
+                }
+                prev = cur;
+            }
+            assert!(randomness_works);
+        })
+        .unwrap();
+    }
+
+    /// Tests whether the RANDOM() calls are executed before the ordering so
+    /// that we have stability.
+    #[test]
+    fn missing_servers_monotonically_increasing() {
+        let pool = testdata2::test_db();
+        rw_tx(&pool, |tx| {
+            let meta = ConsensusMeta::<Plain>::query(tx).unwrap();
+            tx.execute(sql!("DELETE FROM router_descriptor"), ())
+                .unwrap();
+
+            let mut stmt = tx
+                .prepare_cached(ConsensusMeta::<Plain>::MISSING_SERVERS_QUERY)
+                .unwrap();
+
+            let res = stmt
+                .query_map(params![meta[0].docid, -1], |row| row.get::<_, i64>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+
+            // Ensure there is more than 1 missing descriptor because we can
+            // only test ordering if n >= 2.
+            assert!(res.len() > 1);
+
+            // Verify that the calls are monotonically increasing.
+            assert!(res.is_sorted());
+        })
+        .unwrap();
+    }
+
+    /// Tests whether the missing extra-info documents are computed properly.
+    // TODO DIRMIRROR: Expand on this once we have proper extra-info support.
+    #[test]
+    fn missing_extra_infos() {
+        let pool = testdata2::test_db();
+        let meta = read_tx(&pool, ConsensusMeta::<Plain>::query)
+            .unwrap()
+            .unwrap()[0];
+        // Ensure that the returned consensus matches the one from testdata2.
+        assert_eq!(
+            meta.docid,
+            DocumentId::digest(testdata2::current_consensus_ns().2.as_bytes())
+        );
+
+        // We should have no missing extra-infos.
+        let missing_extras = read_tx(&pool, |tx| meta.missing_extras(tx, None))
+            .unwrap()
+            .unwrap();
+        assert!(missing_extras.is_empty());
+
+        // TODO DIRMIRROR: Once we have support for extra-info's, add a test
+        // for this here.  Right now, testing this is pretty useless as we
+        // cannot add it nicely to the testdata2 module if there isn't even
+        // an ExtraInfo struct from tor-netdoc.
+    }
+
+    /// Tests whether the missing micro descriptor queue is computed properly.
+    ///
+    /// For this, we remove existing micro descriptors from the database and
+    /// see whether they are determined as missing properly.
+    #[test]
+    fn missing_micro_descriptors() {
+        let pool = testdata2::test_db();
+        let meta = read_tx(&pool, ConsensusMeta::<Md>::query).unwrap().unwrap()[0];
+        // Ensure that the returned consensus matches the one from testdata2.
+        assert_eq!(
+            meta.docid,
+            DocumentId::digest(testdata2::current_consensus_md().2.as_bytes())
+        );
+
+        // Delete a single router descriptor, so we can determine a missing one
+        // using it.
+        let removed_descriptor = *testdata2::current_consensus_md().0.routers[0].doc_digest();
+        let removed_descriptor = Sha256::from(removed_descriptor);
+        pool.get()
+            .unwrap()
+            .execute(
+                sql!(
+                    "
+                    DELETE FROM router_descriptor
+                    WHERE unsigned_sha2 = ?1
+                    "
+                ),
+                params![removed_descriptor],
+            )
+            .unwrap();
+
+        // Only one should be returned.
+        let missing_micros = read_tx(&pool, |tx| meta.missing_micros(tx, None))
+            .unwrap()
+            .unwrap();
+        assert_eq!(missing_micros, HashSet::from([removed_descriptor]));
+
+        // If we delete all micro descriptors we have, we should get all.
+        rw_tx(&pool, |tx| {
+            tx.execute(sql!("DELETE FROM router_descriptor"), params![])
+        })
+        .unwrap()
+        .unwrap();
+
+        // Now all should be returned; we verify this by checking that the
+        // result is present in all_descriptors, which is a superset.
+        let missing_micros = read_tx(&pool, |tx| meta.missing_micros(tx, None))
+            .unwrap()
+            .unwrap();
+        // This is a superset of missing_micros because it includes micro
+        // descriptors that are not a part of the current consensus.
+        let all_descriptors = testdata2::current_micro_descs()
+            .iter()
+            .map(|x| Sha256::digest(x.1.as_bytes()))
+            .collect::<HashSet<_>>();
+        assert!(
+            missing_micros
+                .iter()
+                .all(|sha2| all_descriptors.contains(sha2))
+        );
+    }
+}

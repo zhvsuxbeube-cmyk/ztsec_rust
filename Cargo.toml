@@ -1,0 +1,29 @@
+[package]
+name = "ztsec_agent"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.92"
+
+[workspace]
+members = ["protocol", "server", "tools/auth-keygen", "tools/load-test"]
+resolver = "3"
+
+[dependencies]
+arti-client = { path = "vendor/arti/crates/arti-client", version = "0.46.0", default-features = false, features = ["tokio", "native-tls", "onion-service-client"] }
+base64 = "0.22.1"
+ed25519-dalek = "=2.2.0"
+futures-util = "0.3.34"
+getrandom = "=0.2.17"
+hkdf = "=0.12.4"
+sha2 = "=0.10.9"
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+tor-rtcompat = { path = "vendor/arti/crates/tor-rtcompat", version = "0.46.0", default-features = false, features = ["tokio", "native-tls"] }
+ztsec_protocol = { path = "protocol" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

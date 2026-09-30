@@ -1,0 +1,26 @@
+[Unit]
+Description=ZTSEC Rust onion/WebSocket connection server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ztsec
+Group=ztsec
+ExecStart=/opt/ztsec/bin/ztsec-server --authorized-keys /etc/ztsec/authorized_keys --state-dir /var/lib/ztsec/arti-state --cache-dir /var/lib/ztsec/arti-cache --local-socket /run/ztsec/telemetry.sock --path /ztsec --onion-port 443 --max-connections 4096 --max-auth-inflight 64 --ipc-queue 256 --message-rate 10 --handshake-timeout 8 --auth-timeout 8 --idle-timeout 90 --ping-interval 30
+Restart=on-failure
+RestartSec=5s
+RuntimeDirectory=ztsec
+RuntimeDirectoryMode=0750
+StateDirectory=ztsec
+StateDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ztsec /run/ztsec
+LimitNOFILE=20000
+TasksMax=8192
+
+[Install]
+WantedBy=multi-user.target

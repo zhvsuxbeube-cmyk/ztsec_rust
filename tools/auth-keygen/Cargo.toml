@@ -1,0 +1,9 @@
+[package]
+name = "ztsec_auth_keygen"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.92"
+
+[dependencies]
+ed25519-dalek = "=2.2.0"
+getrandom = "=0.2.17"

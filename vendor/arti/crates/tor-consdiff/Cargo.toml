@@ -1,0 +1,39 @@
+[package]
+name = "tor-consdiff"
+version = "0.46.0"
+authors = ["The Tor Project, Inc.", "Nick Mathewson <nickm@torproject.org>"]
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+homepage = "https://gitlab.torproject.org/tpo/core/arti/-/wikis/home"
+description = "Handle the consensus-diff format used in the Tor directory protocol"
+keywords = ["tor", "arti", "diff"]
+categories = ["parser-implementations", "network-programming"]
+repository = "https://gitlab.torproject.org/tpo/core/arti.git/"
+
+[features]
+default = []
+full = ["tor-llcrypto/full", "tor-error/full", "tor-netdoc/full"]
+
+experimental = ["slow-diff-apply"]
+slow-diff-apply = ["__is_experimental"]
+__is_experimental = []
+
+[dependencies]
+derive_more = "2.1.1"
+digest = "0.10.0"
+hex = "0.4"
+imara-diff = "0.2.0"
+static_assertions = "1.1.0"
+thiserror = "2"
+tor-error = { path = "../tor-error", version = "0.46.0" }
+tor-llcrypto = { path = "../tor-llcrypto", version = "0.46.0" }
+# TODO: Ideally, we would be able to compile without ns-vote.
+tor-netdoc = { path = "../tor-netdoc", version = "0.46.0", features = ["incomplete"] }
+
+[dev-dependencies]
+rand = "0.10.1"
+tor-basic-utils = { path = "../tor-basic-utils", version = "0.46.0" }
+
+[package.metadata.docs.rs]
+all-features = true

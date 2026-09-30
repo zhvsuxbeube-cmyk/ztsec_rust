@@ -1,0 +1,27 @@
+[package]
+name = "dependencies-bodge"
+version = "0.0.1"
+edition = "2024"
+publish = false
+authors = ["The Tor Project, Inc."]
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+homepage = "https://gitlab.torproject.org/tpo/core/arti/-/wikis/home"
+description = "Fake crate to influence cargo dependency selection"
+
+# This "package" allows us to influence Cargo's crate selection even for indirect deps.
+#
+# The trick is to add, here, the desired dependency version
+# with a sufficiently restrictive spec,
+#
+# This tends to work because cargo likes to use a single version where it can.
+
+[dependencies]
+
+[features]
+full = []
+# Example:  We used this to encourage Cargo to select an older version
+# of security-framework, when we were stuck on the 10.12 OSX APIs and couldn't
+# build the newer versions. (#2387)
+#
+#security-framework = "~3.6.0"

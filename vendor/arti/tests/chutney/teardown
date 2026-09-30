@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+
+# stdlib imports
+import sys
+import subprocess
+
+# stdlib "from" imports
+from pathlib import Path
+
+# local imports
+from config import Config
+
+assert __name__ == "__main__"
+_SCRIPT_DIR = Path(sys.argv[0]).parent.resolve()
+
+config = Config.load_json(Path(_SCRIPT_DIR).joinpath("arti.run.json"))
+config.export_env()
+
+subprocess.check_call([config.chutney, "stop"])

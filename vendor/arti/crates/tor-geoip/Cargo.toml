@@ -1,0 +1,40 @@
+[package]
+name = "tor-geoip"
+version = "0.46.0"
+authors = ["The Tor Project, Inc.", "eta <eta@torproject.org>"]
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+homepage = "https://gitlab.torproject.org/tpo/core/arti/-/wikis/home"
+description = "A crate to parse C Tor GeoIP CSV files."
+keywords = ["tor", "arti"]
+categories = ["parser-implementations", "network-programming"]
+repository = "https://gitlab.torproject.org/tpo/core/arti.git/"
+
+[dependencies]
+derive_more = { version = "2.0.1", features = ["full"] }
+rangemap = "1.3"
+thiserror = "2"
+tor-geoip-db = { version = "0.1.0-pre2", optional = true }
+
+[features]
+embedded-db = ["tor-geoip-db"]
+default = ["embedded-db"]
+full = ["embedded-db"]
+
+experimental = ["export"]
+export = ["__is_experimental"]
+__is_experimental = []
+
+[dev-dependencies]
+proptest = "1.0.0"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[bin]]
+name = "geoip-convert-mm-format"
+path = "bin/convert.rs"
+test = false
+bench = false
+required-features = ["export"]

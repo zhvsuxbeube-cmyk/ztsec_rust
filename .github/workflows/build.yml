@@ -1,0 +1,216 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal
+          rustup default 1.92.0
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml', 'protocol/Cargo.toml', 'server/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Generate dependency lockfile
+        run: cargo generate-lockfile
+      - name: Test Rust workspace
+        run: cargo test --workspace --all-targets
+      - name: Build Rust server and tooling
+        run: |
+          cargo build --release --package ztsec_server --bin ztsec-server
+          cargo build --manifest-path tools/auth-keygen/Cargo.toml
+          cargo build --manifest-path tools/load-test/Cargo.toml --release
+      - name: Python tests
+        run: |
+          python3 -m py_compile telemetry_service.py python_service.py tools/*.py
+          python3 -m unittest tools.test_python_service
+          python3 tools/test_update_contract.py
+      - name: Local server/Python integration test
+        run: tools/local_integration.sh
+      - name: Docker build validation
+        run: docker build -f docker/rust-server-builder.Dockerfile --target artifacts -t ztsec-rust-builder .
+      - name: Upload Linux server
+        uses: actions/upload-artifact@v4
+        with:
+          name: ztsec-server-linux-x64
+          path: target/release/ztsec-server
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.92.0-x86_64-pc-windows-msvc --profile minimal
+          rustup default 1.92.0-x86_64-pc-windows-msvc
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml', 'protocol/Cargo.toml', 'server/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Generate dependency lockfile
+        run: cargo generate-lockfile
+      - name: Test agent
+        run: cargo test --package ztsec_agent --tests
+      - name: Panel unit tests
+        shell: pwsh
+        run: python -m unittest tools.panel_test
+      - name: Build agent
+        run: cargo build --release --target x86_64-pc-windows-msvc --bin ztsec_agent
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Plugin
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          cl /nologo /LD /EHs-c- /GR- /GS- /Zl /std:c++17 plugin\hello.cpp /link /NOENTRY /NODEFAULTLIB /OUT:dist\hello.dll kernel32.lib user32.lib
+          if ($LASTEXITCODE -ne 0) { throw 'plugin build failed' }
+          dumpbin /exports dist\hello.dll | Out-File dist\exports.txt
+          $exports = Get-Content dist\exports.txt -Raw
+          foreach ($name in 'PluginOnLoad','PluginOnEvent','PluginOnUnload') {
+            if ($exports -notmatch $name) { throw "missing export: $name" }
+          }
+      - name: Spy
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
+          $panel = Start-Process python -ArgumentList 'tools\panel.py','--port','4794','--test',"$PWD\dist\hello.dll" -NoNewWindow -PassThru -RedirectStandardOutput 'panel.out' -RedirectStandardError 'panel.err'
+          Start-Sleep -Seconds 2
+          $env:ZTSEC_CI = '1'
+          $agent = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4794' -NoNewWindow -PassThru -RedirectStandardOutput 'agent.out' -RedirectStandardError 'agent.err'
+          if (-not $panel.WaitForExit(30000)) { Stop-Process $panel.Id -Force; Stop-Process $agent.Id -Force; throw 'panel timeout' }
+          if ($agent.HasExited -eq $false) { Stop-Process $agent.Id -Force }
+          $p = Get-Content panel.out -Raw
+          if ($p -notmatch 'ACK:PLUGIN:hello') { throw 'plugin ack' }
+          if ($p -notmatch 'ACK:PLUGIN_EVENT:ping') { throw 'event ack' }
+          if ($p -notmatch 'ACK:PLUGIN_OUT:hello') { throw 'unload ack' }
+          if ($p -notmatch 'ACK:CLOSE') { throw 'close ack' }
+          Get-Content panel.out
+          Get-Content panel.err
+          Get-Content agent.out
+          Get-Content agent.err
+          $a = Get-Content agent.out -Raw
+          if ($a -notmatch 'plugin event: event ping') { throw 'plugin callback' }
+      - name: Execute
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
+          Set-Content -Path 'dist\test_exec.ps1' -Value "Write-Output 'ztsec_execute_ok'" -Encoding UTF8
+          $panel = Start-Process python -ArgumentList 'tools\exec_test.py','4795',"$PWD\dist\test_exec.ps1" -NoNewWindow -PassThru -RedirectStandardOutput 'exec_panel.out' -RedirectStandardError 'exec_panel.err'
+          Start-Sleep -Seconds 2
+          $env:ZTSEC_CI = '1'
+          $agent = Start-Process $exe -ArgumentList '--ip','127.0.0.1','--port','4795' -NoNewWindow -PassThru -RedirectStandardOutput 'exec_agent.out' -RedirectStandardError 'exec_agent.err'
+          if (-not $panel.WaitForExit(30000)) { Stop-Process $panel.Id -Force; Stop-Process $agent.Id -Force; throw 'execute panel timeout' }
+          if ($agent.HasExited -eq $false) { Stop-Process $agent.Id -Force }
+          if ($panel.ExitCode -ne 0) {
+            Get-Content exec_panel.out; Get-Content exec_panel.err
+            Get-Content exec_agent.out; Get-Content exec_agent.err
+            throw 'execute test failed'
+          }
+          Get-Content exec_panel.out
+      - name: Update E2E
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
+          $work = Join-Path $PWD 'dist\update-e2e'
+          New-Item -ItemType Directory -Force $work | Out-Null
+          Copy-Item $exe (Join-Path $work 'ztsec_agent.exe') -Force
+          $textPath = Join-Path $PWD 'src\text.rs'
+          $original = Get-Content $textPath -Raw
+          try {
+            $updated = $original.Replace('pub const VERSION: &str = "Rust-Native/1";', 'pub const VERSION: &str = "Rust-Native/2";')
+            if ($updated -eq $original) { throw 'failed to set update test version' }
+            Set-Content -Path $textPath -Value $updated -NoNewline
+            cargo build --release --target x86_64-pc-windows-msvc
+            Copy-Item $exe (Join-Path $work 'ztsec_agent_updated.exe') -Force
+          }
+          finally {
+            Set-Content -Path $textPath -Value $original -NoNewline
+          }
+          $panel = Start-Process python -ArgumentList 'tools\panel.py','--ip','127.0.0.1','--port','4796','--update-test',(Join-Path $work 'ztsec_agent_updated.exe'),'--expect-version','Rust-Native/2' -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $work 'panel.out') -RedirectStandardError (Join-Path $work 'panel.err')
+          $deadline = (Get-Date).AddSeconds(15)
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path (Join-Path $work 'panel.out')) {
+              $panelLog = Get-Content (Join-Path $work 'panel.out') -Raw
+              if ($panelLog -match 'listening 127\.0\.0\.1:4796') { break }
+            }
+            Start-Sleep -Milliseconds 100
+          }
+          $env:ZTSEC_CI = '1'
+          $agent = Start-Process (Join-Path $work 'ztsec_agent.exe') -ArgumentList '--ip','127.0.0.1','--port','4796' -NoNewWindow -PassThru -RedirectStandardOutput (Join-Path $work 'agent.out') -RedirectStandardError (Join-Path $work 'agent.err')
+          if (-not $panel.WaitForExit(90000)) {
+            if (-not $agent.HasExited) { Stop-Process $agent.Id -Force }
+            Stop-Process $panel.Id -Force
+            throw 'update e2e panel timeout'
+          }
+          if (-not $agent.HasExited) { Stop-Process $agent.Id -Force }
+          if ($panel.ExitCode -ne 0) {
+            Get-Content (Join-Path $work 'panel.out')
+            Get-Content (Join-Path $work 'panel.err')
+            Get-Content (Join-Path $work 'agent.out')
+            Get-Content (Join-Path $work 'agent.err')
+            throw "update e2e failed with exit code $($panel.ExitCode)"
+          }
+          $out = Get-Content (Join-Path $work 'panel.out') -Raw
+          if ($out -notmatch 'ACK:UPDATE:') { throw 'missing update ack' }
+          if ($out -notmatch 'Rust-Native/2') { throw 'updated agent did not reconnect with new version' }
+          $finalBytes = [IO.File]::ReadAllBytes($exe)
+          $expectedBytes = [IO.File]::ReadAllBytes((Join-Path $work 'ztsec_agent_updated.exe'))
+          if (-not [Linq.Enumerable]::SequenceEqual($finalBytes, $expectedBytes)) { throw 'original executable path was not replaced with updated bytes' }
+      - name: Archive
+        shell: pwsh
+        run: |
+          Copy-Item dist\update-e2e\ztsec_agent.exe dist\ztsec_agent.exe -Force
+          Compress-Archive -Path dist\ztsec_agent.exe,dist\hello.dll,dist\exports.txt -DestinationPath ztsec_agent-win64.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ztsec-agent-win64
+          path: ztsec_agent-win64.zip
+
+  package:
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Package release bundle
+        shell: bash
+        run: |
+          mkdir -p release
+          cp dist/ztsec-server-linux-x64/ztsec-server release/ztsec-server
+          cp dist/ztsec-agent-win64/ztsec_agent-win64.zip release/ztsec-agent-win64.zip
+          cp telemetry_service.py release/telemetry_service.py
+          cp README.md release/README.md
+          tar -C release -czf ztsec-release.tgz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ztsec-release-bundle
+          path: ztsec-release.tgz

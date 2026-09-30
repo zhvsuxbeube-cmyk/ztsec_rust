@@ -1,0 +1,451 @@
+//! Configure and activate RPC listeners from connect points.
+
+use anyhow::Context;
+use std::{
+    collections::{BTreeMap, HashMap},
+    str::FromStr as _,
+    sync::Arc,
+};
+use tracing::debug;
+
+use derive_deftly::Deftly;
+use fs_mistrust::{Mistrust, anon_home::PathExt as _};
+use tor_basic_utils::PathExt as _;
+use tor_config::derive::prelude::*;
+use tor_config::{
+    ConfigBuildError, define_map_builder,
+    extend_builder::{ExtendBuilder, ExtendStrategy},
+};
+use tor_config_path::{CfgPath, CfgPathResolver};
+use tor_error::internal;
+use tor_rpc_connect::{
+    ParsedConnectPoint, SuperuserPermission,
+    auth::RpcAuth,
+    load::{LoadError, LoadOptions, LoadOptionsBuilder},
+    server::ListenerGuard,
+};
+use tor_rtcompat::{Runtime, general};
+
+/// Return defaults for RpcListenerMapBuilder.
+pub(super) fn listener_map_defaults() -> BTreeMap<String, RpcListenerSetConfigBuilder> {
+    toml::from_str(
+        r#"
+        ["user-default"]
+        enable = true
+        dir = "${ARTI_LOCAL_DATA}/rpc/connect.d"
+
+        ["system-default"]
+        enable = false
+        dir = "/etc/arti-rpc/connect.d"
+        "#,
+    )
+    .expect("Could not parse defaults!")
+}
+
+/// Configuration for a single source of connect points
+/// to use when configuring Arti as an RPC server.
+///
+/// This can configure either a connect point from a single toml file,
+/// or a set of connect points from a directory of toml files.
+#[derive(Debug, Clone, Deftly, Eq, PartialEq)]
+#[derive_deftly(TorConfig)]
+#[deftly(tor_config(no_default_trait, no_flattenable_trait, pre_build = Self::validate))]
+#[cfg_attr(feature = "experimental-api", visibility::make(pub))]
+#[cfg_attr(feature = "experimental-api", deftly(tor_config(vis = pub)))]
+pub(crate) struct RpcListenerSetConfig {
+    /// An builder to determine default connect point options.
+    ///
+    /// If `file` is set, this builder is used directly
+    /// to determine the options for the connect points.
+    ///
+    /// If `dir` is set, this builder defines a set of defaults
+    /// that we can override for each connect point in `file_options`.
+    #[deftly(tor_config(
+        setter(skip),
+        attr = serde(flatten),
+        // This lets us hold a Builder in the Config too,
+        // so we can use `ExtendBuilder` on it.
+        field(ty = ConnectPointOptionsBuilder),
+        build = { |this: &Self| this.listener_options.clone() },
+        extend_with = ExtendBuilder::extend_from
+    ))]
+    listener_options: ConnectPointOptionsBuilder,
+
+    /// A path to a file on disk containing a connect string.
+    ///
+    /// Exactly one of `file` or `dir` may be set.
+    #[deftly(tor_config(setter(strip_option), default))]
+    file: Option<CfgPath>,
+
+    /// A path to a directory on disk containing one or more connect strings.
+    ///
+    /// Only files whose names end with ``.toml` are considered.
+    ///
+    #[deftly(tor_config(setter(strip_option), default))]
+    dir: Option<CfgPath>,
+
+    /// Map from file name within `dir` to builders for options on the individual files.
+    ///
+    /// We hold builders here so that we can use `ExtendBuilder` to derive settings
+    /// using `listener_options` as the defaults.
+    #[deftly(tor_config(
+        setter(skip),
+        field(ty = FileOptionsMapBuilder),
+        build = { |this: &Self| this.file_options.clone() },
+        extend_with = ExtendBuilder::extend_from
+    ))]
+    file_options: FileOptionsMapBuilder,
+}
+
+impl RpcListenerSetConfigBuilder {
+    /// Return an error if this builder isn't valid.
+    fn validate(&self) -> Result<(), ConfigBuildError> {
+        match (&self.file, &self.dir, self.file_options.is_empty()) {
+            // If "file" is present, dir and file_options must be absent.
+            (Some(_), None, true) => Ok(()),
+            // If "dir" is present, file must be absent and file_options can be whatever.
+            (None, Some(_), _) => Ok(()),
+            // Otherwise, there's an error.
+            (None, None, _) => Err(ConfigBuildError::MissingField {
+                field: "{file or dir}".into(),
+            }),
+            (_, _, _) => Err(ConfigBuildError::Inconsistent {
+                fields: vec!["file".into(), "dir".into(), "file_options".into()],
+                problem: "'file' is mutually exclusive with 'dir' and 'file_options'".into(),
+            }),
+        }
+    }
+
+    /// Return a mutable reference to the listener options.
+    ///
+    /// This field determines the default connect point options.
+    ///
+    /// If `file` is set, this builder is used directly
+    /// to determine the options for the connect points.
+    ///
+    /// If `dir` is set, this builder defines a set of defaults
+    /// that we can override for each connect point in `file_options`.
+    #[cfg(any(test, feature = "experimental-api"))]
+    pub fn listener_options(&mut self) -> &mut ConnectPointOptionsBuilder {
+        &mut self.listener_options
+    }
+
+    /// Return a mutable reference to the file options
+    ///
+    /// This field is a map from file name within `dir` to builders for options on the individual files.
+    ///
+    /// We hold builders here so that we can use `ExtendBuilder` to derive settings
+    /// using `listener_options` as the defaults.
+    #[cfg(any(test, feature = "experimental-api"))]
+    pub fn file_options(&mut self) -> &mut FileOptionsMapBuilder {
+        &mut self.file_options
+    }
+}
+
+define_map_builder! {
+    /// Builder for the `FileOptionsMap` within an `RpcListenerSetConfig`.
+    #[derive(Eq, PartialEq)]
+    #[cfg_attr(feature = "experimental-api", visibility::make(pub))]
+    pub(crate) struct FileOptionsMapBuilder =>
+    type FileOptionsMap = BTreeMap<String, ConnectPointOptions>;
+}
+
+/// Configuration for overriding a single item in a connect point directory.
+///
+/// This structure's corresponding builder appears at two points
+/// in our configuration tree:
+/// Once at the `RpcListenerSetConfig` level,
+/// and once (for directories only!) under the `file_options` map.
+///
+/// When loading a connect point from an explicitly specified file,
+/// we look at the `ConnectPointOptionsBuilder` under the `RpcListenerSetConfig` only.
+///
+/// When loading a connect point from a file within a specified directory,
+/// we use the `ConnectPointOptionsBuilder` under the `RpcListenerSetConfig`
+/// as a set of defaults,
+/// and we extend those defaults from any entry we find in the `file_options` map
+/// corresponding to the connect point's filename.
+#[derive(Debug, Clone, Eq, PartialEq, Deftly)]
+#[derive_deftly(TorConfig)]
+#[deftly(tor_config(attr = derive(PartialEq, Eq)))]
+#[cfg_attr(feature = "experimental-api", visibility::make(pub))]
+#[cfg_attr(feature = "experimental-api", deftly(tor_config(vis = pub)))]
+pub(crate) struct ConnectPointOptions {
+    /// Used to explicitly disable an entry in a connect point directory.
+    #[deftly(tor_config(default = true))]
+    enable: bool,
+}
+
+impl ConnectPointOptionsBuilder {
+    /// Return true if this builder represents an enabled connect point.
+    fn is_enabled(&self) -> bool {
+        self.enable != Some(false)
+    }
+
+    /// Return a [`LoadOptions`] corresponding to this OverrideConfig.
+    ///
+    /// The `LoadOptions` will contain a subset of our own options,
+    /// set in order to make [`ParsedConnectPoint::load_dir`] behaved as configured here.
+    fn load_options(&self) -> LoadOptions {
+        LoadOptionsBuilder::default()
+            .disable(!self.is_enabled())
+            .build()
+            .expect("Somehow constructed an invalid LoadOptions")
+    }
+}
+
+/// Configuration information used to initialize RPC connections.
+///
+/// This information is derived from the configuration on the connect point,
+/// and from the connect point itself.
+#[derive(Clone, Debug)]
+pub(super) struct RpcConnInfo {
+    /// A human-readable name for the source of this RPC connection.
+    ///
+    /// We try to make this unique, but it might not be, depending on filesystem UTF-8 issues.
+    pub(super) name: String,
+    /// The authentication we require for this RPC connection.
+    pub(super) auth: RpcAuth,
+    /// The options for this connect point.
+    #[allow(unused)] // TODO: Once there are more options than "enable", this will be used.
+    pub(super) options: ConnectPointOptions,
+    /// If true, we allow successful connections on this connect point
+    /// to get superuser capabilities.
+    pub(super) allow_superuser: SuperuserPermission,
+}
+
+impl RpcConnInfo {
+    /// Initialize a new `RpcConnInfo`.
+    ///
+    /// Uses `display_name`
+    /// to name the connect point for human-readable logs.
+    ///
+    /// Uses `auth`, `options`, and `allow_superuser` as settings to initialize new connections.
+    #[allow(clippy::unnecessary_wraps)]
+    fn new(
+        display_name: String,
+        auth: RpcAuth,
+        options: ConnectPointOptions,
+        allow_superuser: SuperuserPermission,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            name: display_name,
+            auth,
+            options,
+            allow_superuser,
+        })
+    }
+}
+
+impl RpcListenerSetConfig {
+    /// Load every enabled connect point from this file or directory,
+    /// and bind to them.
+    ///
+    /// On success, returns a list of bound sockets,
+    /// along with information about how to treat incoming connections on those sockets,
+    /// and a guard object that must not be dropped until we are no longer listening on the socket.
+    pub(super) async fn bind<R: Runtime>(
+        &self,
+        runtime: &R,
+        config_key: &str,
+        resolver: &CfgPathResolver,
+        mistrust: &Mistrust,
+    ) -> anyhow::Result<Vec<(general::Listener, Arc<RpcConnInfo>, ListenerGuard)>> {
+        if !self.listener_options.is_enabled() {
+            // We stop immediately if we're disabled at the RpcListenerSetConfig level,
+            // and load nothing.
+            return Ok(vec![]);
+        }
+
+        if let Some(file) = &self.file {
+            let file = file.path(resolver)?;
+            debug!(
+                "Binding to RPC connect point from {}",
+                file.anonymize_home()
+            );
+            let ctx = |action| {
+                format!(
+                    "Can't {} RPC connect point from {}",
+                    action,
+                    file.anonymize_home()
+                )
+            };
+            let options = self
+                .listener_options
+                .build()
+                .with_context(|| ctx("interpret options"))?;
+
+            let conn_pt = ParsedConnectPoint::load_file(file.as_ref(), mistrust)
+                .with_context(|| ctx("load"))?
+                .resolve(resolver)
+                .with_context(|| ctx("resolve"))?;
+            let tor_rpc_connect::server::Listener {
+                listener,
+                auth,
+                guard,
+                ..
+            } = conn_pt
+                .bind(runtime, mistrust)
+                .await
+                .with_context(|| ctx("bind to"))?;
+            return Ok(vec![(
+                listener,
+                Arc::new(RpcConnInfo::new(
+                    format!("rpc.listen.\"{}\"", config_key),
+                    auth,
+                    options,
+                    conn_pt.superuser_permission(),
+                )?),
+                guard,
+            )]);
+        }
+
+        if let Some(dir) = &self.dir {
+            let dir = dir.path(resolver)?;
+            debug!("Reading RPC connect directory at {}", dir.anonymize_home());
+            // Make a map of instructions from our `file_options` telling
+            // `ParsedConnectPoint::load_dir` about any filenames that might need special handling.
+            //
+            // (This is where we disable any connect point whose `file_options` ConnectPointOptions
+            // tells us it's disabled.)
+            let load_options: HashMap<std::path::PathBuf, LoadOptions> = self
+                .file_options
+                .iter()
+                .map(|(s, or)| (s.into(), or.load_options()))
+                .collect();
+            let mut listeners = Vec::new();
+            let dir_contents =
+                match ParsedConnectPoint::load_dir(dir.as_ref(), mistrust, &load_options) {
+                    Ok(contents) => contents,
+                    //  The spec says: "A nonexistent directory in `rpc.listen` is treated as if it
+                    //  were present but empty."
+                    Err(LoadError::Access(fs_mistrust::Error::NotFound(_))) => return Ok(vec![]),
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "Can't read RPC connect point directory at {}",
+                                dir.anonymize_home()
+                            )
+                        });
+                    }
+                };
+            for (path, conn_pt_result) in dir_contents {
+                debug!("Binding to connect point from {}", path.display_lossy());
+                let ctx = |action| {
+                    format!(
+                        "Can't {} RPC connect point {} from dir {}",
+                        action,
+                        path.display_lossy(),
+                        dir.anonymize_home()
+                    )
+                };
+
+                let options = {
+                    let mut bld = self.listener_options.clone();
+
+                    if let Some(override_options) = path
+                        .to_str()
+                        .and_then(|fname_as_str| self.file_options.get(fname_as_str))
+                    {
+                        bld.extend_from(override_options.clone(), ExtendStrategy::ReplaceLists);
+                    }
+                    bld.build().with_context(|| ctx("interpret options"))?
+                };
+
+                let conn_pt = conn_pt_result
+                    .with_context(|| ctx("load"))?
+                    .resolve(resolver)
+                    .with_context(|| ctx("resolve"))?;
+
+                let tor_rpc_connect::server::Listener {
+                    listener,
+                    auth,
+                    guard,
+                    ..
+                } = conn_pt
+                    .bind(runtime, mistrust)
+                    .await
+                    .with_context(|| ctx("bind to"))?;
+                listeners.push((
+                    listener,
+                    Arc::new(RpcConnInfo::new(
+                        format!("rpc.listen.\"{}\" ({})", config_key, path.display_lossy()),
+                        auth,
+                        options,
+                        conn_pt.superuser_permission(),
+                    )?),
+                    guard,
+                ));
+            }
+
+            return Ok(listeners);
+        }
+
+        Err(internal!("Constructed RpcListenerSetConfig had neither 'dir' nor 'file' set.").into())
+    }
+}
+
+/// As [`RpcListenerSetConfig`], but bind directly to a verbatim connect point given as a string.
+///
+/// Uses `index` to describe which default entry this connect point came from;
+/// `index` should be a human-readable 1-based index.
+pub(super) async fn bind_string<R: Runtime>(
+    connpt: &str,
+    index: usize,
+    runtime: &R,
+    resolver: &CfgPathResolver,
+    mistrust: &Mistrust,
+) -> anyhow::Result<(general::Listener, Arc<RpcConnInfo>, ListenerGuard)> {
+    let ctx = |action| format!("Can't {action} RPC connect point from rpc.listen_default.#{index}");
+
+    let conn_pt = ParsedConnectPoint::from_str(connpt)
+        .with_context(|| ctx("parse"))?
+        .resolve(resolver)
+        .with_context(|| ctx("resolve"))?;
+    let tor_rpc_connect::server::Listener {
+        listener,
+        auth,
+        guard,
+        ..
+    } = conn_pt
+        .bind(runtime, mistrust)
+        .await
+        .with_context(|| ctx("bind to"))?;
+    Ok((
+        listener,
+        Arc::new(RpcConnInfo::new(
+            format!("rpc.listen_default[(#{})]", index),
+            auth,
+            ConnectPointOptions::default(),
+            conn_pt.superuser_permission(),
+        )?),
+        guard,
+    ))
+}
+
+#[cfg(test)]
+mod test {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_time_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+
+    use super::*;
+
+    #[test]
+    fn parse_defaults() {
+        // mainly we're concerned that this doesn't panic.
+        let m = listener_map_defaults();
+        assert_eq!(m.len(), 2);
+    }
+}

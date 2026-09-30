@@ -1,0 +1,12 @@
+//! Background tasks of the arti-relay.
+//!
+//! This module has all background tasks/reactors that run in the background during the life time
+//! of a relay.
+
+pub(crate) mod channel;
+pub(crate) mod crypto;
+pub(crate) mod descriptor;
+pub(crate) mod listeners;
+
+pub(crate) use channel::ChannelHouseKeepingTask;
+pub(crate) use descriptor::RelayDescriptorPublisherTask;

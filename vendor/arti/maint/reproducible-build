@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+#
+# This script is run inside a docker container as part of our
+# reproducible build process.
+#
+set -xeuo pipefail
+if [ ! -f /.dockerenv ]; then
+    echo Not running inside Docker, build will probably not be reproducible
+    echo Use docker_reproducible_build instead to get the right environment
+fi
+if [ $# -eq 0 ]; then
+	echo usage : "$0" '<linux|windows|macos|android...>'
+	exit 1
+fi
+
+: "${CARGO:=cargo}" # quotes are just to placate shellcheck
+
+linux=""
+windows=""
+macos=""
+android=""
+while [ "$#" -ne 0 ]; do
+	case "$1" in
+	linux)   linux=1;;
+	windows) windows=1;;
+	macos)   macos=1;;
+	android) android=1;;
+	*)
+		echo "unknown target : $1" >&2
+		exit 1;;
+	esac
+	shift
+done
+
+here=$(pwd)
+
+## fix the target architecture to get reproducible builds
+## the architecture was chosen as old enough that it should cover most usage
+## while still supporting useful features like AES-NI. Older architectures
+## won't be able to execute the resulting binary.
+if [ -z $android ]; then
+  export CFLAGS="-march=westmere"
+  export RUSTFLAGS="-C target-cpu=westmere"
+fi
+export SOURCE_DATE_EPOCH="0"
+
+## force build to run in a fixed location. Necessary because the build path
+## is somehow captured when compiling.
+cp -a "$here" /arti
+cd /arti
+
+cargo_build () {
+	$CARGO build --locked "$@"
+}
+cargo_build_arti () {
+	cargo_build -p arti --release --features full,static "$@"
+}
+
+echo "android: '$android'"
+if [ -z $android ]; then
+  ## add missing dependencies
+  apk add perl make git musl-dev
+fi
+
+if [ -n "$linux" ]; then
+	## no additional dependencies specifically for Linux
+
+	## Build targeting x86_64-unknown-linux-musl to get a static binary
+	## feature "static" enable compiling some C dependencies instead of linking
+	## to system libraries. It is required to get a well behaving result.
+	cargo_build_arti --target x86_64-unknown-linux-musl
+	mv /arti/target/x86_64-unknown-linux-musl/release/arti "$here"/arti-linux
+fi
+if [ -n "$android" ]; then
+  cargo ndk --target aarch64-linux-android build --locked -p arti --release --features full,static
+  mv target/aarch64-linux-android/release/arti "$here"/arti-android-aarch64
+  "$ANDROID_NDK_ROOT"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip "$here"/arti-android-aarch64
+  cargo ndk --target armv7-linux-androideabi build --locked -p arti --release --features full,static
+  mv target/armv7-linux-androideabi/release/arti "$here"/arti-android-armv7
+  "$ANDROID_NDK_ROOT"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip "$here"/arti-android-armv7
+fi
+if [ -n "$windows" ]; then
+	apk add mingw-w64-gcc
+	rustup target add x86_64-pc-windows-gnu
+
+	## Same tweaks as for Linux, plus don't insert compilation timestamp into PE headers
+	RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,--no-insert-timestamp" \
+		cargo_build_arti --target x86_64-pc-windows-gnu
+	mv /arti/target/x86_64-pc-windows-gnu/release/arti.exe "$here"/arti-windows.exe
+fi
+if [ -n "$macos" ]; then
+	apk add bash cmake patch clang libc-dev libxml2-dev openssl-dev musl-fts-dev build-base python3 bsd-compat-headers xz
+	rustup target add x86_64-apple-darwin
+
+	# Architecture note: the "o64" tool prefix here chooses the right
+	# defaults for x86_64-apple-darwin.
+	#
+	# At some point, we should switch all the "o64" prefixes to to
+	# "o64a" for aarch64.
+
+	# This is the version of OSX that we try to build against.
+	export MACOSX_DEPLOYMENT_TARGET="10.14"
+
+	mkdir -p .cargo
+	# (note: "ar" seems to be unused here. We could probably remove it?)
+	cat > .cargo/config << EOF
+[target.x86_64-apple-darwin]
+linker = "o64-clang++"
+EOF
+
+	# Here we explain hw oto find the SDK we want.  This
+	# originally comes from apple upstream as a '.dmg'.  The copy
+	# below is an extacted '.pkg' in a cache maintained by the TB
+	# team.
+	#
+	# To upgrade the SDK:
+	#   - Make sure that OSX_SDK_URL is a .pkg file in buid-sources.tbb.tpo.
+	#   - Set OSX_SDK_VERSION to the versions of that SDK.
+	#   - Set OSX_PKG_SHA256 to the sha256 digest of that SDK's pkg file.
+	#   - Make sure that OSX_PKG is the base-name of that pkg file.
+	#
+	# This SDK doesn't need to be the most recent or the oldest;
+	# it does have to be at least as recent as our MACOSX_DEPLOYMENT_TARGET.
+	OSX_SDK_URL=https://build-sources.tbb.torproject.org/CLTools_macOSNMOS_SDK-15.5.pkg
+	OSX_SDK_VERSION=15.5
+	OSX_PKG="CLTools_macOSNMOS_SDK-${OSX_SDK_VERSION}.pkg"
+	OSX_PKG_SHA256=ba3453d62b3d2babf67f3a4a44e8073d6555c85f114856f4390a1f53bd76e24a
+	OSX_SDK="MacOSX${OSX_SDK_VERSION}.sdk.tar.xz"
+
+	## don't compile clang if it's already here (CI cache?)
+	## Make sure that it was built from the right SDK too.
+	if [ ! -x "/arti/osxcross-${OSX_SDK_VERSION}/target/bin/o64-clang" ]; then
+		# Step 1: Fetch locally cached OSX Command-line tools pkg file.
+		wget -nc "${OSX_SDK_URL}"
+		echo "${OSX_PKG_SHA256} ${OSX_PKG}" > ./sdk-checksum
+		sha256sum -c ./sdk-checksum
+
+		# Step 2: Extract the CommandLineTools directory from that package file,
+		# using a tool from the tor-browser-build repo.
+		rm -rf ./tor-browser-build/
+		git clone --depth 1 --sparse --filter=blob:none \
+		    https://gitlab.torproject.org/tpo/applications/tor-browser-build.git
+		cd ./tor-browser-build
+		git sparse-checkout set projects/macosx-toolchain
+		cd ./projects/macosx-toolchain
+		patch < tools.diff
+		python3 unpack-sdk.py \
+			"../../../${OSX_PKG}" \
+			"Library/Developer/" \
+			"../../.."
+		cd ../../..
+		# (Kludge: Remove the link from e.g. MacOSX15.sdk to MacOSX15.5.sdk,
+		# so we don't get duplicate package files in step 3 below.)
+		rm CommandLineTools/SDKs/MacOSX[0-9][0-9].sdk
+
+		# Step 3: Clone osxcross and build a package from the CommandLineTools
+		git clone https://github.com/tpoechtrager/osxcross "osxcross-${OSX_SDK_VERSION}"
+		cd "osxcross-${OSX_SDK_VERSION}"
+		XCODE_TOOLS_DIR=../CommandLineTools ./tools/gen_sdk_package_tools.sh
+		mv "${OSX_SDK}" ./tarballs
+
+		# Step 4: Build the osxcross toolchain using that package.
+		# (Todo: We could save time by building only the arch we want.)
+		UNATTENDED=1 BUILD_FLAVOR=stable OSX_VERSION_MIN="$MACOSX_DEPLOYMENT_TARGET" ./build.sh
+
+		# Step 5: copy it to gitlab build-dir so it may get cached
+		cp -R /arti/"osxcross-${OSX_SDK_VERSION}" "$here"
+		cd ..
+	fi
+
+	PATH="/arti/osxcross-${OSX_SDK_VERSION}/target/bin:$PATH" \
+		CC=o64-clang \
+		CXX=o64-clang++ \
+		cargo_build_arti --target x86_64-apple-darwin
+
+	mv /arti/target/x86_64-apple-darwin/release/arti "$here"/arti-macos
+fi
+
+git config --global --add safe.directory /arti
+
+set +x
+echo "branch       :" "$(git rev-parse --abbrev-ref HEAD)"
+echo "commit       :" "$(git rev-parse HEAD)"
+[ -z "$linux" ]   || echo "Linux hash   :" "$(sha256sum "$here"/arti-linux       | cut -d " " -f 1)"
+[ -z "$android" ]   || echo -e "Android hash   :" "\n$(sha256sum "$here"/arti-android* | cut -d " " -f 1)"
+[ -z "$windows" ] || echo "Windows hash :" "$(sha256sum "$here"/arti-windows.exe | cut -d " " -f 1)"
+[ -z "$macos" ]   || echo "MacOS hash   :" "$(sha256sum "$here"/arti-macos       | cut -d " " -f 1)"

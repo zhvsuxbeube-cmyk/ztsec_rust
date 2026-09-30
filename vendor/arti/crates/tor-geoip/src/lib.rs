@@ -1,0 +1,610 @@
+//! A crate for performing GeoIP lookups using the Tor GeoIP database.
+
+// @@ begin lint list maintained by maint/add_warning @@
+#![allow(renamed_and_removed_lints)] // @@REMOVE_WHEN(ci_arti_stable)
+#![allow(unknown_lints)] // @@REMOVE_WHEN(ci_arti_nightly)
+#![warn(missing_docs)]
+#![warn(noop_method_call)]
+#![warn(unreachable_pub)]
+#![warn(clippy::all)]
+#![deny(clippy::await_holding_lock)]
+#![deny(clippy::cargo_common_metadata)]
+#![deny(clippy::cast_lossless)]
+#![deny(clippy::checked_conversions)]
+#![allow(clippy::cognitive_complexity)] // See arti#2556
+#![deny(clippy::debug_assert_with_mut_call)]
+#![deny(clippy::exhaustive_enums)]
+#![deny(clippy::exhaustive_structs)]
+#![deny(clippy::expl_impl_clone_on_copy)]
+#![deny(clippy::fallible_impl_from)]
+#![deny(clippy::implicit_clone)]
+#![deny(clippy::large_stack_arrays)]
+#![warn(clippy::manual_ok_or)]
+#![deny(clippy::missing_docs_in_private_items)]
+#![warn(clippy::needless_borrow)]
+#![warn(clippy::needless_pass_by_value)]
+#![warn(clippy::option_option)]
+#![deny(clippy::print_stderr)]
+#![deny(clippy::print_stdout)]
+#![warn(clippy::rc_buffer)]
+#![deny(clippy::ref_option_ref)]
+#![warn(clippy::semicolon_if_nothing_returned)]
+#![warn(clippy::trait_duplication_in_bounds)]
+#![deny(clippy::unchecked_time_subtraction)]
+#![deny(clippy::unnecessary_wraps)]
+#![warn(clippy::unseparated_literal_suffix)]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::mod_module_files)]
+#![allow(clippy::let_unit_value)] // This can reasonably be done for explicitness
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::significant_drop_in_scrutinee)] // arti/-/merge_requests/588/#note_2812945
+#![allow(clippy::result_large_err)] // temporary workaround for arti#587
+#![allow(clippy::needless_raw_string_hashes)] // complained-about code is fine, often best
+#![allow(clippy::needless_lifetimes)] // See arti#1765
+#![allow(mismatched_lifetime_syntaxes)] // temporary workaround for arti#2060
+#![allow(clippy::collapsible_if)] // See arti#2342
+#![deny(clippy::unused_async)]
+#![deny(clippy::string_slice)] // See arti#2571
+#![allow(recursion_depth_exceeding_limit)] // arti#2715, rust/issues/159228
+//! <!-- @@ end lint list maintained by maint/add_warning @@ -->
+
+// TODO #1645 (either remove this, or decide to have it everywhere)
+#![cfg_attr(not(all(feature = "full")), allow(unused))]
+
+use crate::dense_range_map::DenseRangeMap;
+pub use crate::err::Error;
+use std::fmt::{Debug, Display, Formatter};
+use std::net::{IpAddr, Ipv6Addr};
+use std::num::{NonZeroU16, NonZeroU32};
+use std::ops::RangeInclusive;
+use std::str::FromStr;
+use std::sync::{Arc, OnceLock};
+
+mod dense_range_map;
+mod err;
+
+/// A parsed copy of the embedded database.
+#[cfg(feature = "embedded-db")]
+static EMBEDDED_DB_PARSED: OnceLock<Arc<GeoipDb>> = OnceLock::new();
+
+/// A two-letter country code.
+///
+/// Specifically, this type represents a purported "ISO 3166-1 alpha-2" country
+/// code, such as "IT" for Italy or "UY" for Uruguay.
+///
+/// It does not include the sentinel value `??` that we use to represent
+/// "country unknown"; if you need that, use [`OptionCc`]. Other than that, we
+/// do not check whether the country code represents a real country: we only
+/// ensure that it is a pair of printing ASCII characters.
+///
+/// Note that the geoip databases included with Arti will only include real
+/// countries; we do not include the pseudo-countries `A1` through `An` for
+/// "anonymous proxies", since doing so would mean putting nearly all Tor relays
+/// into one of those countries.
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct CountryCode {
+    /// The underlying value (two printable ASCII characters, stored uppercase).
+    ///
+    /// The special value `??` is excluded, since it is not a country; use
+    /// `OptionCc` instead if you need to represent that.
+    ///
+    /// We store these as `NonZeroU16` so that an `Option<CountryCode>` only has to
+    /// take 2 bytes. This helps with alignment and storage.
+    ///
+    /// (We use a `NonZeroU16` rather than `[NonZeroU8; 2]` to ensure that every
+    /// bit representation is a valid `Option<CountryCode>`.)
+    inner: NonZeroU16,
+}
+
+impl CountryCode {
+    /// Make a new `CountryCode`.
+    fn new(cc_orig: &str) -> Result<Self, Error> {
+        /// Try to convert an array of 2 bytes into a NonZeroU16.
+        #[inline]
+        fn try_cvt_to_nz(inp: [u8; 2]) -> Result<NonZeroU16, Error> {
+            if inp[0] == 0 || inp[1] == 0 {
+                return Err(Error::BadCountryCode("Country code contained NULs".into()));
+            }
+            Ok(u16::from_ne_bytes(inp)
+                .try_into()
+                .expect("zero arrived surprisingly"))
+        }
+
+        let cc = cc_orig.to_ascii_uppercase();
+
+        let cc: [u8; 2] = cc
+            .as_bytes()
+            .try_into()
+            .map_err(|_| Error::BadCountryCode(cc))?;
+
+        if !cc.iter().all(|b| b.is_ascii() && !b.is_ascii_control()) {
+            return Err(Error::BadCountryCode(cc_orig.to_owned()));
+        }
+
+        if &cc == b"??" {
+            return Err(Error::NowhereNotSupported);
+        }
+
+        Ok(Self {
+            inner: try_cvt_to_nz(cc).map_err(|_| Error::BadCountryCode(cc_orig.to_owned()))?,
+        })
+    }
+
+    /// Get the actual country code.
+    ///
+    /// This just calls `.as_ref()`.
+    pub fn get(&self) -> &str {
+        self.as_ref()
+    }
+}
+
+impl Display for CountryCode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_ref())
+    }
+}
+
+impl Debug for CountryCode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CountryCode(\"{}\")", self.as_ref())
+    }
+}
+
+impl AsRef<str> for CountryCode {
+    fn as_ref(&self) -> &str {
+        /// Convert a reference to a NonZeroU16 to a reference to
+        /// an array of 2 bytes.
+        #[inline]
+        fn cvt_ref(inp: &NonZeroU16) -> &[u8; 2] {
+            // SAFETY: Every NonZeroU16 has a layout, alignment, and bit validity that is
+            // also a valid [u8; 2].  The layout of arrays is also guaranteed.
+            //
+            // (We don't use try_into here because we need to return a str that
+            // points to a reference to self.)
+            let slice: &[NonZeroU16] = std::slice::from_ref(inp);
+            let (_, slice, _) = unsafe { slice.align_to::<u8>() };
+            slice
+                .try_into()
+                .expect("the resulting slice should have the correct length!")
+        }
+
+        // This shouldn't ever panic, since we shouldn't feed non-utf8 country
+        // codes in.
+        //
+        // In theory we could use from_utf8_unchecked, but that's probably not
+        // needed.
+        std::str::from_utf8(cvt_ref(&self.inner)).expect("invalid country code in CountryCode")
+    }
+}
+
+impl FromStr for CountryCode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        CountryCode::new(s)
+    }
+}
+
+/// Wrapper for an `Option<`[`CountryCode`]`>` that encodes `None` as `??`.
+///
+/// Used so that we can implement foreign traits.
+#[derive(
+    Copy, Clone, Debug, Eq, PartialEq, derive_more::Into, derive_more::From, derive_more::AsRef,
+)]
+#[allow(clippy::exhaustive_structs)]
+pub struct OptionCc(pub Option<CountryCode>);
+
+impl FromStr for OptionCc {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match CountryCode::new(s) {
+            Err(Error::NowhereNotSupported) => Ok(None.into()),
+            Err(e) => Err(e),
+            Ok(cc) => Ok(Some(cc).into()),
+        }
+    }
+}
+
+impl Display for OptionCc {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(cc) => write!(f, "{}", cc),
+            None => write!(f, "??"),
+        }
+    }
+}
+
+/// The type of an ASN.
+type Asn = NonZeroU32;
+
+/// A database of IP addresses to country codes.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct GeoipDb {
+    /// The IPv4 subset of the database, with v4 addresses stored as 32-bit integers.
+    map_v4: DenseRangeMap<u32, CountryCode, Asn>,
+    /// The IPv6 subset of the database, with v6 addresses stored as 128-bit integers.
+    map_v6: DenseRangeMap<u128, CountryCode, Asn>,
+}
+
+impl GeoipDb {
+    /// Make a new `GeoipDb` using a compiled-in copy of the GeoIP database.
+    ///
+    /// The returned instance of the database is shared with `Arc` across all invocations of this
+    /// function in the same program.
+    #[cfg(feature = "embedded-db")]
+    pub fn new_embedded() -> Arc<Self> {
+        Arc::clone(EMBEDDED_DB_PARSED.get_or_init(|| {
+            use tor_geoip_db as db;
+            fn cvt_ccs(ccs: &'static [Option<NonZeroU16>]) -> &'static [Option<CountryCode>] {
+                // SAFETY: CountryCode is a repr(transparent) for NonZeroU16.
+                let (pre, data, post) = unsafe { ccs.align_to::<Option<CountryCode>>() };
+                assert!(pre.is_empty());
+                assert!(post.is_empty());
+                data
+            }
+
+            let map_v4 = DenseRangeMap::from_static_parts(db::ipv4s(), cvt_ccs(db::ipv4c()), None);
+            let map_v6 = DenseRangeMap::from_static_parts(db::ipv6s(), cvt_ccs(db::ipv6c()), None);
+
+            Arc::new(
+                // It's reasonable to assume the one we embedded is fine --
+                // we'll test it in CI, etc.
+                GeoipDb { map_v4, map_v6 },
+            )
+        }))
+    }
+
+    /// Make a new `GeoipDb` using provided copies of the v4 and v6 database, in Tor legacy format.
+    pub fn new_from_legacy_format(
+        db_v4: &str,
+        db_v6: &str,
+        include_asn: bool,
+    ) -> Result<Self, Error> {
+        let discard_asn = !include_asn;
+        let map_v4 = DenseRangeMap::try_from_sorted_inclusive_ranges(
+            db_v4
+                .lines()
+                .filter_map(|line| parse_line::<u32>(line).transpose()),
+            discard_asn,
+        )?;
+
+        let map_v6 = DenseRangeMap::try_from_sorted_inclusive_ranges(
+            db_v6
+                .lines()
+                .filter_map(|line| parse_line::<Ipv6Addr>(line).transpose()),
+            discard_asn,
+        )?;
+
+        Ok(Self { map_v4, map_v6 })
+    }
+
+    /// Return the database in a raw format suitable for embedding.
+    ///
+    /// This method and the format it returns are unstable.
+    /// This method should only be used for maintaining the database.
+    #[cfg(feature = "export")]
+    #[allow(clippy::type_complexity)]
+    pub fn export_raw(&self) -> RawGeoipDbExport {
+        let (ipv4_starts, ipv4_ccs, ipv4_asns) = self.map_v4.export();
+        let (ipv6_starts, ipv6_ccs, ipv6_asns) = self.map_v6.export();
+
+        RawGeoipDbExport {
+            ipv4_starts,
+            ipv4_ccs,
+            ipv4_asns,
+            ipv6_starts,
+            ipv6_ccs,
+            ipv6_asns,
+        }
+    }
+
+    /// Get a 2-letter country code for the given IP address, if this data is available.
+    pub fn lookup_country_code(&self, ip: IpAddr) -> Option<&CountryCode> {
+        match ip {
+            IpAddr::V4(v4) => self.map_v4.get1(&v4.into()),
+            IpAddr::V6(v6) => self.map_v6.get1(&v6.into()),
+        }
+    }
+
+    /// Determine a 2-letter country code for a host with multiple IP addresses.
+    ///
+    /// This looks up all of the IP addresses with `lookup_country_code`. If the lookups
+    /// return different countries, `None` is returned. IP addresses that fail to resolve
+    /// into a country are ignored if some of the other addresses do resolve successfully.
+    pub fn lookup_country_code_multi<I>(&self, ips: I) -> Option<&CountryCode>
+    where
+        I: IntoIterator<Item = IpAddr>,
+    {
+        let mut ret = None;
+
+        for ip in ips {
+            if let Some(cc) = self.lookup_country_code(ip) {
+                // If we already have a return value and it's different, then return None;
+                // a server can't be in two different countries.
+                if ret.is_some() && ret != Some(cc) {
+                    return None;
+                }
+
+                ret = Some(cc);
+            }
+        }
+
+        ret
+    }
+
+    /// Return the ASN the IP address is in, if this data is available.
+    pub fn lookup_asn(&self, ip: IpAddr) -> Option<u32> {
+        let cc = match ip {
+            IpAddr::V4(v4) => self.map_v4.get2(&v4.into()),
+            IpAddr::V6(v6) => self.map_v6.get2(&v6.into()),
+        };
+        cc.map(|nz| nz.get())
+    }
+}
+
+/// A type that can be an address entry in one of our databases.
+trait DbAddress: FromStr {
+    /// The integer that we use to represent this kind of address.
+    type Int;
+
+    /// Convert this address to an integer.
+    fn to_int(&self) -> Self::Int;
+}
+
+impl DbAddress for u32 {
+    type Int = u32;
+
+    fn to_int(&self) -> Self::Int {
+        *self
+    }
+}
+
+impl DbAddress for Ipv6Addr {
+    type Int = u128;
+
+    fn to_int(&self) -> Self::Int {
+        (*self).into()
+    }
+}
+
+/// A line as returned by [`parse_line`].
+type ParsedLine<T> = (RangeInclusive<T>, Option<CountryCode>, Option<Asn>);
+
+/// Parse a single line from a database, expecting addresses of type T.
+///
+/// Return Ok(None) if the line is empty.
+fn parse_line<T: DbAddress>(line: &str) -> Result<Option<ParsedLine<T::Int>>, Error>
+where
+    Error: From<<T as FromStr>::Err>,
+{
+    if line.starts_with('#') {
+        return Ok(None);
+    }
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+
+    let mut split = line.split(',');
+    let from = split
+        .next()
+        .ok_or(Error::BadFormat("empty line somehow?".into()))?
+        .parse::<T>()?
+        .to_int();
+    let to = split
+        .next()
+        .ok_or(Error::BadFormat("line with insufficient commas".into()))?
+        .parse::<T>()?
+        .to_int();
+    let cc = split
+        .next()
+        .ok_or(Error::BadFormat("line with insufficient commas".into()))?;
+    let cc = match cc {
+        "" => None,
+        cc => OptionCc::from_str(cc)?.0,
+    };
+    let asn = split.next().map(|x| x.parse::<u32>()).transpose()?;
+    // Treat "0" as "no asn".
+    let asn = asn.map(NonZeroU32::try_from).transpose().ok().flatten();
+
+    Ok(Some((from..=to, cc, asn)))
+}
+
+/// A (representation of a) host on the network which may have a known country code.
+pub trait HasCountryCode {
+    /// Return the country code in which this server is most likely located.
+    ///
+    /// This is usually implemented by simple GeoIP lookup on the addresses provided by `HasAddrs`.
+    /// It follows that the server might not actually be in the returned country, but this is a
+    /// halfway decent estimate for what other servers might guess the server's location to be
+    /// (and thus useful for e.g. getting around simple geo-blocks, or having webpages return
+    /// the correct localised versions).
+    ///
+    /// Returning `None` signifies that no country code information is available. (Conflicting
+    /// GeoIP lookup results might also cause `None` to be returned.)
+    fn country_code(&self) -> Option<CountryCode>;
+}
+
+/// An export of a GeoIp database in a raw format suitable for embedding.
+///
+/// This format is deliberately undocumented, and not for other uses.
+#[cfg(feature = "export")]
+#[allow(clippy::exhaustive_structs, missing_docs)]
+pub struct RawGeoipDbExport<'a> {
+    pub ipv4_starts: &'a [u32],
+    pub ipv4_ccs: &'a [Option<CountryCode>],
+    pub ipv4_asns: Option<&'a [Option<NonZeroU32>]>,
+    pub ipv6_starts: &'a [u128],
+    pub ipv6_ccs: &'a [Option<CountryCode>],
+    pub ipv6_asns: Option<&'a [Option<NonZeroU32>]>,
+}
+
+#[cfg(feature = "export")]
+impl<'a> RawGeoipDbExport<'a> {
+    /// Save the contents of this export into a set of data files in "Path".
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::fs::write;
+        fn into_bytes<'a, T>(data: &'a [T]) -> &'a [u8] {
+            // SAFETY: Every possible bit sequence is a valid u8.
+            let (pre, data, post) = unsafe { data.align_to::<u8>() };
+            assert!(pre.is_empty());
+            assert!(post.is_empty());
+            data
+        }
+        write(path.join("geoip_data_v4s"), into_bytes(self.ipv4_starts))?;
+        write(path.join("geoip_data_v4c"), into_bytes(self.ipv4_ccs))?;
+        if let Some(asns) = self.ipv4_asns {
+            write(path.join("geoip_data_v4a"), into_bytes(asns))?;
+        }
+        write(path.join("geoip_data_v6s"), into_bytes(self.ipv6_starts))?;
+        write(path.join("geoip_data_v6c"), into_bytes(self.ipv6_ccs))?;
+        if let Some(asns) = self.ipv6_asns {
+            write(path.join("geoip_data_v6a"), into_bytes(asns))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    // @@ begin test lint list maintained by maint/add_warning @@
+    #![allow(clippy::bool_assert_comparison)]
+    #![allow(clippy::clone_on_copy)]
+    #![allow(clippy::dbg_macro)]
+    #![allow(clippy::mixed_attributes_style)]
+    #![allow(clippy::print_stderr)]
+    #![allow(clippy::print_stdout)]
+    #![allow(clippy::single_char_pattern)]
+    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unchecked_time_subtraction)]
+    #![allow(clippy::useless_vec)]
+    #![allow(clippy::needless_pass_by_value)]
+    #![allow(clippy::string_slice)] // See arti#2571
+    //! <!-- @@ end test lint list maintained by maint/add_warning @@ -->
+
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    // NOTE(eta): this test takes a whole 1.6 seconds in *non-release* mode
+    #[test]
+    #[cfg(feature = "embedded-db")]
+    fn embedded_db() {
+        let db = GeoipDb::new_embedded();
+
+        assert_eq!(
+            db.lookup_country_code(Ipv4Addr::new(8, 8, 8, 8).into())
+                .map(|x| x.as_ref()),
+            Some("US")
+        );
+
+        assert_eq!(
+            db.lookup_country_code("2001:4860:4860::8888".parse().unwrap())
+                .map(|x| x.as_ref()),
+            Some("US")
+        );
+    }
+
+    #[test]
+    fn cc_rep() {
+        let italy = CountryCode::new("IT").unwrap();
+        assert_eq!(italy.as_ref(), "IT");
+    }
+
+    #[test]
+    fn basic_lookups() {
+        let src_v4 = r#"
+        16909056,16909311,GB
+        "#;
+        let src_v6 = r#"
+        dead:beef::,dead:ffff::,??
+        fe80::,fe81::,US
+        "#;
+        let db = GeoipDb::new_from_legacy_format(src_v4, src_v6, true).unwrap();
+
+        assert_eq!(
+            db.lookup_country_code(Ipv4Addr::new(1, 2, 3, 4).into())
+                .map(|x| x.as_ref()),
+            Some("GB")
+        );
+
+        assert_eq!(
+            db.lookup_country_code(Ipv4Addr::new(1, 1, 1, 1).into()),
+            None
+        );
+
+        assert_eq!(
+            db.lookup_country_code("fe80::dead:beef".parse().unwrap())
+                .map(|x| x.as_ref()),
+            Some("US")
+        );
+
+        assert_eq!(
+            db.lookup_country_code("fe81::dead:beef".parse().unwrap()),
+            None
+        );
+        assert_eq!(
+            db.lookup_country_code("dead:beef::1".parse().unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn cc_parse() -> Result<(), Error> {
+        // real countries.
+        assert_eq!(CountryCode::from_str("us")?, CountryCode::from_str("US")?);
+        assert_eq!(CountryCode::from_str("UY")?, CountryCode::from_str("UY")?);
+
+        // not real as of this writing, but still representable.
+        assert_eq!(CountryCode::from_str("A7")?, CountryCode::from_str("a7")?);
+        assert_eq!(CountryCode::from_str("xz")?, CountryCode::from_str("xz")?);
+
+        // Can't convert to two bytes.
+        assert!(matches!(
+            CountryCode::from_str("z"),
+            Err(Error::BadCountryCode(_))
+        ));
+        assert!(matches!(
+            CountryCode::from_str("🐻‍❄️"),
+            Err(Error::BadCountryCode(_))
+        ));
+        assert!(matches!(
+            CountryCode::from_str("Sheboygan"),
+            Err(Error::BadCountryCode(_))
+        ));
+
+        // Can convert to two bytes, but still not printable ascii
+        assert!(matches!(
+            CountryCode::from_str("\r\n"),
+            Err(Error::BadCountryCode(_))
+        ));
+        assert!(matches!(
+            CountryCode::from_str("\0\0"),
+            Err(Error::BadCountryCode(_))
+        ));
+        assert!(matches!(
+            CountryCode::from_str("¡"),
+            Err(Error::BadCountryCode(_))
+        ));
+
+        // Not a country.
+        assert!(matches!(
+            CountryCode::from_str("??"),
+            Err(Error::NowhereNotSupported)
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn opt_cc_parse() -> Result<(), Error> {
+        assert_eq!(
+            CountryCode::from_str("br")?,
+            OptionCc::from_str("BR")?.0.unwrap()
+        );
+        assert!(OptionCc::from_str("??")?.0.is_none());
+
+        Ok(())
+    }
+}

@@ -1,0 +1,392 @@
+//! Implement a simple DNS resolver that relay request over Tor.
+//!
+//! A resolver is created with [`bind_dns_resolver()`], which opens a set of listener ports.
+//! `DnsProxy::run_dns_proxy` then listens for
+//! DNS requests, and sends back replies in response.
+
+use futures::lock::Mutex;
+use futures::stream::StreamExt;
+use hickory_proto::op::{Message, OpCode, Query, ResponseCode};
+use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType, rdata};
+use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use tor_rtcompat::{SpawnExt, UdpProvider};
+use tracing::{debug, error, info, warn};
+
+use arti_client::{Error, HasKind, StreamPrefs, TorClient};
+use safelog::sensitive as sv;
+use tor_config::Listen;
+use tor_error::{error_report, warn_report};
+use tor_rtcompat::{Runtime, UdpSocket};
+
+use anyhow::{Result, anyhow};
+
+use crate::proxy::port_info;
+
+/// Maximum length for receiving a single datagram
+const MAX_DATAGRAM_SIZE: usize = 1536;
+
+/// A Key used to isolate dns requests.
+///
+/// Composed of an usize (representing which listener socket accepted
+/// the connection and the source IpAddr of the client)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DnsIsolationKey(usize, IpAddr);
+
+impl arti_client::isolation::IsolationHelper for DnsIsolationKey {
+    fn compatible_same_type(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn join_same_type(&self, other: &Self) -> Option<Self> {
+        if self == other {
+            Some(self.clone())
+        } else {
+            None
+        }
+    }
+
+    fn enables_long_lived_circuits(&self) -> bool {
+        false
+    }
+}
+
+/// Identifier for a DNS request, composed of its source IP and transaction ID
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DnsCacheKey(DnsIsolationKey, Vec<Query>);
+
+/// Target for a DNS response
+#[derive(Debug, Clone)]
+struct DnsResponseTarget<U> {
+    /// Transaction ID
+    id: u16,
+    /// Address of the client
+    addr: SocketAddr,
+    /// Socket to send the response through
+    socket: Arc<U>,
+}
+
+/// Run a DNS query over tor, returning either a list of answers, or a DNS error code.
+async fn do_query<R>(
+    tor_client: &TorClient<R>,
+    query: &Query,
+    prefs: &StreamPrefs,
+) -> Result<Vec<Record>, ResponseCode>
+where
+    R: Runtime,
+{
+    let mut answers = Vec::new();
+
+    let err_conv = |error: Error| {
+        if tor_error::ErrorKind::RemoteHostNotFound == error.kind() {
+            // NoError without any body is considered to be NODATA as per rfc2308 section-2.2
+            ResponseCode::NoError
+        } else {
+            ResponseCode::ServFail
+        }
+    };
+
+    let mut a = Vec::new();
+    let mut ptr = Vec::new();
+
+    match query.query_class() {
+        DNSClass::IN => {
+            match query.query_type() {
+                typ @ RecordType::A | typ @ RecordType::AAAA => {
+                    let mut name = query.name().clone();
+                    // name would be "torproject.org." without this
+                    name.set_fqdn(false);
+                    let res = tor_client
+                        .resolve_with_prefs(&name.to_utf8(), prefs)
+                        .await
+                        .map_err(err_conv)?;
+                    for ip in res {
+                        a.push((query.name().clone(), ip, typ));
+                    }
+                }
+                RecordType::PTR => {
+                    let addr = query
+                        .name()
+                        .parse_arpa_name()
+                        .map_err(|_| ResponseCode::FormErr)?
+                        .addr();
+                    let res = tor_client
+                        .resolve_ptr_with_prefs(addr, prefs)
+                        .await
+                        .map_err(err_conv)?;
+                    for domain in res {
+                        let domain = Name::from_utf8(domain).map_err(|_| ResponseCode::ServFail)?;
+                        ptr.push((query.name().clone(), domain));
+                    }
+                }
+                _ => {
+                    return Err(ResponseCode::NotImp);
+                }
+            }
+        }
+        _ => {
+            return Err(ResponseCode::NotImp);
+        }
+    }
+    for (name, ip, typ) in a {
+        match (ip, typ) {
+            (IpAddr::V4(v4), RecordType::A) => {
+                answers.push(Record::from_rdata(name, 3600, RData::A(rdata::A(v4))));
+            }
+            (IpAddr::V6(v6), RecordType::AAAA) => {
+                answers.push(Record::from_rdata(name, 3600, RData::AAAA(rdata::AAAA(v6))));
+            }
+            _ => (),
+        }
+    }
+    for (ptr, name) in ptr {
+        answers.push(Record::from_rdata(ptr, 3600, RData::PTR(rdata::PTR(name))));
+    }
+
+    Ok(answers)
+}
+
+/// Given a datagram containing a DNS query, resolve the query over
+/// the Tor network and send the response back.
+async fn handle_dns_req<R, U>(
+    tor_client: &TorClient<R>,
+    socket_id: usize,
+    packet: &[u8],
+    addr: SocketAddr,
+    socket: Arc<U>,
+    current_requests: &Mutex<HashMap<DnsCacheKey, Vec<DnsResponseTarget<U>>>>,
+) -> Result<()>
+where
+    R: Runtime,
+    U: UdpSocket,
+{
+    // if we can't parse the request, don't try to answer it.
+    let query = Message::from_bytes(packet)?;
+    let id = query.metadata.id;
+    let queries = query.queries;
+    let isolation = DnsIsolationKey(socket_id, addr.ip());
+
+    let request_id = {
+        let request_id = DnsCacheKey(isolation.clone(), queries.clone());
+
+        let response_target = DnsResponseTarget { id, addr, socket };
+
+        let mut current_requests = current_requests.lock().await;
+
+        let req = current_requests.entry(request_id.clone()).or_default();
+        req.push(response_target);
+
+        if req.len() > 1 {
+            debug!("Received a query already being served");
+            return Ok(());
+        }
+        debug!("Received a new query");
+
+        request_id
+    };
+
+    let mut response: Message;
+    // According to rfc9619 there should only be 1 query per request. This constraint would
+    // need to be relaxed for things like DNS cookies.
+    if queries.len() != 1 {
+        response = Message::error_msg(id, OpCode::Query, ResponseCode::FormErr);
+    } else {
+        let mut prefs = StreamPrefs::new();
+        prefs.set_isolation(isolation);
+
+        response = match do_query(tor_client, &queries[0], &prefs).await {
+            Ok(answers) => {
+                let mut response = Message::response(id, OpCode::Query);
+                response.metadata.recursion_desired = query.metadata.recursion_desired;
+                response.metadata.recursion_available = true;
+                response.add_queries(queries).add_answers(answers);
+                // TODO maybe add some edns?
+                response
+            }
+            Err(error_type) => Message::error_msg(id, OpCode::Query, error_type),
+        };
+    }
+
+    // remove() should never return None, but just in case
+    let targets = current_requests
+        .lock()
+        .await
+        .remove(&request_id)
+        .unwrap_or_default();
+
+    for target in targets {
+        response.metadata.id = target.id;
+        // ignore errors, we want to reply to everybody
+        let response = match response.to_bytes() {
+            Ok(r) => r,
+            Err(e) => {
+                // The response message probably contains the query DNS name, and the error
+                // might well do so too.  (Many variants of hickory_proto's ProtoErrorKind
+                // contain domain names.)  Digging into these to be more useful is tiresome,
+                // so just mark the whole response message, and error, as sensitive.
+                error_report!(e, "Failed to serialize DNS packet: {:?}", sv(&response));
+                continue;
+            }
+        };
+        let _ = target.socket.send(&response, &target.addr).await;
+    }
+    Ok(())
+}
+
+/// A DNS proxy server that can run indefinitely.
+#[cfg_attr(feature = "experimental-api", visibility::make(pub))]
+#[must_use]
+pub(crate) struct DnsProxy<R: Runtime> {
+    /// A list of bound UDP sockets.
+    udp_sockets: Vec<<R as UdpProvider>::UdpSocket>,
+    /// A tor client to handle DNS requests.
+    tor_client: Arc<TorClient<R>>,
+}
+
+/// Bind to a set of DNS ports, and return a new DnsProxy.
+///
+/// Takes no action until `run_dns_proxy` is called.
+#[cfg_attr(feature = "experimental-api", visibility::make(pub))]
+pub(crate) async fn bind_dns_resolver<R: Runtime>(
+    runtime: R,
+    tor_client: Arc<TorClient<R>>,
+    listen: Listen,
+) -> Result<DnsProxy<R>> {
+    if !listen.is_loopback_only() {
+        warn!(
+            "Configured to listen for DNS on non-local addresses. This is usually insecure! We recommend listening on localhost only."
+        );
+    }
+
+    let mut listeners = Vec::new();
+
+    // Try to bind to the DNS ports.
+    match listen.ip_addrs() {
+        Ok(addrgroups) => {
+            for addrgroup in addrgroups {
+                let mut any_success: bool = false;
+                for addr in addrgroup {
+                    // NOTE: Our logs here displays the local address. We allow this, since
+                    // knowing the address is basically essential for diagnostics.
+                    match runtime.bind(&addr).await {
+                        Ok(listener) => {
+                            let bound_addr = listener.local_addr()?;
+                            info!("Listening on {:?}.", bound_addr);
+                            listeners.push(listener);
+                            any_success = true;
+                        }
+                        #[cfg(unix)]
+                        Err(ref e) if e.raw_os_error() == Some(libc::EAFNOSUPPORT) => {
+                            warn_report!(e, "Address family not supported {}", addr);
+                        }
+                        Err(ref e) => {
+                            return Err(anyhow!("Can't listen on {}: {e}", addr));
+                        }
+                    }
+                }
+
+                if !any_success {
+                    return Err(anyhow!("All addresses failed to bind in a group"));
+                }
+            }
+        }
+        Err(e) => warn_report!(e, "Invalid listen spec"),
+    }
+    // We weren't able to bind any ports: There's nothing to do.
+    if listeners.is_empty() {
+        error!("Couldn't open any DNS listeners.");
+        return Err(anyhow!("Couldn't open any DNS listeners"));
+    }
+
+    Ok(DnsProxy {
+        tor_client,
+        udp_sockets: listeners,
+    })
+}
+
+impl<R: Runtime> DnsProxy<R> {
+    /// Run indefinitely, receiving incoming DNS requests and processing them.
+    pub(crate) async fn run_dns_proxy(self) -> Result<()> {
+        let DnsProxy {
+            tor_client,
+            udp_sockets,
+        } = self;
+        run_dns_resolver_with_listeners(tor_client.runtime().clone(), tor_client, udp_sockets).await
+    }
+
+    /// Return a list of the port addresses that we have bound.
+    pub(crate) fn port_info(&self) -> Result<Vec<port_info::Port>> {
+        Ok(self
+            .udp_sockets
+            .iter()
+            .map(|socket| {
+                socket.local_addr().map(|address| port_info::Port {
+                    protocol: port_info::SupportedProtocol::DnsUdp,
+                    address: address.into(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+/// Inner task: Receive incoming DNS requests and process them.
+async fn run_dns_resolver_with_listeners<R: Runtime>(
+    runtime: R,
+    tor_client: Arc<TorClient<R>>,
+    listeners: Vec<<R as tor_rtcompat::UdpProvider>::UdpSocket>,
+) -> Result<()> {
+    let mut incoming = futures::stream::select_all(
+        listeners
+            .into_iter()
+            .map(|socket| {
+                futures::stream::unfold(Arc::new(socket), |socket| async {
+                    let mut packet = [0; MAX_DATAGRAM_SIZE];
+                    let packet = socket
+                        .recv(&mut packet)
+                        .await
+                        .map(|(size, remote)| (packet, size, remote, socket.clone()));
+                    Some((packet, socket))
+                })
+            })
+            .enumerate()
+            .map(|(listener_id, incoming_packet)| {
+                Box::pin(incoming_packet.map(move |packet| (packet, listener_id)))
+            }),
+    );
+
+    let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+    while let Some((packet, id)) = incoming.next().await {
+        let (packet, size, addr, socket) = match packet {
+            Ok(packet) => packet,
+            Err(err) => {
+                // TODO move crate::socks::accept_err_is_fatal somewhere else and use it here?
+                warn_report!(err, "Incoming datagram failed");
+                continue;
+            }
+        };
+
+        let client_ref = tor_client.clone();
+        runtime.spawn({
+            let pending_requests = pending_requests.clone();
+            async move {
+                let res = handle_dns_req(
+                    &client_ref,
+                    id,
+                    &packet[..size],
+                    addr,
+                    socket,
+                    &pending_requests,
+                )
+                .await;
+                if let Err(e) = res {
+                    // TODO: warn_report does not work on anyhow::Error.
+                    warn!("connection exited with error: {}", tor_error::Report(e));
+                }
+            }
+        })?;
+    }
+
+    Ok(())
+}
