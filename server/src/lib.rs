@@ -190,7 +190,7 @@ impl Server {
                     return Err(error);
                 }
             };
-            info!(address = %service.onion_address().map(|a| a.to_string()).unwrap_or_else(|| "<pending>".into()), "onion service started");
+            info!(address = ?service.onion_address(), "onion service started");
             let server = self.clone_for_task();
             let onion_task = tokio::spawn(async move {
                 server.accept_onion_requests(request_stream).await;
@@ -273,7 +273,7 @@ impl Server {
     }
 
     async fn accept_onion_requests(self, request_stream: impl futures_util::Stream<Item = tor_hsservice::RendRequest>) {
-        let mut stream_requests = tor_hsservice::handle_rend_requests(request_stream);
+        let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
         tokio::pin!(stream_requests);
         let mut shutdown = self.shutdown.subscribe();
         loop {
@@ -347,7 +347,7 @@ impl Server {
         }
     }
 
-    async fn websocket_session<S>(self, stream: S, peer: &str) -> io::Result<()>
+    async fn websocket_session<S>(&self, stream: S, peer: &str) -> io::Result<()>
     where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
         let expected_path = self.config.websocket_path.clone();
         let callback = move |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response: tokio_tungstenite::tungstenite::handshake::server::Response| {
@@ -359,29 +359,30 @@ impl Server {
             Ok(response)
         };
         let mut ws = timeout(self.config.handshake_timeout, tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config()))).await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket handshake timeout"))??;
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket handshake timeout"))?
+            .map_err(ws_err)?;
         let fingerprint = self.authenticate(&mut ws).await?;
         let mut limiter = RateLimiter::new(self.config.max_messages_per_second);
         let mut ping_tick = interval(self.config.ping_interval);
-        let mut last_activity = SystemTime::now();
+        let mut last_activity = Instant::now();
 
         loop {
             tokio::select! {
                 _ = ping_tick.tick() => {
-                    if last_activity.elapsed().unwrap_or_default() > self.config.idle_timeout { return Ok(()); }
+                    if last_activity.elapsed() > self.config.idle_timeout { return Ok(()); }
                     ws.send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into())).await.map_err(ws_err)?;
                 }
                 message = timeout(self.config.idle_timeout, ws.next()) => {
                     let message = match message { Ok(value) => value, Err(_) => return Ok(()) };
                     match message {
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                            last_activity = SystemTime::now();
+                            last_activity = Instant::now();
                             if !limiter.allow() { self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed); return Err(io::Error::new(io::ErrorKind::PermissionDenied, "message rate limit exceeded")); }
                             if text.len() > ztsec_protocol::MAX_WS_MESSAGE_BYTES { self.metrics.oversized.fetch_add(1, Ordering::Relaxed); return Err(io::Error::new(io::ErrorKind::InvalidData, "WebSocket message too large")); }
                             if self.handle_application_message(&mut ws, text.as_ref(), &fingerprint).await? { return Ok(()); }
                         }
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => { last_activity = SystemTime::now(); ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await.map_err(ws_err)?; }
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_))) => { last_activity = SystemTime::now(); }
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => { last_activity = Instant::now(); ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await.map_err(ws_err)?; }
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_))) => { last_activity = Instant::now(); }
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(_))) => { self.metrics.malformed.fetch_add(1, Ordering::Relaxed); return Err(io::Error::new(io::ErrorKind::InvalidData, "binary messages are not supported")); }
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => return Ok(()),
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Frame(_))) => {}

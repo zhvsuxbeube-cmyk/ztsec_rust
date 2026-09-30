@@ -48,11 +48,6 @@ impl Endpoint {
         }
     }
 
-    pub fn display_target(&self) -> String {
-        let (host, port, path) = self.target();
-        format!("ws://{host}:{port}{path}")
-    }
-
     pub fn target(&self) -> (&str, u16, &str) {
         match self {
             Self::Onion { host, port, path } | Self::Local { host, port, path } => (host, *port, path),

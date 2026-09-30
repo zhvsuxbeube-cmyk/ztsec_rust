@@ -32,16 +32,25 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo check --workspace --all-targets 2>&1 | tee linux_log.log
+          : > linux_log.log
+          cargo check --workspace --all-targets 2>&1 | tee -a linux_log.log
       - name: Generate dependency lockfile
-        run: cargo generate-lockfile
-      - name: Test Rust workspace
-        run: cargo test --workspace --all-targets
-      - name: Build Rust server and tooling
+        shell: bash
         run: |
-          cargo build --release --package ztsec_server --bin ztsec-server
-          cargo build --manifest-path tools/auth-keygen/Cargo.toml
-          cargo build --manifest-path tools/load-test/Cargo.toml --release
+          set -o pipefail
+          cargo generate-lockfile 2>&1 | tee -a linux_log.log
+      - name: Test Rust workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --all-targets 2>&1 | tee -a linux_log.log
+      - name: Build Rust server and tooling
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release --package ztsec_server --bin ztsec-server 2>&1 | tee -a linux_log.log
+          cargo build --manifest-path tools/auth-keygen/Cargo.toml 2>&1 | tee -a linux_log.log
+          cargo build --manifest-path tools/load-test/Cargo.toml --release 2>&1 | tee -a linux_log.log
       - name: Python tests
         run: |
           python3 -m py_compile telemetry_service.py python_service.py tools/*.py
@@ -83,25 +92,38 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml', 'protocol/Cargo.toml', 'server/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-      - name: Cargo check preflight
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          & cargo check --package ztsec_agent --all-targets 2>&1 | Tee-Object -FilePath windows_log.log
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Generate dependency lockfile
-        run: cargo generate-lockfile
-      - name: Test agent
-        run: cargo test --package ztsec_agent --tests
-      - name: Panel unit tests
-        shell: pwsh
-        run: python -m unittest tools.panel_test
-      - name: Build agent
-        run: cargo build --release --target x86_64-pc-windows-msvc --bin ztsec_agent
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      - name: Cargo check preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Content -Path windows_log.log -Value ''
+          & cargo check --package ztsec_agent --all-targets 2>&1 | Tee-Object -FilePath windows_log.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Generate dependency lockfile
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & cargo generate-lockfile 2>&1 | Tee-Object -FilePath windows_log.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test agent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & cargo test --package ztsec_agent --tests 2>&1 | Tee-Object -FilePath windows_log.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Panel unit tests
+        shell: pwsh
+        run: python -m unittest tools.panel_test
+      - name: Build agent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & cargo build --release --target x86_64-pc-windows-msvc --bin ztsec_agent 2>&1 | Tee-Object -FilePath windows_log.log -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Plugin
         shell: pwsh
         run: |
@@ -165,7 +187,8 @@ jobs:
             $updated = $original.Replace('pub const VERSION: &str = "Rust-Native/1";', 'pub const VERSION: &str = "Rust-Native/2";')
             if ($updated -eq $original) { throw 'failed to set update test version' }
             Set-Content -Path $textPath -Value $updated -NoNewline
-            cargo build --release --target x86_64-pc-windows-msvc
+            & cargo build --release --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath windows_log.log -Append
+            if ($LASTEXITCODE -ne 0) { throw "update build failed with exit code $LASTEXITCODE" }
             Copy-Item $exe (Join-Path $work 'ztsec_agent_updated.exe') -Force
           }
           finally {

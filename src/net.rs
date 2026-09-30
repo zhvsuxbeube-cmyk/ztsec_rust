@@ -5,7 +5,6 @@ use tokio::time::{interval, sleep};
 
 use crate::{args::Args, auth, plugin::Manager, sys, telemetry, text, transport::{self, Session}, update};
 
-const LEGACY_RETRY: Duration = Duration::from_secs(5);
 const MAX_RETRY_JITTER_MILLIS: u64 = 500;
 
 pub async fn run(args: &Args, mut final_ready: Option<update::FinalReadyArgs>) -> io::Result<()> {

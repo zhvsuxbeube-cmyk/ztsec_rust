@@ -49,3 +49,29 @@ listed as direct dependency features.
 ## CI cargo-check logs
 
 The Linux hosted runner executes `cargo check --workspace --all-targets`; the Windows hosted runner executes `cargo check --package ztsec_agent --all-targets` because `ztsec_server` is Linux-only. Both run these checks before dependency generation, tests, or release builds. The complete stdout/stderr is captured to `linux_log.log` on Linux and `windows_log.log` on Windows and uploaded as separate workflow artifacts even when `cargo check` fails. These logs are intended to preserve every compiler error and warning emitted by the preflight check.
+
+## CI #90 error inventory
+
+The uploaded `Logs.zip` was reviewed line-by-line for compiler diagnostics. The Linux run
+reported three compilation errors and one project-owned warning: `HsId` was incorrectly
+formatted through `Display`; `Server` was moved into `websocket_session` and then reused;
+the WebSocket handshake error was not converted into `io::Error`; and an unnecessary
+`mut` was present on the rendezvous-request stream. The Windows run completed `cargo
+check` successfully but reported two project-owned dead-code warnings (`LEGACY_RETRY`
+and `Endpoint::display_target`) plus one warning from the supplied upstream Arti
+`tor-dirclient` crate (`LZMA_DICT_MEM_LIMIT`).
+
+All project-owned diagnostics above are fixed. The Arti warning remains confined to the
+vendored upstream source because changing it would create an unnecessary Arti fork.
+
+## CI log capture update (2026-09-30)
+
+The workflow now appends Cargo output from dependency lock generation, Rust tests, and
+release/tool builds to the same platform log after the mandatory `cargo check` preflight.
+The Windows MSVC environment is initialized before the preflight and all subsequent
+Cargo commands. This ensures later compiler/linker errors and warnings are retained in
+`linux_log.log` or `windows_log.log`, not only errors from the initial check.
+
+The upstream Arti `tor-dirclient` warning about `LZMA_DICT_MEM_LIMIT` is emitted by the
+vendored Arti 0.46.0 source and is not modified here; changing upstream warning behavior
+would unnecessarily fork the supplied Arti source.
