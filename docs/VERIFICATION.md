@@ -165,3 +165,8 @@ Because the final Docker artifact image uses `FROM scratch` and has no default c
 ### Docker scratch artifact extraction
 
 The final `artifacts` image intentionally uses `FROM scratch` and contains only `/ztsec-server`. Because `scratch` has no default command, CI must create the extraction container with `/ztsec-server` explicitly before calling `docker cp`.
+
+
+### Management relay verification
+
+The Linux local integration harness now exercises the private control socket end-to-end: one authenticated mock agent receives a unicast `CMD:RECONNECT`, two authenticated mock agents with different fingerprints receive a broadcast `CMD:RECONNECT`, and a third mock agent follows `CMD:DIRECT_CONNECT` to the direct listener, authenticates there, receives `CMD:DIRECT_DISCONNECT`, and reconnects to the primary listener. The harness requires the server control response to report queue admission at each transition. The test does not use arbitrary command execution.

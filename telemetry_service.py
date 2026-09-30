@@ -2,6 +2,7 @@
 """Local ZTSEC telemetry consumer; intentionally has no Internet-facing listener."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -18,6 +19,66 @@ RETRY_MAX = 10.0
 
 LOGGER = logging.getLogger("ztsec-telemetry")
 
+
+MAX_CONTROL_FRAME = 64 * 1024
+MAX_CONTROL_COMMAND = 1024
+
+def send_agent_command(socket_path: Path, target: str, command: str, request_id: str) -> dict[str, Any]:
+    """Send one bounded control request over the private Unix socket."""
+    if not request_id or len(request_id.encode("utf-8")) > 64 or not request_id.isascii() or any(ord(ch) < 33 or ord(ch) > 126 for ch in request_id):
+        raise ValueError("invalid request id")
+    if not (target.lower() == "broadcast" or (len(target) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in target))):
+        raise ValueError("target must be broadcast or a 64-hex agent fingerprint")
+    if not command or len(command.encode("utf-8")) > MAX_CONTROL_COMMAND or any(ch in command for ch in "\r\n\x00"):
+        raise ValueError("invalid command")
+    normalized = command.strip()
+    upper = normalized.upper()
+    if upper not in {"REQ:DATA", "CMD:RECONNECT", "CMD:CLOSE", "CMD:SLEEP", "CMD:HIBERNATE", "CMD:RESTART", "CMD:SHUTDOWN", "CMD:DIRECT_DISCONNECT"} and not upper.startswith("CMD:DIRECT_CONNECT:"):
+        raise ValueError("command is not permitted by the control plane")
+    if upper.startswith("CMD:DIRECT_CONNECT:"):
+        direct_value = normalized[len("CMD:DIRECT_CONNECT:"):].strip()
+        try:
+            if direct_value.startswith("["):
+                end = direct_value.rfind("]:")
+                if end <= 1:
+                    raise ValueError
+                host = direct_value[1:end]
+                port_text = direct_value[end + 2:]
+            else:
+                host, port_text = direct_value.rsplit(":", 1)
+            address = ipaddress.ip_address(host)
+            port = int(port_text)
+            if address.is_unspecified or address.is_multicast or not 1 <= port <= 65535:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise ValueError("invalid direct endpoint address") from None
+    request = {
+        "protocol_version": 1,
+        "message_type": "agent_command",
+        "request_id": request_id,
+        "target": target,
+        "command": normalized,
+    }
+    payload = json.dumps(request, separators=(",", ":")).encode("utf-8")
+    if len(payload) > MAX_CONTROL_FRAME:
+        raise ValueError("control request too large")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(10.0)
+        sock.connect(str(socket_path))
+        sock.sendall(struct.pack("!I", len(payload)) + payload)
+        response = receive_frame_from_control(sock)
+    return response
+
+
+def receive_frame_from_control(sock: socket.socket) -> dict[str, Any]:
+    header = read_exact(sock, 4)
+    size = struct.unpack("!I", header)[0]
+    if size == 0 or size > MAX_CONTROL_FRAME:
+        raise ValueError(f"invalid control response size: {size}")
+    value = json.loads(read_exact(sock, size).decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("control response must be an object")
+    return value
 
 def read_exact(sock: socket.socket, size: int) -> bytes:
     chunks: list[bytes] = []

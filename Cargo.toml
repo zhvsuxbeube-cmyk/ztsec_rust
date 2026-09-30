@@ -23,6 +23,7 @@ tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-th
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 tor-rtcompat = { path = "vendor/arti/crates/tor-rtcompat", version = "0.46.0", default-features = false, features = ["tokio", "native-tls"] }
 ztsec_protocol = { path = "protocol" }
+zeroize = "1.8.2"
 
 [profile.release]
 opt-level = 3

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, fs, io, net::SocketAddr, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 use arti_client::{config::TorClientConfigBuilder, TorClient};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -10,7 +10,11 @@ use tor_hsservice::{config::{OnionServiceConfigBuilder, TokenBucketConfig}, Runn
 use tor_proto::stream::IncomingStreamRequest;
 use tracing::{debug, info, warn};
 
+mod control;
+use control::{AgentRegistry, RouteStatus};
+
 pub const DEFAULT_LOCAL_SOCKET: &str = "/run/ztsec/telemetry.sock";
+pub const DEFAULT_CONTROL_SOCKET: &str = "/run/ztsec/control.sock";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -19,8 +23,14 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub authorized_keys: PathBuf,
     pub local_listen: Option<String>,
+    pub direct_listen: Option<String>,
+    pub direct_endpoints: Vec<SocketAddr>,
     pub enable_onion: bool,
     pub local_socket: PathBuf,
+    pub control_socket: PathBuf,
+    pub max_agent_command_queue: usize,
+    pub max_broadcast_targets: usize,
+    pub max_control_requests_per_second: u32,
     pub websocket_path: String,
     pub onion_port: u16,
     pub max_connections: usize,
@@ -43,8 +53,14 @@ impl Default for Config {
             cache_dir: data_dir.join("arti-cache"),
             authorized_keys: PathBuf::from("/etc/ztsec/authorized_keys"),
             local_listen: None,
+            direct_listen: None,
+            direct_endpoints: Vec::new(),
             enable_onion: true,
             local_socket: PathBuf::from(DEFAULT_LOCAL_SOCKET),
+            control_socket: PathBuf::from(DEFAULT_CONTROL_SOCKET),
+            max_agent_command_queue: 16,
+            max_broadcast_targets: 1024,
+            max_control_requests_per_second: 10,
             websocket_path: "/ztsec".into(),
             onion_port: 443,
             max_connections: 4096,
@@ -148,13 +164,17 @@ pub struct Server {
     connection_limit: Arc<Semaphore>,
     auth_limit: Arc<Semaphore>,
     shutdown: watch::Sender<bool>,
+    registry: AgentRegistry,
+    control_limit: Arc<Semaphore>,
+    session_ids: Arc<AtomicU64>,
 }
 
 impl Server {
     pub fn new(config: Config) -> io::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         if config.websocket_path.is_empty() || !config.websocket_path.starts_with('/') { return Err(io::Error::new(io::ErrorKind::InvalidInput, "websocket path must start with '/'") ); }
         if config.max_connections == 0 || config.max_auth_inflight == 0 || config.max_ipc_queue == 0 { return Err(io::Error::new(io::ErrorKind::InvalidInput, "resource limits must be non-zero")); }
-        if config.max_messages_per_second == 0 { return Err(io::Error::new(io::ErrorKind::InvalidInput, "message rate limit must be non-zero")); }
+        if config.max_messages_per_second == 0 || config.max_agent_command_queue == 0 || config.max_broadcast_targets == 0 || config.max_control_requests_per_second == 0 { return Err(io::Error::new(io::ErrorKind::InvalidInput, "resource limits must be non-zero")); }
+        validate_direct_listener_configuration(&config)?;
         let keys = KeyStore::load(&config.authorized_keys)?;
         let (ipc_tx, ipc_rx) = mpsc::channel(config.max_ipc_queue);
         let (shutdown, _) = watch::channel(false);
@@ -167,6 +187,9 @@ impl Server {
             ipc_tx,
             sequence: Arc::new(AtomicU64::new(0)),
             shutdown,
+            registry: AgentRegistry::default(),
+            control_limit: Arc::new(Semaphore::new(16)),
+            session_ids: Arc::new(AtomicU64::new(1)),
         };
         Ok((server, ipc_rx))
     }
@@ -174,12 +197,60 @@ impl Server {
     pub fn metrics(&self) -> Arc<Metrics> { Arc::clone(&self.metrics) }
 
     pub async fn run(self, mut ipc_rx: mpsc::Receiver<Vec<u8>>) -> io::Result<()> {
+        // Bind all local/public listeners before spawning background workers so a bind failure
+        // cannot leave already-started tasks or socket files behind.
         let ipc_path = self.config.local_socket.clone();
         let ipc_listener = bind_ipc_listener(&ipc_path)?;
+        let control_path = self.config.control_socket.clone();
+        let control_listener = match bind_control_listener(&control_path) {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = fs::remove_file(&ipc_path);
+                return Err(error);
+            }
+        };
+        let local_listener = match self.config.local_listen.clone() {
+            Some(address) => match TcpListener::bind(&address).await {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    let _ = fs::remove_file(&control_path);
+                    let _ = fs::remove_file(&ipc_path);
+                    return Err(io::Error::new(error.kind(), format!("bind local test listener {address}: {error}")));
+                }
+            },
+            None => None,
+        };
+        let direct_listener = match self.config.direct_listen.clone() {
+            Some(address) => match TcpListener::bind(&address).await {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    let _ = fs::remove_file(&control_path);
+                    let _ = fs::remove_file(&ipc_path);
+                    return Err(io::Error::new(error.kind(), format!("bind direct listener {address}: {error}")));
+                }
+            },
+            None => None,
+        };
+
         let ipc_metrics = Arc::clone(&self.metrics);
         let ipc_shutdown = self.shutdown.subscribe();
         let ipc_queue_limit = self.config.max_ipc_queue;
         let ipc_task = tokio::spawn(async move { ipc_worker(ipc_listener, ipc_path, &mut ipc_rx, ipc_metrics, ipc_queue_limit, ipc_shutdown).await });
+
+        let control_server = self.clone_for_task();
+        let control_limit = Arc::clone(&self.control_limit);
+        let control_task = tokio::spawn(async move { control_worker(control_server, control_listener, control_path, control_limit).await });
+
+        let local_task = local_listener.map(|listener| {
+            info!("local test listener enabled");
+            let server = self.clone_for_task();
+            tokio::spawn(async move { server.accept_tcp(listener).await })
+        });
+        let direct_task = direct_listener.map(|listener| {
+            info!("direct WebSocket listener enabled");
+            let server = self.clone_for_task();
+            tokio::spawn(async move { server.accept_tcp(listener).await })
+        });
 
         let onion_service = if self.config.enable_onion {
             let (service, request_stream) = match self.launch_onion_service().await {
@@ -187,6 +258,9 @@ impl Server {
                 Err(error) => {
                     self.shutdown();
                     ipc_task.abort();
+                    control_task.abort();
+                    let _ = fs::remove_file(&self.config.control_socket);
+                    let _ = fs::remove_file(&self.config.local_socket);
                     return Err(error);
                 }
             };
@@ -199,12 +273,6 @@ impl Server {
         } else {
             None
         };
-        let local_task = if let Some(address) = self.config.local_listen.clone() {
-            let listener = TcpListener::bind(&address).await.map_err(|e| io::Error::new(e.kind(), format!("bind local test listener {address}: {e}")))?;
-            info!(address = %address, "local test listener enabled");
-            let server = self.clone_for_task();
-            Some(tokio::spawn(async move { server.accept_tcp(listener).await }))
-        } else { None };
 
         let metrics_task = {
             let metrics = Arc::clone(&self.metrics);
@@ -236,6 +304,9 @@ impl Server {
 
         self.shutdown();
         if let Some(task) = local_task { task.abort(); }
+        if let Some(task) = direct_task { task.abort(); }
+        control_task.abort();
+        let _ = fs::remove_file(&self.config.control_socket);
         metrics_task.abort();
         if let Some((service, task)) = onion_service {
             drop(service);
@@ -249,6 +320,7 @@ impl Server {
         Self {
             config: self.config.clone(), keys: self.keys.clone(), metrics: Arc::clone(&self.metrics), ipc_tx: self.ipc_tx.clone(),
             sequence: Arc::clone(&self.sequence), connection_limit: Arc::clone(&self.connection_limit), auth_limit: Arc::clone(&self.auth_limit), shutdown: self.shutdown.clone(),
+            registry: self.registry.clone(), control_limit: Arc::clone(&self.control_limit), session_ids: Arc::clone(&self.session_ids),
         }
     }
 
@@ -362,35 +434,67 @@ impl Server {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket handshake timeout"))?
             .map_err(ws_err)?;
         let fingerprint = self.authenticate(&mut ws).await?;
+        let session_id = self.session_ids.fetch_add(1, Ordering::Relaxed);
+        let mut command_registration = self.registry.register(fingerprint.clone(), session_id, self.config.max_agent_command_queue).await;
         let mut limiter = RateLimiter::new(self.config.max_messages_per_second);
         let mut ping_tick = interval(self.config.ping_interval);
         let mut last_activity = Instant::now();
 
         loop {
-            tokio::select! {
+            let step: Result<bool, io::Error> = tokio::select! {
                 _ = ping_tick.tick() => {
-                    if last_activity.elapsed() > self.config.idle_timeout { return Ok(()); }
-                    ws.send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into())).await.map_err(ws_err)?;
-                }
-                message = timeout(self.config.idle_timeout, ws.next()) => {
-                    let message = match message { Ok(value) => value, Err(_) => return Ok(()) };
-                    match message {
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                            last_activity = Instant::now();
-                            if !limiter.allow() { self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed); return Err(io::Error::new(io::ErrorKind::PermissionDenied, "message rate limit exceeded")); }
-                            if text.len() > ztsec_protocol::MAX_WS_MESSAGE_BYTES { self.metrics.oversized.fetch_add(1, Ordering::Relaxed); return Err(io::Error::new(io::ErrorKind::InvalidData, "WebSocket message too large")); }
-                            if self.handle_application_message(&mut ws, text.as_ref(), &fingerprint).await? { return Ok(()); }
-                        }
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => { last_activity = Instant::now(); ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await.map_err(ws_err)?; }
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_))) => { last_activity = Instant::now(); }
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(_))) => { self.metrics.malformed.fetch_add(1, Ordering::Relaxed); return Err(io::Error::new(io::ErrorKind::InvalidData, "binary messages are not supported")); }
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => return Ok(()),
-                        Some(Ok(tokio_tungstenite::tungstenite::Message::Frame(_))) => {}
-                        Some(Err(error)) => return Err(ws_err(error)),
+                    if last_activity.elapsed() > self.config.idle_timeout {
+                        Ok(true)
+                    } else {
+                        ws.send(tokio_tungstenite::tungstenite::Message::Ping(Vec::new().into())).await.map_err(ws_err).map(|_| false)
                     }
                 }
+                command = command_registration.rx.recv() => {
+                    match command {
+                        Some(command) => ws.send(tokio_tungstenite::tungstenite::Message::Text(command.into())).await.map_err(ws_err).map(|_| false),
+                        None => Ok(true),
+                    }
+                }
+                message = timeout(self.config.idle_timeout, ws.next()) => {
+                    match message {
+                        Err(_) => Ok(true),
+                        Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                            last_activity = Instant::now();
+                            if !limiter.allow() {
+                                self.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                                Err(io::Error::new(io::ErrorKind::PermissionDenied, "message rate limit exceeded"))
+                            } else if text.len() > ztsec_protocol::MAX_WS_MESSAGE_BYTES {
+                                self.metrics.oversized.fetch_add(1, Ordering::Relaxed);
+                                Err(io::Error::new(io::ErrorKind::InvalidData, "WebSocket message too large"))
+                            } else {
+                                self.handle_application_message(&mut ws, text.as_ref(), &fingerprint).await.map(|_| false)
+                            }
+                        }
+                        Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload)))) => {
+                            last_activity = Instant::now();
+                            ws.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await.map_err(ws_err).map(|_| false)
+                        }
+                        Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_)))) => {
+                            last_activity = Instant::now();
+                            Ok(false)
+                        }
+                        Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(_)))) => {
+                            self.metrics.malformed.fetch_add(1, Ordering::Relaxed);
+                            Err(io::Error::new(io::ErrorKind::InvalidData, "binary messages are not supported"))
+                        }
+                        Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_)))) | Ok(None) => Ok(true),
+                        Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Frame(_)))) => Ok(false),
+                        Ok(Some(Err(error))) => Err(ws_err(error)),
+                    }
+                }
+            }?;
+            if step {
+                break;
             }
         }
+
+        self.registry.unregister(&fingerprint, session_id).await;
+        Ok(())
     }
 
     async fn authenticate<S>(&self, ws: &mut tokio_tungstenite::WebSocketStream<S>) -> io::Result<String>
@@ -437,6 +541,10 @@ impl Server {
     where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
         if text == "HB" { ws.send(tokio_tungstenite::tungstenite::Message::Text("PONG".into())).await.map_err(ws_err)?; return Ok(false); }
         if text == "PONG" { return Ok(false); }
+        if text.starts_with("ACK:") || text.starts_with("ERR:") {
+            debug!(fingerprint_prefix = %&fingerprint[..fingerprint.len().min(12)], message = %text, "agent command response");
+            return Ok(false);
+        }
         if text == "REQ:DATA" { ws.send(tokio_tungstenite::tungstenite::Message::Text("PONG".into())).await.map_err(ws_err)?; return Ok(false); }
         if !text.starts_with("DATA:") {
             self.metrics.malformed.fetch_add(1, Ordering::Relaxed);
@@ -466,6 +574,205 @@ impl Server {
     }
 
     fn shutdown(&self) { let _ = self.shutdown.send(true); }
+}
+
+
+async fn control_worker(server: Server, listener: UnixListener, path: PathBuf, control_limit: Arc<Semaphore>) -> io::Result<()> {
+    let mut shutdown = server.shutdown.subscribe();
+    loop {
+        let (stream, _) = tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+                continue;
+            }
+            accepted = listener.accept() => accepted.map_err(|e| io::Error::new(e.kind(), format!("accept control IPC connection: {e}")))?,
+        };
+        let Ok(permit) = control_limit.clone().try_acquire_owned() else {
+            continue;
+        };
+        let worker = server.clone_for_task();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if let Err(error) = handle_control_client(&worker, stream).await {
+                debug!(?error, "control IPC client closed");
+            }
+        });
+    }
+    let _ = fs::remove_file(path);
+    Ok(())
+}
+
+async fn handle_control_client(server: &Server, stream: tokio::net::UnixStream) -> io::Result<()> {
+    let (mut reader, mut writer) = stream.into_split();
+    let mut limiter = RateLimiter::new(server.config.max_control_requests_per_second);
+    loop {
+        let mut header = [0u8; 4];
+        match timeout(Duration::from_secs(10), reader.read_exact(&mut header)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "control IPC idle timeout")),
+        }
+        let len = u32::from_be_bytes(header) as usize;
+        if len == 0 || len > ztsec_protocol::MAX_CONTROL_FRAME_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "control IPC frame too large"));
+        }
+        let mut payload = vec![0u8; len];
+        match timeout(Duration::from_secs(10), reader.read_exact(&mut payload)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "control IPC payload timeout")),
+        }
+        let response = match serde_json::from_slice::<ztsec_protocol::ControlRequest>(&payload) {
+            Ok(request) => {
+                if !limiter.allow() {
+                    server.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+                    control_response(request.request_id.clone(), request.target.clone(), "rate_limited", 0, 0, "control request rate limit exceeded".into())
+                } else {
+                    server.route_control(request).await
+                }
+            }
+            Err(error) => ztsec_protocol::ControlResponse {
+                protocol_version: ztsec_protocol::PROTOCOL_VERSION,
+                message_type: "agent_command_result".into(),
+                request_id: String::new(),
+                status: "rejected".into(),
+                target: String::new(),
+                queued: 0,
+                dropped: 0,
+                detail: format!("invalid control request: {error}"),
+            },
+        };
+        let body = serde_json::to_vec(&response).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        if body.len() > ztsec_protocol::MAX_CONTROL_FRAME_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "control response too large"));
+        }
+        timeout(Duration::from_secs(10), writer.write_all(&(body.len() as u32).to_be_bytes())).await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control IPC response timeout"))??;
+        timeout(Duration::from_secs(10), writer.write_all(&body)).await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control IPC response timeout"))??;
+    }
+}
+
+impl Server {
+    async fn route_control(&self, request: ztsec_protocol::ControlRequest) -> ztsec_protocol::ControlResponse {
+        let target = request.target.clone();
+        let request_id = request.request_id.clone();
+        if let Err(error) = request.validate() {
+            return control_response(request_id, target, "rejected", 0, 0, error.to_string());
+        }
+        if !valid_control_target(&request.target) {
+            return control_response(request_id, target, "rejected", 0, 0, "target must be 'broadcast' or a 64-hex agent fingerprint".into());
+        }
+        if let Err(error) = validate_relay_command(&request.command, &self.config) {
+            return control_response(request_id, target, "rejected", 0, 0, error);
+        }
+        let (queued, dropped, status) = self.registry.route(&request.target, &request.command, self.config.max_broadcast_targets).await;
+        match status {
+            RouteStatus::Queued => control_response(request_id, target, "queued", queued, dropped, "command queued".into()),
+            RouteStatus::QueueFull => control_response(request_id, target, "partial", queued, dropped, "one or more agent command queues were full".into()),
+            RouteStatus::NotConnected => control_response(request_id, target, "offline", queued, dropped, "target agent is not connected".into()),
+        }
+    }
+}
+
+fn control_response(request_id: String, target: String, status: &str, queued: usize, dropped: usize, detail: String) -> ztsec_protocol::ControlResponse {
+    let detail: String = detail.chars().take(512).collect();
+    ztsec_protocol::ControlResponse {
+        protocol_version: ztsec_protocol::PROTOCOL_VERSION,
+        message_type: "agent_command_result".into(),
+        request_id,
+        status: status.into(),
+        target,
+        queued,
+        dropped,
+        detail,
+    }
+}
+
+fn strip_prefix_ascii_ci<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value.get(..prefix.len()).filter(|head| head.eq_ignore_ascii_case(prefix)).map(|_| &value[prefix.len()..])
+}
+
+fn valid_control_target(target: &str) -> bool {
+    target.eq_ignore_ascii_case("broadcast") || (target.len() == 64 && target.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+fn validate_relay_command(command: &str, config: &Config) -> Result<(), String> {
+    let normalized = command.trim();
+    if normalized.eq_ignore_ascii_case("REQ:DATA")
+        || normalized.eq_ignore_ascii_case("CMD:RECONNECT")
+        || normalized.eq_ignore_ascii_case("CMD:CLOSE")
+        || normalized.eq_ignore_ascii_case("CMD:SLEEP")
+        || normalized.eq_ignore_ascii_case("CMD:HIBERNATE")
+        || normalized.eq_ignore_ascii_case("CMD:RESTART")
+        || normalized.eq_ignore_ascii_case("CMD:SHUTDOWN")
+        || normalized.eq_ignore_ascii_case("CMD:DIRECT_DISCONNECT")
+    {
+        return Ok(());
+    }
+    if let Some(value) = strip_prefix_ascii_ci(normalized, "CMD:DIRECT_CONNECT:") {
+        let addr = value.trim().parse::<SocketAddr>().map_err(|_| "invalid direct endpoint address".to_owned())?;
+        if addr.ip().is_unspecified() || addr.ip().is_multicast() {
+            return Err("direct endpoint address is not usable".into());
+        }
+        if config.direct_endpoints.iter().any(|allowed| allowed == &addr) {
+            return Ok(());
+        }
+        return Err("direct endpoint is not in the server allowlist".into());
+    }
+    Err("command is not relayable by the transport control plane".into())
+}
+
+fn validate_direct_listener_configuration(config: &Config) -> io::Result<()> {
+    if config.direct_listen.is_none() && !config.direct_endpoints.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--direct-endpoint requires --direct-listen"));
+    }
+    let Some(listen) = config.direct_listen.as_deref() else {
+        return Ok(());
+    };
+    if config.direct_endpoints.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--direct-listen requires at least one --direct-endpoint"));
+    }
+    let listen_addr = listen.parse::<SocketAddr>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "--direct-listen must be an IP:PORT socket address"))?;
+    for endpoint in &config.direct_endpoints {
+        if endpoint.port() != listen_addr.port() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("direct endpoint {endpoint} must use the --direct-listen port {}", listen_addr.port())));
+        }
+        if endpoint.ip().is_unspecified() || endpoint.ip().is_multicast() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("direct endpoint {endpoint} is not a usable advertised address")));
+        }
+        if listen_addr.ip().is_unspecified() {
+            let same_family = listen_addr.is_ipv4() == endpoint.is_ipv4();
+            if !same_family {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("direct endpoint {endpoint} does not match the --direct-listen address family")));
+            }
+        } else if endpoint.ip() != listen_addr.ip() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("direct endpoint {endpoint} does not match --direct-listen address {listen_addr}")));
+        }
+    }
+    Ok(())
+}
+
+fn bind_control_listener(path: &Path) -> io::Result<UnixListener> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.file_type().is_socket() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("control IPC path {} exists and is not a Unix socket", path.display())));
+        }
+        fs::remove_file(path)?;
+    }
+    let listener = UnixListener::bind(path).map_err(|e| io::Error::new(e.kind(), format!("bind control IPC socket {}: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o660);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(listener)
 }
 
 fn bind_ipc_listener(path: &Path) -> io::Result<UnixListener> {
@@ -632,5 +939,65 @@ mod tests {
         assert!(limiter.allow());
         assert!(limiter.allow());
         assert!(!limiter.allow());
+    }
+
+    #[test]
+    fn control_target_validation_is_strict() {
+        assert!(valid_control_target("broadcast"));
+        assert!(valid_control_target(&"A".repeat(64)));
+        assert!(!valid_control_target("broadcast "));
+        assert!(!valid_control_target(&"a".repeat(63)));
+        assert!(!valid_control_target(&"g".repeat(64)));
+    }
+
+    #[test]
+    fn relay_command_allowlist_rejects_code_execution() {
+        let config = Config::default();
+        assert!(validate_relay_command("CMD:RECONNECT", &config).is_ok());
+        assert!(validate_relay_command("REQ:DATA", &config).is_ok());
+        assert!(validate_relay_command("CMD:SLEEP", &config).is_ok());
+        assert!(validate_relay_command("CMD:HIBERNATE", &config).is_ok());
+        assert!(validate_relay_command("CMD:RESTART", &config).is_ok());
+        assert!(validate_relay_command("CMD:SHUTDOWN", &config).is_ok());
+        assert!(validate_relay_command("CMD:EXECUTE:cmd", &config).is_err());
+        assert!(validate_relay_command("CMD:UPDATE:anything", &config).is_err());
+        assert!(validate_relay_command("CMD:SHELL", &config).is_err());
+    }
+
+    #[test]
+    fn relay_direct_endpoint_requires_allowlist() {
+        let mut config = Config::default();
+        let address: SocketAddr = "203.0.113.10:4794".parse().unwrap();
+        config.direct_endpoints.push(address);
+        assert!(validate_relay_command("CMD:DIRECT_CONNECT:203.0.113.10:4794", &config).is_ok());
+        assert!(validate_relay_command("cmd:direct_connect:203.0.113.10:4794", &config).is_ok());
+        assert!(validate_relay_command("CMD:DIRECT_CONNECT:203.0.113.11:4794", &config).is_err());
+        assert!(validate_relay_command("CMD:DIRECT_CONNECT:0.0.0.0:4794", &config).is_err());
+        assert!(validate_relay_command("CMD:DIRECT_CONNECT:239.1.1.1:4794", &config).is_err());
+    }
+
+    #[test]
+    fn direct_listener_configuration_matches_advertised_endpoint() {
+        let mut config = Config::default();
+        config.direct_listen = Some("0.0.0.0:4794".into());
+        config.direct_endpoints.push("203.0.113.10:4794".parse().unwrap());
+        assert!(validate_direct_listener_configuration(&config).is_ok());
+        config.direct_endpoints[0] = "203.0.113.10:4795".parse().unwrap();
+        assert!(validate_direct_listener_configuration(&config).is_err());
+    }
+
+    #[test]
+    fn direct_listener_rejects_mismatched_specific_ip() {
+        let mut config = Config::default();
+        config.direct_listen = Some("192.0.2.10:4794".into());
+        config.direct_endpoints.push("192.0.2.11:4794".parse().unwrap());
+        assert!(validate_direct_listener_configuration(&config).is_err());
+    }
+
+    #[test]
+    fn direct_endpoint_requires_listener() {
+        let mut config = Config::default();
+        config.direct_endpoints.push("192.0.2.10:4794".parse().unwrap());
+        assert!(validate_direct_listener_configuration(&config).is_err());
     }
 }

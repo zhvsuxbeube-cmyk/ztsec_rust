@@ -26,8 +26,14 @@ fn parse_args() -> io::Result<Config> {
             "--cache-dir" => config.cache_dir = PathBuf::from(next(&mut args, "cache-dir")?),
             "--authorized-keys" => config.authorized_keys = PathBuf::from(next(&mut args, "authorized-keys")?),
             "--local-listen" => config.local_listen = Some(next(&mut args, "local-listen")?),
+            "--direct-listen" => config.direct_listen = Some(next(&mut args, "direct-listen")?),
+            "--direct-endpoint" => config.direct_endpoints.push(next_socket(&mut args, "direct-endpoint")?),
+            "--max-agent-command-queue" => config.max_agent_command_queue = parse_usize(&next(&mut args, "max-agent-command-queue")?)?,
+            "--max-broadcast-targets" => config.max_broadcast_targets = parse_usize(&next(&mut args, "max-broadcast-targets")?)?,
+            "--max-control-requests-per-second" => config.max_control_requests_per_second = parse_u32(&next(&mut args, "max-control-requests-per-second")?)?,
             "--no-onion" => config.enable_onion = false,
             "--local-socket" => config.local_socket = PathBuf::from(next(&mut args, "local-socket")?),
+            "--control-socket" => config.control_socket = PathBuf::from(next(&mut args, "control-socket")?),
             "--path" => config.websocket_path = next(&mut args, "path")?,
             "--onion-port" => config.onion_port = parse_u16(&next(&mut args, "onion-port")?)?,
             "--max-connections" => config.max_connections = parse_usize(&next(&mut args, "max-connections")?)?,
@@ -40,7 +46,7 @@ fn parse_args() -> io::Result<Config> {
             "--ping-interval" => config.ping_interval = parse_seconds(&next(&mut args, "ping-interval")?)?,
             "--metrics-interval" => config.metrics_interval = parse_seconds(&next(&mut args, "metrics-interval")?)?,
             "--help" | "-h" => {
-                println!("ztsec-server options: --nickname N --state-dir DIR --cache-dir DIR --authorized-keys FILE --local-listen ADDR --no-onion --local-socket PATH --path PATH --onion-port PORT --max-connections N --max-auth-inflight N --ipc-queue N --message-rate N --handshake-timeout S --auth-timeout S --idle-timeout S --ping-interval S --metrics-interval S");
+                println!("ztsec-server options: --nickname N --state-dir DIR --cache-dir DIR --authorized-keys FILE --local-listen ADDR --direct-listen ADDR --direct-endpoint IP:PORT --no-onion --local-socket PATH --control-socket PATH --path PATH --onion-port PORT --max-connections N --max-auth-inflight N --ipc-queue N --message-rate N --max-agent-command-queue N --max-broadcast-targets N --max-control-requests-per-second N --handshake-timeout S --auth-timeout S --idle-timeout S --ping-interval S --metrics-interval S");
                 std::process::exit(0);
             }
             other => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown option {other}"))),
@@ -50,6 +56,10 @@ fn parse_args() -> io::Result<Config> {
 }
 
 fn next<I: Iterator<Item = String>>(args: &mut I, name: &str) -> io::Result<String> { args.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("missing value for --{name}"))) }
+fn next_socket<I: Iterator<Item = String>>(args: &mut I, name: &str) -> io::Result<std::net::SocketAddr> {
+    next(args, name)?.parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid socket address for --{name}")))
+}
+
 fn parse_u16(value: &str) -> io::Result<u16> { value.parse().ok().filter(|v| *v != 0).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid u16 value")) }
 fn parse_u32(value: &str) -> io::Result<u32> { value.parse().ok().filter(|v| *v != 0).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid u32 value")) }
 fn parse_usize(value: &str) -> io::Result<usize> { value.parse().ok().filter(|v| *v != 0).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid usize value")) }

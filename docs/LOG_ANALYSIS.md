@@ -113,3 +113,8 @@ The Docker `artifacts` stage intentionally uses `FROM scratch`, so the image has
 ## CI failure: Docker scratch image had no command
 
 The artifacts image uses `FROM scratch`, so it has no implicit shell or default `CMD`. The CI previously called `docker create ztsec-rust-builder` without a command, which Docker rejected with `no command specified`. The workflow now calls `docker create ztsec-rust-builder /ztsec-server`; this creates a stopped container configuration and does not execute the server, allowing `docker cp` to extract the ELF binary. The Docker build step also uses `set -euo pipefail` so extraction failures stop the job immediately.
+
+
+## Management relay hardening
+
+The relay uses a bounded per-agent queue, bounded broadcast fan-out, a separate local control-socket connection limit, and a per-control-connection request rate limit. The relay command vocabulary is intentionally allowlisted to non-code-execution management operations. Direct transport changes require an explicitly configured server endpoint and are runtime-only on the agent.

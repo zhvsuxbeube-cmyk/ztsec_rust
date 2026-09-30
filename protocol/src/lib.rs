@@ -11,6 +11,53 @@ pub const MAX_AGENT_ID_LEN: usize = 128;
 pub const MAX_TELEMETRY_FIELD_BYTES: usize = 64 * 1024;
 pub const MAX_AUTH_KEY_HEX_LEN: usize = 64;
 
+
+pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_CONTROL_REQUEST_ID_LEN: usize = 64;
+pub const MAX_CONTROL_TARGET_LEN: usize = 128;
+pub const MAX_CONTROL_COMMAND_LEN: usize = 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlRequest {
+    pub protocol_version: u16,
+    pub message_type: String,
+    pub request_id: String,
+    pub target: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlResponse {
+    pub protocol_version: u16,
+    pub message_type: String,
+    pub request_id: String,
+    pub status: String,
+    pub target: String,
+    pub queued: usize,
+    pub dropped: usize,
+    pub detail: String,
+}
+
+impl ControlRequest {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.protocol_version != PROTOCOL_VERSION || self.message_type != "agent_command" {
+            return Err(ProtocolError::UnexpectedMessage);
+        }
+        if self.request_id.is_empty() || self.request_id.len() > MAX_CONTROL_REQUEST_ID_LEN
+            || self.request_id.bytes().any(|b| !b.is_ascii_graphic()) {
+            return Err(ProtocolError::InvalidControlField("request_id"));
+        }
+        if self.target.is_empty() || self.target.len() > MAX_CONTROL_TARGET_LEN {
+            return Err(ProtocolError::InvalidControlField("target"));
+        }
+        if self.command.is_empty() || self.command.len() > MAX_CONTROL_COMMAND_LEN
+            || self.command.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+            return Err(ProtocolError::InvalidControlField("command"));
+        }
+        Ok(())
+    }
+}
+
 pub const COUNTRY: &str = "Country";
 pub const NICKNAME: &str = "Nickname";
 pub const TAG: &str = "Tag";
@@ -172,6 +219,7 @@ pub enum ProtocolError {
     WrongFieldCount { expected: usize, actual: usize },
     FieldTooLong { index: usize },
     InvalidField { index: usize },
+    InvalidControlField(&'static str),
 }
 
 impl std::fmt::Display for ProtocolError {
@@ -184,6 +232,7 @@ impl std::fmt::Display for ProtocolError {
                 write!(f, "telemetry field count {actual}, expected {expected}"),
             Self::FieldTooLong { index } => write!(f, "telemetry field {index} is too long"),
             Self::InvalidField { index } => write!(f, "telemetry field {index} is invalid"),
+            Self::InvalidControlField(field) => write!(f, "invalid control field {field}"),
         }
     }
 }
@@ -193,6 +242,33 @@ impl std::error::Error for ProtocolError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn valid_control_request_is_accepted() {
+        let request = ControlRequest {
+            protocol_version: PROTOCOL_VERSION,
+            message_type: "agent_command".into(),
+            request_id: "req-01".into(),
+            target: "a".repeat(64),
+            command: "CMD:RECONNECT".into(),
+        };
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn control_request_rejects_newlines_and_oversized_fields() {
+        let mut request = ControlRequest {
+            protocol_version: PROTOCOL_VERSION,
+            message_type: "agent_command".into(),
+            request_id: "req-01".into(),
+            target: "broadcast".into(),
+            command: "CMD:RECONNECT".into(),
+        };
+        request.command.push('\n');
+        assert!(request.validate().is_err());
+        request.command = "x".repeat(MAX_CONTROL_COMMAND_LEN + 1);
+        assert!(request.validate().is_err());
+    }
 
     #[test]
     fn parse_existing_telemetry_shape() {

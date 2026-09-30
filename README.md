@@ -95,7 +95,7 @@ The final Windows executable embeds Arti; no separate Arti executable is require
 ```bash
 rustup toolchain install 1.92.0-x86_64-unknown-linux-gnu
 rustup default 1.92.0-x86_64-unknown-linux-gnu
-cargo test --workspace --all-targets
+cargo test --workspace
 cargo build --release --package ztsec_server --bin ztsec-server
 ```
 
@@ -297,7 +297,7 @@ The Python service retries Rust IPC with an exponential delay capped at ten seco
 Deterministic tests:
 
 ```bash
-cargo test --workspace --all-targets
+cargo test --workspace
 python3 -m unittest tools.test_python_service
 python3 tools/test_update_contract.py
 ```
@@ -395,9 +395,19 @@ MIGRATION
 
 ## CI compiler logs
 
-The Linux and Windows CI jobs run `cargo check --workspace --all-targets` before lockfile generation, tests, or release builds. Complete stdout/stderr is captured to `linux_log.log` and `windows_log.log` respectively. The logs are uploaded as dedicated artifacts on every runner outcome and are included in the final release bundle when both platform jobs succeed.
+The Linux and Windows CI jobs run `cargo check` before lockfile generation, tests, or release builds. The Linux workspace command is `cargo check --workspace`; the Windows job checks the Windows-only agent package. The workflow intentionally does not use `--all-targets` so vendored Arti test targets are not selected. Complete stdout/stderr is captured to `linux_log.log` and `windows_log.log` respectively. The logs are uploaded as dedicated artifacts on every runner outcome and are included in the final release bundle when both platform jobs succeed.
 
 
 ## Source archive contents
 
 Release source archives produced for this handoff omit the unchanged `vendor/arti` directory because that directory is already present in the GitHub repository. The working tree retains the full vendored Arti source. If a future change modifies anything under `vendor/arti`, that entire directory will be included in the corresponding output archive.
+
+## Bidirectional management relay
+
+The Rust server now maintains a bounded registry of authenticated agents. The local control socket at `/run/ztsec/control.sock` can route a small allowlisted management vocabulary to one authenticated agent or to a bounded broadcast set.
+
+Supported relay commands are `REQ:DATA`, `CMD:RECONNECT`, `CMD:CLOSE`, `CMD:SLEEP`, `CMD:HIBERNATE`, `CMD:RESTART`, `CMD:SHUTDOWN`, `CMD:DIRECT_CONNECT:<configured-ip>:<port>`, and `CMD:DIRECT_DISCONNECT`. Commands are queued in small per-agent bounded channels, so a slow agent cannot cause an unbounded server queue.
+
+The control plane deliberately does not become a general-purpose remote execution or software-deployment bus. Existing `EXECUTE`, plugin-deployment, and update-transfer commands are rejected by the new relay boundary; the existing simple power-management commands remain explicitly allowlisted. The Linux local integration test exercises unicast and broadcast command delivery through the private control socket, including the direct-connect/direct-disconnect path on the direct listener.
+
+The agent's direct transport switch is runtime-only. A successful `CMD:DIRECT_CONNECT` closes the Tor WebSocket and reconnects to the explicitly allowlisted direct server endpoint. `CMD:DIRECT_DISCONNECT` closes that direct session and returns to the configured endpoint. The direct endpoint is not persisted in agent configuration, and its in-memory strings are zeroized when released; this does not erase external audit or OS logs.

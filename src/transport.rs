@@ -1,4 +1,4 @@
-use std::{io, path::PathBuf, sync::Arc, time::Duration};
+use std::{io, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use arti_client::{config::TorClientConfigBuilder, DataStream, TorClient};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -7,6 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{client_async_with_config, tungstenite::{http::Request, Message}, WebSocketStream};
 use tor_rtcompat::PreferredRuntime;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::auth;
 
@@ -14,6 +15,7 @@ use crate::auth;
 pub enum Endpoint {
     Onion { host: String, port: u16, path: String },
     Local { host: String, port: u16, path: String },
+    Direct { host: String, port: u16, path: String },
 }
 
 impl Endpoint {
@@ -50,13 +52,59 @@ impl Endpoint {
 
     pub fn target(&self) -> (&str, u16, &str) {
         match self {
-            Self::Onion { host, port, path } | Self::Local { host, port, path } => (host, *port, path),
+            Self::Onion { host, port, path } | Self::Local { host, port, path } | Self::Direct { host, port, path } => (host, *port, path),
         }
     }
 
     pub fn is_onion(&self) -> bool {
         matches!(self, Self::Onion { .. })
     }
+
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct { .. })
+    }
+
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Onion { path, .. } | Self::Local { path, .. } | Self::Direct { path, .. } => path,
+        }
+    }
+
+    pub fn direct(addr: SocketAddr, path: &str) -> Result<Self, String> {
+        if addr.port() == 0 {
+            return Err("direct endpoint port must not be zero".into());
+        }
+        if addr.ip().is_unspecified() || addr.ip().is_multicast() {
+            return Err("direct endpoint address is not usable".into());
+        }
+        let host = addr.ip().to_string();
+        if host.is_empty() {
+            return Err("direct endpoint host is empty".into());
+        }
+        Ok(Self::Direct { host, port: addr.port(), path: normalize_path(path) })
+    }
+}
+
+impl Drop for Endpoint {
+    fn drop(&mut self) {
+        if let Self::Direct { host, path, .. } = self {
+            host.zeroize();
+            path.zeroize();
+        }
+    }
+}
+
+fn format_authority(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn normalize_path(raw: &str) -> String {
+    let path = format!("/{}", raw.trim_start_matches('/'));
+    if path == "/" { "/".to_owned() } else { path }
 }
 
 fn parse_port(value: &str) -> Result<u16, String> {
@@ -157,6 +205,10 @@ impl Connector {
         &self.endpoint
     }
 
+    pub fn set_endpoint(&mut self, endpoint: Endpoint) {
+        self.endpoint = endpoint;
+    }
+
     async fn ensure_tor(&mut self, timeout_duration: Duration) -> io::Result<Arc<TorClient<PreferredRuntime>>> {
         if let Some(tor) = &self.tor {
             return Ok(Arc::clone(tor));
@@ -188,10 +240,11 @@ impl Connector {
 
     pub async fn connect_ws(&mut self, connect_timeout: Duration, handshake_timeout: Duration) -> io::Result<Session> {
         let (host, port, path) = self.endpoint.target();
-        let uri = format!("ws://{host}:{port}{path}");
+        let authority = Zeroizing::new(format_authority(host, port));
+        let uri = Zeroizing::new(format!("ws://{authority}{path}"));
         let request = Request::builder()
-            .uri(uri)
-            .header("Host", format!("{host}:{port}"))
+            .uri(uri.as_str())
+            .header("Host", authority.as_str())
             .body(())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
@@ -218,6 +271,17 @@ impl Connector {
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "onion WebSocket handshake timeout"))?
                     .map_err(ws_io)?;
                 Ok(Session::Tor(ws))
+            }
+            Endpoint::Direct { host, port, .. } => {
+                let stream = timeout(connect_timeout, TcpStream::connect((host.as_str(), port)))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "direct WebSocket connect timeout"))?
+                    .map_err(|e| io::Error::new(e.kind(), format!("direct endpoint connection failed: {e}")))?;
+                let (ws, _) = timeout(handshake_timeout, client_async_with_config(request, stream, Some(ws_config())))
+                    .await
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "direct WebSocket handshake timeout"))?
+                    .map_err(ws_io)?;
+                Ok(Session::Local(ws))
             }
         }
     }
@@ -278,5 +342,35 @@ mod tests {
     #[test]
     fn rejects_non_ws() {
         assert!(Endpoint::parse("wss://127.0.0.1:4793/").is_err());
+    }
+}
+
+#[cfg(test)]
+mod direct_tests {
+    use super::*;
+
+    #[test]
+    fn direct_endpoint_accepts_socket_address_and_preserves_path() {
+        let endpoint = Endpoint::direct("192.0.2.10:4794".parse().unwrap(), "/ztsec").unwrap();
+        assert!(endpoint.is_direct());
+        assert_eq!(endpoint.target(), ("192.0.2.10", 4794, "/ztsec"));
+    }
+
+    #[test]
+    fn direct_endpoint_accepts_ipv6_socket_address() {
+        let endpoint = Endpoint::direct("[2001:db8::10]:4794".parse().unwrap(), "/ztsec").unwrap();
+        assert!(endpoint.is_direct());
+        assert_eq!(endpoint.path(), "/ztsec");
+    }
+
+    #[test]
+    fn direct_endpoint_rejects_unspecified_address() {
+        assert!(Endpoint::direct("0.0.0.0:4794".parse().unwrap(), "/ztsec").is_err());
+    }
+
+    #[test]
+    fn websocket_authority_brackets_ipv6() {
+        assert_eq!(format_authority("2001:db8::10", 4794), "[2001:db8::10]:4794");
+        assert_eq!(format_authority("203.0.113.10", 4794), "203.0.113.10:4794");
     }
 }

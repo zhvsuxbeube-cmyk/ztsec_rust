@@ -2,6 +2,7 @@ use std::{io, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tokio::time::{interval, sleep};
+use zeroize::Zeroizing;
 
 use crate::{args::Args, auth, plugin::Manager, sys, telemetry, text, transport::{self, Session}, update};
 
@@ -26,8 +27,12 @@ pub async fn run(args: &Args, mut final_ready: Option<update::FinalReadyArgs>) -
         eprintln!("ztsec transport=websocket-loopback endpoint={}", args.endpoint_display);
     }
 
+    let primary_endpoint = args.endpoint.clone();
+    let endpoint_path = primary_endpoint.path().to_owned();
+    let mut active_endpoint = primary_endpoint.clone();
+    let mut direct_override = false;
     let mut connector = transport::Connector::new(
-        args.endpoint.clone(),
+        active_endpoint.clone(),
         args.arti_state_dir.clone(),
         args.arti_cache_dir.clone(),
     );
@@ -35,6 +40,7 @@ pub async fn run(args: &Args, mut final_ready: Option<update::FinalReadyArgs>) -
     let mut delay = args.retry_base;
 
     loop {
+        connector.set_endpoint(active_endpoint.clone());
         match connector.connect_authenticated(
             &fp,
             &signing_key,
@@ -42,12 +48,12 @@ pub async fn run(args: &Args, mut final_ready: Option<update::FinalReadyArgs>) -
             args.handshake_timeout,
         ).await {
             Ok(mut session) => {
-                let target = connector.endpoint().target().0.to_owned();
-                let ping_target = if connector.endpoint().is_onion() { None } else { telemetry::ping_ms(&target) };
+                let target = Zeroizing::new(connector.endpoint().target().0.to_owned());
+                let ping_target = if connector.endpoint().is_onion() { None } else { telemetry::ping_ms(target.as_str()) };
                 let data = tokio::task::spawn_blocking({
                     let target = target.clone();
                     let fp = fp.clone();
-                    move || telemetry::record(&target, ping_target, &fp)
+                    move || telemetry::record(target.as_str(), ping_target, &fp)
                 }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
                 let hello_data = format!("{}{}", text::DATA, data);
@@ -71,9 +77,10 @@ pub async fn run(args: &Args, mut final_ready: Option<update::FinalReadyArgs>) -
                     }
                 }
 
-                let should_exit = ws_session(
+                let action = ws_session(
                     &mut session,
                     &target,
+                    &endpoint_path,
                     &args.endpoint_display,
                     &fp,
                     &host,
@@ -84,14 +91,42 @@ pub async fn run(args: &Args, mut final_ready: Option<update::FinalReadyArgs>) -
                     &args.arti_cache_dir,
                 ).await;
                 plugins.clear();
-                if should_exit {
-                    return Ok(());
+                match action {
+                    SessionAction::Close => return Ok(()),
+                    SessionAction::Reconnect => {
+                        delay = args.retry_base;
+                        println!("{}", text::RETRYING);
+                    }
+                    SessionAction::SwitchDirect(endpoint) => {
+                        active_endpoint = endpoint;
+                        direct_override = true;
+                        delay = args.retry_base;
+                        eprintln!("ztsec transport switching to direct connection");
+                        continue;
+                    }
+                    SessionAction::SwitchPrimary => {
+                        // Replace both endpoint holders immediately so the old Direct endpoint is
+                        // dropped (and zeroized) before the next await/reconnect attempt.
+                        active_endpoint = primary_endpoint.clone();
+                        connector.set_endpoint(primary_endpoint.clone());
+                        direct_override = false;
+                        delay = args.retry_base;
+                        eprintln!("ztsec transport returning to configured connection");
+                        continue;
+                    }
                 }
-                delay = args.retry_base;
-                println!("{}", text::RETRYING);
             }
             Err(error) => {
                 eprintln!("ztsec connection failed: {error}");
+                if direct_override {
+                    eprintln!("direct transport unavailable; returning to configured transport");
+                    // Drop the direct endpoint from both the loop state and Connector immediately.
+                    active_endpoint = primary_endpoint.clone();
+                    connector.set_endpoint(primary_endpoint.clone());
+                    direct_override = false;
+                    delay = args.retry_base;
+                    continue;
+                }
                 println!("{}", text::RETRYING);
             }
         }
@@ -101,9 +136,12 @@ pub async fn run(args: &Args, mut final_ready: Option<update::FinalReadyArgs>) -
     }
 }
 
+enum SessionAction { Close, Reconnect, SwitchDirect(transport::Endpoint), SwitchPrimary }
+
 async fn ws_session(
     session: &mut Session,
     target: &str,
+    endpoint_path: &str,
     endpoint: &str,
     fp: &str,
     host: &str,
@@ -112,7 +150,7 @@ async fn ws_session(
     auth_key_file: &Path,
     arti_state_dir: &Path,
     arti_cache_dir: &Path,
-) -> bool {
+) -> SessionAction {
     let mut ticker = interval(heartbeat);
     let mut update_transfer: Option<UpdateTransfer> = None;
     loop {
@@ -127,43 +165,51 @@ async fn ws_session(
                     let _ = session.send_text(&format!("{}{}:{}", text::PLUGOUT, event, encode_b64(&payload))).await;
                 }
                 if session.send_ping().await.is_err() {
-                    return false;
+                    return SessionAction::Reconnect;
                 }
             }
             result = session.next_text() => {
                 match result {
                     Ok(Some(value)) if value == text::HB => {
-                        if session.send_text(text::PONG).await.is_err() { return false; }
+                        if session.send_text(text::PONG).await.is_err() { return SessionAction::Reconnect; }
                     }
                     Ok(Some(value)) if value == text::REQ => {
-                        if session.send_text(text::PONG).await.is_err() { return false; }
+                        if session.send_text(text::PONG).await.is_err() { return SessionAction::Reconnect; }
                         let telemetry = match tokio::task::spawn_blocking({
                             let target = target.to_owned();
                             let fp = fp.to_owned();
                             move || telemetry::record(&target, None, &fp)
                         }).await {
                             Ok(value) => value,
-                            Err(_) => return false,
+                            Err(_) => return SessionAction::Reconnect,
                         };
-                        if session.send_text(&format!("{}{}", text::DATA, telemetry)).await.is_err() { return false; }
+                        if session.send_text(&format!("{}{}", text::DATA, telemetry)).await.is_err() { return SessionAction::Reconnect; }
                     }
                     Ok(Some(value)) if value.starts_with(text::CMD) => {
+                        let sensitive_direct_command = starts_with_ascii_ci(value[text::CMD.len()..].trim_start(), text::DIRECT_CONNECT);
                         let raw = value[text::CMD.len()..].trim();
-                        match handle_command(session, raw, endpoint, fp, host, plugins, &mut update_transfer, auth_key_file, arti_state_dir, arti_cache_dir).await {
-                            CommandResult::Close => return true,
-                            CommandResult::Reconnect => return false,
+                        let action = handle_command(session, raw, endpoint_path, endpoint, fp, host, plugins, &mut update_transfer, auth_key_file, arti_state_dir, arti_cache_dir).await;
+                        if sensitive_direct_command {
+                            use zeroize::Zeroize;
+                            value.zeroize();
+                        }
+                        match action {
+                            CommandResult::Close => return SessionAction::Close,
+                            CommandResult::Reconnect => return SessionAction::Reconnect,
+                            CommandResult::SwitchDirect(endpoint) => return SessionAction::SwitchDirect(endpoint),
+                            CommandResult::SwitchPrimary => return SessionAction::SwitchPrimary,
                             CommandResult::Continue => {}
                         }
                     }
                     Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => return false,
+                    Ok(None) | Err(_) => return SessionAction::Reconnect,
                 }
             }
         }
     }
 }
 
-enum CommandResult { Continue, Close, Reconnect }
+enum CommandResult { Continue, Close, Reconnect, SwitchDirect(transport::Endpoint), SwitchPrimary }
 
 struct UpdateTransfer {
     path: PathBuf,
@@ -184,6 +230,7 @@ impl Drop for UpdateTransfer {
 async fn handle_command(
     session: &mut Session,
     raw: &str,
+    endpoint_path: &str,
     endpoint: &str,
     fp: &str,
     host: &str,
@@ -284,6 +331,28 @@ async fn handle_command(
             let _ = session.send_text(&format!("{}{}{}", text::ACK, text::PEVENT, event)).await;
         }
         return CommandResult::Continue;
+    }
+
+    if starts_with_ascii_ci(raw, text::DIRECT_CONNECT) {
+        let endpoint = match parse_direct_command(raw, endpoint_path) {
+            Ok(endpoint) => endpoint,
+            Err(_) => {
+                let _ = session.send_text(&format!("{}{}", text::ERR, text::DIRECT_CONNECT)).await;
+                return CommandResult::Continue;
+            }
+        };
+        // Close the authenticated session before changing transports. The owned Endpoint returned
+        // here becomes the sole runtime holder of the direct address; Endpoint::Drop zeroizes it.
+        let _ = session.send_text(&format!("{}{}", text::ACK, text::DIRECT_CONNECT)).await;
+        let _ = session.close().await;
+        return CommandResult::SwitchDirect(endpoint);
+    }
+
+
+    if starts_with_ascii_ci(raw, text::DIRECT_DISCONNECT) {
+        let _ = session.send_text(&format!("{}{}", text::ACK, text::DIRECT_DISCONNECT)).await;
+        let _ = session.close().await;
+        return CommandResult::SwitchPrimary;
     }
 
     if starts_with_ascii_ci(raw, text::UPDATE_BEGIN) {
@@ -495,6 +564,15 @@ async fn handle_command(
     }
 }
 
+fn parse_direct_command(raw: &str, endpoint_path: &str) -> Result<transport::Endpoint, ()> {
+    if !starts_with_ascii_ci(raw, text::DIRECT_CONNECT) {
+        return Err(());
+    }
+    let value = raw[text::DIRECT_CONNECT.len()..].trim();
+    let addr = value.parse::<std::net::SocketAddr>().map_err(|_| ())?;
+    transport::Endpoint::direct(addr, endpoint_path).map_err(|_| ())
+}
+
 fn starts_with_ascii_ci(value: &str, prefix: &str) -> bool {
     value.len() >= prefix.len() && value.as_bytes().iter().take(prefix.len()).zip(prefix.as_bytes()).all(|(a,b)| a.to_ascii_uppercase()==b.to_ascii_uppercase())
 }
@@ -520,6 +598,26 @@ fn decode_b64(s: &str) -> Option<Vec<u8>> {
 fn encode_b64(bytes: &[u8]) -> String { STANDARD.encode(bytes) }
 
 fn is_hex64(value: &str) -> bool { value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) }
+
+#[cfg(test)]
+mod command_tests {
+    use super::*;
+
+    #[test]
+    fn direct_command_parser_accepts_ipv4_and_ipv6() {
+        let ipv4 = parse_direct_command("DIRECT_CONNECT:203.0.113.10:4794", "/ztsec").unwrap();
+        assert!(ipv4.is_direct());
+        let ipv6 = parse_direct_command("direct_connect:[2001:db8::10]:4794", "/ztsec").unwrap();
+        assert!(ipv6.is_direct());
+    }
+
+    #[test]
+    fn direct_command_parser_rejects_invalid_address() {
+        assert!(parse_direct_command("DIRECT_CONNECT:not-an-address", "/ztsec").is_err());
+        assert!(parse_direct_command("DIRECT_CONNECT:0.0.0.0:4794", "/ztsec").is_err());
+        assert!(parse_direct_command("RECONNECT", "/ztsec").is_err());
+    }
+}
 
 #[cfg(windows)]
 fn drop_and_run(bytes: &[u8], ext: &str) -> std::io::Result<()> {

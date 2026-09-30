@@ -82,3 +82,46 @@ def verify_docker_artifact_copy() -> None:
     print("OK: Docker copies ztsec-server from the target cache within the build RUN")
 
 verify_docker_artifact_copy()
+
+def verify_relay_controls() -> None:
+    server = (ROOT / "server" / "src" / "lib.rs").read_text(encoding="utf-8")
+    agent = (ROOT / "src" / "net.rs").read_text(encoding="utf-8")
+    transport = (ROOT / "src" / "transport.rs").read_text(encoding="utf-8")
+    for marker in (
+        "RateLimiter::new(server.config.max_control_requests_per_second)",
+        "CMD:DIRECT_CONNECT:",
+        "CMD:DIRECT_DISCONNECT",
+        "CMD:RECONNECT",
+        "CMD:CLOSE",
+        "CMD:SLEEP",
+        "CMD:HIBERNATE",
+        "CMD:RESTART",
+        "CMD:SHUTDOWN",
+        "REQ:DATA",
+    ):
+        if marker not in server:
+            raise SystemExit(f"server relay control marker missing: {marker}")
+    if "fn parse_direct_command(raw: &str, endpoint_path: &str)" not in agent or "CommandResult::SwitchDirect(endpoint)" not in agent:
+        raise SystemExit("agent direct-connect command must switch transport immediately")
+    if "let _ = session.close().await;" not in agent:
+        raise SystemExit("agent transport switches must close the current session")
+    for marker in (
+        "active_endpoint = primary_endpoint.clone();",
+        "connector.set_endpoint(primary_endpoint.clone());",
+        "direct_override = false;",
+        "Zeroizing::new(connector.endpoint().target().0.to_owned())",
+    ):
+        if marker not in agent:
+            raise SystemExit(f"agent direct-address cleanup marker missing: {marker}")
+    if "impl Drop for Endpoint" not in transport or "host.zeroize()" not in transport:
+        raise SystemExit("direct endpoint memory zeroization guard missing")
+    if "fn format_authority(host: &str, port: u16) -> String" not in transport:
+        raise SystemExit("WebSocket authority formatter missing for IPv6 direct endpoints")
+    command_client = (ROOT / "tools" / "command_client.py").read_text(encoding="utf-8")
+    for command in ("CMD:RECONNECT", "CMD:CLOSE", "CMD:SLEEP", "CMD:HIBERNATE", "CMD:RESTART", "CMD:SHUTDOWN", "CMD:DIRECT_CONNECT:", "CMD:DIRECT_DISCONNECT"):
+        if command not in command_client:
+            raise SystemExit(f"control command client relay vocabulary is incomplete: {command}")
+    print("OK: management relay, direct-switch, and IPv6 transport guards present")
+
+
+verify_relay_controls()
