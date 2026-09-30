@@ -38,8 +38,10 @@ COPY python_service.py ./python_service.py
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --package ztsec_server --bin ztsec-server
-
-RUN mkdir -p /out && cp target/release/ztsec-server /out/ztsec-server
+    cargo build --release --package ztsec_server --bin ztsec-server \
+    && test -s target/release/ztsec-server \
+    && mkdir -p /out \
+    && cp target/release/ztsec-server /out/ztsec-server \
+    && test -s /out/ztsec-server
 FROM scratch AS artifacts
 COPY --from=0 /out/ztsec-server /ztsec-server

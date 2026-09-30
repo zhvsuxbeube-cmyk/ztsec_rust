@@ -97,3 +97,9 @@ The Linux native Rust release build had already succeeded and produced `target/r
 The Dockerfile now copies the `Cargo.toml` files for both ZTSEC tool workspace members before `cargo generate-lockfile`, alongside the existing root/protocol/server manifests. The minimal source targets are still seeded before lockfile generation so each package has a valid target. The real source is copied later for the release build.
 
 No `vendor/arti` source was modified.
+
+## Docker failure: `cp: cannot stat target/release/ztsec-server`
+
+The Dockerfile used a BuildKit `type=cache` mount for `/src/target` during the release build, then attempted to access the generated binary from a later `RUN`. Docker documents cache mounts as build-time cache directories whose contents are not committed as normal image-layer filesystem changes. citeturn909897search0turn909897search11
+
+The release build and copy to `/out/ztsec-server` now happen in the same mounted `RUN`, with explicit non-empty checks. This preserves the target cache while making the exported artifact part of the image filesystem.

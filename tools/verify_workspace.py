@@ -55,3 +55,25 @@ for marker in required_manifest_markers:
     if pos < 0 or pos > lock_step:
         raise SystemExit(f"Dockerfile must copy workspace member manifest before cargo generate-lockfile: {marker}")
 print("OK: Docker lockfile stage copies every ZTSEC workspace package manifest")
+
+
+def verify_docker_artifact_copy() -> None:
+    dockerfile = (ROOT / "docker" / "rust-server-builder.Dockerfile").read_text(encoding="utf-8")
+    build_pos = dockerfile.find("cargo build --release --package ztsec_server --bin ztsec-server")
+    if build_pos < 0:
+        raise SystemExit("Dockerfile missing release server build")
+    # The target directory is a BuildKit cache mount. The binary must be copied
+    # to a normal image-layer path while that mount is active.
+    copy_pos = dockerfile.find("cp target/release/ztsec-server /out/ztsec-server", build_pos)
+    if copy_pos < 0:
+        raise SystemExit("Dockerfile must copy ztsec-server to /out in the build RUN")
+    next_run = dockerfile.find("\nRUN ", build_pos + 1)
+    if next_run >= 0 and copy_pos > next_run:
+        raise SystemExit("Dockerfile copies the cached target binary in a later RUN layer")
+    if "test -s target/release/ztsec-server" not in dockerfile:
+        raise SystemExit("Dockerfile must verify the built Linux server binary")
+    if "test -s /out/ztsec-server" not in dockerfile:
+        raise SystemExit("Dockerfile must verify the exported Linux server binary")
+    print("OK: Docker copies ztsec-server from the target cache within the build RUN")
+
+verify_docker_artifact_copy()

@@ -94,6 +94,7 @@ jobs:
           trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true; rm -f ztsec-server-docker' EXIT
           docker cp "$container_id:/ztsec-server" ./ztsec-server-docker 2>&1 | tee -a docker_build.log linux_log.log
           test -s ./ztsec-server-docker
+          stat -c '%s bytes' ./ztsec-server-docker | tee -a docker_build.log linux_log.log
           file ./ztsec-server-docker | tee -a docker_build.log linux_log.log
           ls -lh ./ztsec-server-docker | tee -a docker_build.log linux_log.log
       - name: Upload Docker build log
