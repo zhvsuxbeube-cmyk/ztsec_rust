@@ -41,6 +41,9 @@ jobs:
             git diff -- vendor/arti >&2 || true
             exit 1
           fi
+      - name: Verify ZTSEC workspace excludes vendored Arti
+        shell: bash
+        run: python3 tools/verify_workspace.py
       - name: Cargo check preflight
         shell: bash
         run: |
@@ -124,6 +127,9 @@ jobs:
             $diff
             exit 1
           }
+      - name: Verify ZTSEC workspace excludes vendored Arti
+        shell: pwsh
+        run: python tools/verify_workspace.py
       - name: Cargo check preflight
         shell: pwsh
         run: |

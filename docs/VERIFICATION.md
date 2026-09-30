@@ -104,3 +104,33 @@ supplied Arti 0.46.0 source.
 
 The latest hosted run failed at `tools/load-test/src/main.rs:75` with Rust `E0283` because Tungstenite 0.30.0's `Utf8Bytes` has multiple `AsRef` implementations. The load test now uses `Utf8Bytes::as_str()` for the `AUTH:OK` comparison and includes a regression test for that response. No Arti source is modified.
 
+
+## Latest Linux runner failure analysis
+
+The latest hosted Linux log contained 11 errors, all from `vendor/arti/crates/tor-circmgr` compiled as a `lib test`. The failing symbols (`construct_custom_netdir`, `OwnedPath`, `VanguardMode`, `VanguardMgr`, `testing_rng`, and `pick_path_with_vanguards`) are Arti's internal test-only APIs and are not required by the ZTSEC application.
+
+The underlying cause was workspace membership: Cargo automatically includes path dependencies located inside the workspace directory unless they are explicitly excluded. The ZTSEC workspace depends on vendored Arti by path, so `cargo test --workspace` was selecting Arti's own unit-test targets. The root workspace now explicitly excludes `vendor/arti`. This keeps Arti available as a normal path dependency while preventing its independent test targets from becoming ZTSEC workspace members.
+
+No Arti source was modified.
+
+## Latest Linux runner failure: vendored Arti workspace membership
+
+The supplied Linux runner log contained 11 errors while compiling `vendor/arti/crates/tor-circmgr` as `lib test`. These were Arti's internal test-only symbols (`construct_custom_netdir`, `OwnedPath`, `VanguardMode`, `VanguardMgr`, `testing_rng`, and `pick_path_with_vanguards`) and were not ZTSEC application errors.
+
+The underlying Cargo behavior is that path dependencies located inside a workspace directory can be discovered as workspace members unless explicitly excluded. Because ZTSEC uses vendored Arti by path, `cargo test --workspace` was selecting Arti test targets. The root workspace now contains `exclude = ["vendor/arti"]`. Arti remains a normal path dependency of the agent/server, but its independent tests are not selected by ZTSEC workspace commands.
+
+No Arti source was modified.
+
+## Latest uploaded Linux log repair (2026-09-30)
+
+The uploaded Linux log contained 11 errors from `vendor/arti/crates/tor-circmgr` compiled as `lib test`. No ZTSEC package was failing in that section of the log.
+
+The root cause was that `vendor/arti` is a path dependency located under the ZTSEC workspace directory. Cargo can automatically discover such path dependencies as workspace members unless the path is explicitly excluded. The root workspace now declares:
+
+```toml
+exclude = ["vendor/arti"]
+```
+
+This keeps Arti available as a normal path dependency for the ZTSEC agent/server while preventing `cargo test --workspace` from selecting Arti's own test targets. No Arti source was changed.
+
+A CI preflight script (`tools/verify_workspace.py`) is run on both Linux and Windows before Cargo validation to ensure the exclusion remains present.

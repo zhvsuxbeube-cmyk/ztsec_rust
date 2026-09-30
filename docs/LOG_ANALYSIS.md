@@ -44,3 +44,19 @@ Project-owned warnings in the same run were Windows-only symbols being compiled 
 
 The newly uploaded Linux log progressed through the ZTSEC server and agent checks and failed only when checking `ztsec_load_test`. The exact error was `E0283` at `tools/load-test/src/main.rs:75`: Tungstenite 0.30.0 defines multiple `AsRef` implementations for `Utf8Bytes`, making `text.as_ref() == "AUTH:OK"` ambiguous. The comparison now uses `text.as_str() == "AUTH:OK"`, which is explicit and allocation-free. A regression unit test was added for the exact authentication response. No file under `vendor/arti` was modified.
 
+
+## Linux runner failure: vendored Arti selected as workspace member
+
+The latest Linux CI log did not contain a ZTSEC source compilation failure. It contained 11 errors while compiling `tor-circmgr` as a `lib test` under `vendor/arti`.
+
+Root cause: the vendored Arti crates are path dependencies inside the ZTSEC workspace directory. Cargo automatically discovers such path dependencies as workspace members unless they are listed under `[workspace].exclude`. Consequently `cargo test --workspace` selected Arti's own test target, whose feature-gated test helpers were not available under the ZTSEC dependency feature set.
+
+Fix: add `exclude = ["vendor/arti"]` to the root workspace. Arti remains a path dependency and is still compiled as a normal dependency of the ZTSEC agent/server, but its own tests are no longer selected by ZTSEC workspace commands.
+
+Arti source remains byte-for-byte unchanged.
+
+## Latest Linux runner log
+
+The latest Linux failure was not a ZTSEC compiler error. It was the upstream Arti `tor-circmgr` unit-test target being selected by `cargo test --workspace`. The ZTSEC workspace now explicitly excludes `vendor/arti`, which prevents Cargo from treating the vendored path dependency as an application workspace member while retaining it as a normal dependency.
+
+No `vendor/arti` source was changed.

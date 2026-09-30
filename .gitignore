@@ -1,3 +1,5 @@
 /target/
 *.log
 *.zip
+__pycache__/
+*.py[cod]

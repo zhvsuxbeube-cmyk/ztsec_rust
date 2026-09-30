@@ -6,6 +6,9 @@ rust-version = "1.92"
 
 [workspace]
 members = ["protocol", "server", "tools/auth-keygen", "tools/load-test"]
+# Arti is a vendored path dependency, not part of this application workspace.
+# Excluding it prevents `cargo test --workspace` from selecting Arti's own unit-test targets.
+exclude = ["vendor/arti"]
 resolver = "3"
 
 [dependencies]
