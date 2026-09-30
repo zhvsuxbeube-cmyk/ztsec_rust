@@ -266,6 +266,7 @@ fn icmp_ping_ms(ip: Ipv4Addr) -> Option<u128> {
     result
 }
 
+#[cfg(any(windows, test))]
 fn fmt_duration(secs: u64) -> String {
     let d = secs / 86_400;
     let h = (secs % 86_400) / 3_600;

@@ -31,3 +31,12 @@ This upstream warning is intentionally left unchanged. The supplied Arti 0.46.0 
 ## Verification policy
 
 The exact uploaded logs are retained as `linux_log.log` and `windows_log.log`. Local `cargo check` is still unavailable in this execution environment because Rust/Cargo are not installed, so hosted Linux and Windows runners remain the authoritative compile validation.
+
+
+## Linux — latest failure (2026-09-30)
+
+The latest hosted Linux preflight failed after `ztsec_server` and `ztsec_agent` had checked successfully. `tools/load-test` failed because `tokio_tungstenite::connect_async_with_config` is gated behind the crate's `connect` feature; the load-test crate previously enabled only `handshake`. The ten follow-on type-inference errors were consequences of that missing import.
+
+The same run then checked an upstream `tor-circmgr` library test from the vendored Arti dependency and reported feature-gated test symbols such as `VanguardMgr`, `OwnedPath`, and `construct_custom_netdir`. These are not ZTSEC code defects. The CI gate is corrected to avoid `--all-targets`, which is what brought those dependency test targets into the application check. No Arti source is changed.
+
+Project-owned warnings in the same run were Windows-only symbols being compiled into the Linux build (`fmt_duration`, plugin error strings, registry constants, PowerShell constants, and `PARENT_WAIT`). Those are now cfg-gated so the Linux production target does not carry unused Windows-only items.

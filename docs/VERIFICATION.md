@@ -46,9 +46,13 @@ The required Tokio/native-TLS runtime features are enabled through the direct
 The invalid `tor-rtcompat/tokio` and `tor-rtcompat/native-tls` entries are no longer
 listed as direct dependency features.
 
+## Workspace target selection
+
+The preflight intentionally does not use Cargo `--all-targets`. The previous Linux run showed that `--all-targets` caused Cargo to check upstream Arti test targets from a path dependency; Arti 0.46.0 has feature-gated internal tests that are not part of this application's supported feature set. The ZTSEC workspace is instead checked with its normal library/binary targets, and its own workspace tests are run separately with `cargo test --workspace`. This avoids modifying or forking Arti simply to satisfy an application-level CI gate.
+
 ## CI cargo-check logs
 
-The Linux hosted runner executes `cargo check --workspace --all-targets`; the Windows hosted runner executes `cargo check --package ztsec_agent --all-targets` because `ztsec_server` is Linux-only. Both run these checks before dependency generation, tests, or release builds. The complete stdout/stderr is captured to `linux_log.log` on Linux and `windows_log.log` on Windows and uploaded as separate workflow artifacts even when `cargo check` fails. These logs are intended to preserve every compiler error and warning emitted by the preflight check.
+The Linux hosted runner executes `cargo check --workspace`; the Windows hosted runner executes `cargo check --package ztsec_agent` because `ztsec_server` is Linux-only. These are the application workspace targets, excluding upstream dependency test targets. Both run these checks before dependency generation, tests, or release builds. The complete stdout/stderr is captured to `linux_log.log` on Linux and `windows_log.log` on Windows and uploaded as separate workflow artifacts even when `cargo check` fails. These logs are intended to preserve every compiler error and warning emitted by the preflight check.
 
 ## CI #90 error inventory
 
@@ -74,8 +78,9 @@ Cargo commands. This ensures later compiler/linker errors and warnings are retai
 
 The supplied Arti 0.46.0 source is intentionally unchanged. Its upstream
 `tor-dirclient` `LZMA_DICT_MEM_LIMIT` dead-code warning is retained as an upstream warning
-rather than modifying or forking Arti. The output source ZIP excludes the unchanged
-`vendor/arti` tree because the same vendor source is already present in the GitHub repository.
+rather than modifying or forking Arti. CI now explicitly checks that `vendor/arti` remains
+unchanged. The output source ZIP excludes the unchanged `vendor/arti` tree because the same
+vendor source is already present in the GitHub repository.
 
 ## CI log repair — latest build failure
 

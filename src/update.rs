@@ -36,6 +36,7 @@ const FINAL_FINGERPRINT_ARG: &str = "--ztsec-update-final-fingerprint=";
 
 const PROBE_WAIT: Duration = Duration::from_secs(45);
 const CHILD_WAIT: Duration = Duration::from_secs(45);
+#[cfg(windows)]
 const PARENT_WAIT: Duration = Duration::from_secs(120);
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const PROBE_READ_TIMEOUT: Duration = Duration::from_secs(15);
