@@ -141,3 +141,17 @@ The server package explicitly declares the hyphenated `ztsec-server` binary targ
 ### CI shell-script execution
 
 `tools/local_integration.sh` is executed explicitly with Bash in GitHub Actions after `chmod +x`, avoiding failures caused by checkout/filesystem executable-bit metadata.
+
+## Docker builder repair — missing workspace member manifest
+
+The latest Docker build failed at `cargo generate-lockfile` because the Dockerfile had not copied `tools/auth-keygen/Cargo.toml` (and therefore did not fully materialize the ZTSEC workspace) before running Cargo. The failure occurred before the server release build inside Docker.
+
+The Docker dependency layer now copies all five ZTSEC workspace manifests before lockfile generation:
+
+- root `Cargo.toml`
+- `protocol/Cargo.toml`
+- `server/Cargo.toml`
+- `tools/auth-keygen/Cargo.toml`
+- `tools/load-test/Cargo.toml`
+
+The lockfile layer then seeds minimal targets for those packages. The actual application source is copied afterward and the real `ztsec-server` release binary is built in the final compile layer. A static verifier checks that every workspace member manifest is copied before `cargo generate-lockfile` so this failure cannot recur from a missing manifest copy.

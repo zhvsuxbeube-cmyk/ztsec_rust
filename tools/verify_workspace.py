@@ -44,3 +44,14 @@ for marker in required_target_markers:
     if pos < 0 or pos > lock_step:
         raise SystemExit(f"Dockerfile must seed workspace target before cargo generate-lockfile: {marker}")
 print("OK: Docker lockfile stage seeds every ZTSEC workspace package target")
+required_manifest_markers = [
+    "COPY protocol/Cargo.toml ./protocol/Cargo.toml",
+    "COPY server/Cargo.toml ./server/Cargo.toml",
+    "COPY tools/auth-keygen/Cargo.toml ./tools/auth-keygen/Cargo.toml",
+    "COPY tools/load-test/Cargo.toml ./tools/load-test/Cargo.toml",
+]
+for marker in required_manifest_markers:
+    pos = docker_text.find(marker)
+    if pos < 0 or pos > lock_step:
+        raise SystemExit(f"Dockerfile must copy workspace member manifest before cargo generate-lockfile: {marker}")
+print("OK: Docker lockfile stage copies every ZTSEC workspace package manifest")

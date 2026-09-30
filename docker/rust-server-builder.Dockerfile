@@ -7,6 +7,8 @@ WORKDIR /src
 COPY Cargo.toml ./Cargo.toml
 COPY protocol/Cargo.toml ./protocol/Cargo.toml
 COPY server/Cargo.toml ./server/Cargo.toml
+COPY tools/auth-keygen/Cargo.toml ./tools/auth-keygen/Cargo.toml
+COPY tools/load-test/Cargo.toml ./tools/load-test/Cargo.toml
 COPY vendor/arti/Cargo.toml ./vendor/arti/Cargo.toml
 COPY vendor/arti/crates ./vendor/arti/crates
 # Every ZTSEC workspace package must have an inferred target for Cargo to

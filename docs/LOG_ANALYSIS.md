@@ -87,3 +87,13 @@ The Linux runner successfully compiled and tested the ZTSEC Rust workspace and p
 The Dockerfile now seeds minimal target source files for every ZTSEC workspace package before `cargo generate-lockfile`; the real source trees are copied afterward and replace those stubs before the release build. This preserves dependency-layer caching while ensuring Cargo can parse the complete application workspace.
 
 No `vendor/arti` source was modified. CI also records the Docker build output in `docker_build.log` and appends it to `linux_log.log`, then extracts `/ztsec-server` from the scratch image and verifies the extracted artifact is non-empty.
+
+## Latest Docker builder failure
+
+The Linux native Rust release build had already succeeded and produced `target/release/ztsec-server`. The Docker build then failed during its dependency-cache layer at `cargo generate-lockfile` because the root workspace referenced `tools/auth-keygen` but the Dockerfile had copied only the root, protocol, server, and Arti manifests. Cargo therefore reported:
+
+`failed to read /src/tools/auth-keygen/Cargo.toml: No such file or directory`
+
+The Dockerfile now copies the `Cargo.toml` files for both ZTSEC tool workspace members before `cargo generate-lockfile`, alongside the existing root/protocol/server manifests. The minimal source targets are still seeded before lockfile generation so each package has a valid target. The real source is copied later for the release build.
+
+No `vendor/arti` source was modified.
