@@ -16,7 +16,7 @@ serde_json = "1.0.151"
 tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 tor-cell = { path = "../vendor/arti/crates/tor-cell", version = "0.46.0", features = ["hs"] }
-tor-hsservice = { path = "../vendor/arti/crates/tor-hsservice", version = "0.46.0", default-features = false, features = ["tor-rtcompat/tokio", "tor-rtcompat/native-tls"] }
+tor-hsservice = { path = "../vendor/arti/crates/tor-hsservice", version = "0.46.0", default-features = false }
 tor-proto = { path = "../vendor/arti/crates/tor-proto", version = "0.46.0", default-features = false, features = ["hs-service", "tokio"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
