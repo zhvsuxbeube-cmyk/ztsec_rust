@@ -1,4 +1,4 @@
-use std::{io, path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
 use arti_client::{config::TorClientConfigBuilder, DataStream, TorClient};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -200,25 +200,28 @@ impl Connector {
             .body(())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-        match &self.endpoint {
+        let endpoint = self.endpoint.clone();
+        match endpoint {
             Endpoint::Local { host, port, .. } => {
-                let stream = timeout(connect_timeout, TcpStream::connect((host.as_str(), *port)))
+                let stream = timeout(connect_timeout, TcpStream::connect((host.as_str(), port)))
                     .await
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket connect timeout"))??;
                 let (ws, _) = timeout(handshake_timeout, client_async_with_config(request, stream, Some(ws_config())))
                     .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket handshake timeout"))??;
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket handshake timeout"))?
+                    .map_err(ws_io)?;
                 Ok(Session::Local(ws))
             }
             Endpoint::Onion { host, port, .. } => {
                 let tor = self.ensure_tor(handshake_timeout).await?;
-                let stream = timeout(connect_timeout, tor.connect((host.as_str(), *port)))
+                let stream = timeout(connect_timeout, tor.connect((host.as_str(), port)))
                     .await
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Tor onion connection timeout"))?
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Tor onion connection failed: {e}")))?;
                 let (ws, _) = timeout(handshake_timeout, client_async_with_config(request, stream, Some(ws_config())))
                     .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "onion WebSocket handshake timeout"))??;
+                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "onion WebSocket handshake timeout"))?
+                    .map_err(ws_io)?;
                 Ok(Session::Tor(ws))
             }
         }

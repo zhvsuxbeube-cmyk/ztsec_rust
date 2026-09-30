@@ -28,6 +28,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml', 'protocol/Cargo.toml', 'server/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+      - name: Cargo check preflight
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo check --workspace --all-targets 2>&1 | tee linux_log.log
       - name: Generate dependency lockfile
         run: cargo generate-lockfile
       - name: Test Rust workspace
@@ -46,6 +51,13 @@ jobs:
         run: tools/local_integration.sh
       - name: Docker build validation
         run: docker build -f docker/rust-server-builder.Dockerfile --target artifacts -t ztsec-rust-builder .
+      - name: Upload Linux cargo check log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-cargo-check-log
+          path: linux_log.log
+          if-no-files-found: error
       - name: Upload Linux server
         uses: actions/upload-artifact@v4
         with:
@@ -71,6 +83,12 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.toml', 'protocol/Cargo.toml', 'server/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
+      - name: Cargo check preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & cargo check --package ztsec_agent --all-targets 2>&1 | Tee-Object -FilePath windows_log.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Generate dependency lockfile
         run: cargo generate-lockfile
       - name: Test agent
@@ -187,7 +205,14 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item dist\update-e2e\ztsec_agent.exe dist\ztsec_agent.exe -Force
-          Compress-Archive -Path dist\ztsec_agent.exe,dist\hello.dll,dist\exports.txt -DestinationPath ztsec_agent-win64.zip -Force
+          Compress-Archive -Path dist\ztsec_agent.exe,dist\hello.dll,dist\exports.txt,windows_log.log -DestinationPath ztsec_agent-win64.zip -Force
+      - name: Upload Windows cargo check log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cargo-check-log
+          path: windows_log.log
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: ztsec-agent-win64

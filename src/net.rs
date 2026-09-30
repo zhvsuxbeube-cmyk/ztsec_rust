@@ -461,9 +461,9 @@ async fn handle_command(
                     return CommandResult::Close;
                 }
                 let _=session.send_text(&format!("{}{}",text::ACK,text::UPDATE)).await;
-                CommandResult::Close
+                return CommandResult::Close;
             }
-            _ => { let _=session.send_text(&format!("{}{}",text::ERR,text::UPDATE)).await; CommandResult::Continue }
+            _ => { let _=session.send_text(&format!("{}{}",text::ERR,text::UPDATE)).await; return CommandResult::Continue; }
         }
     }
 

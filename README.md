@@ -392,3 +392,7 @@ MIGRATION
 3. The supplied Arti version is 0.46.0. Its onion-service implementation has documented limitations compared with a mature separately managed C Tor deployment; review the 0.46.0 Arti documentation/source before production threat-model sign-off.
 4. The ZIP did not contain a pre-existing production server-side command/business layer, so the new Rust/Python IPC boundary focuses on validated telemetry ingest plus the acknowledgement required by the existing agent/update readiness flow. The original legacy direct-TCP command path is retained for compatibility testing.
 5. A root `Cargo.lock` could not be generated in this environment because Cargo is unavailable. The release CI is responsible for lockfile generation/verification before building; the vendored Arti source itself includes its reviewed 0.46.0 lockfile.
+
+## CI compiler logs
+
+The Linux and Windows CI jobs run `cargo check --workspace --all-targets` before lockfile generation, tests, or release builds. Complete stdout/stderr is captured to `linux_log.log` and `windows_log.log` respectively. The logs are uploaded as dedicated artifacts on every runner outcome and are included in the final release bundle when both platform jobs succeed.

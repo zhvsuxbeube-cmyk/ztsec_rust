@@ -59,15 +59,19 @@ async fn run_one(endpoint: &str, fingerprint: &str, signing: &SigningKey, durati
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timeout"))?
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     ws.send(Message::Text(format!("HELLO:FINGERPRINT:{fingerprint}").into())).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    let challenge = timeout(Duration::from_secs(10), ws.next()).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "challenge timeout"))??
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "challenge eof"))?;
+    let challenge = timeout(Duration::from_secs(10), ws.next()).await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "challenge timeout"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "challenge eof"))?
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("challenge read failed: {e}")))?;
     let challenge = match challenge { Message::Text(text) => text.to_string(), _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "challenge not text")) };
     let nonce = STANDARD.decode(challenge.strip_prefix("AUTH:CHALLENGE:").ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid challenge"))?).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid nonce"))?;
     let signature = signing.sign(&ztsec_protocol::auth_message(fingerprint, &nonce));
     let pk = signing.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>();
     ws.send(Message::Text(format!("AUTH:RESPONSE:{pk}:{}", STANDARD.encode(signature.to_bytes())).into())).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    let auth = timeout(Duration::from_secs(10), ws.next()).await.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "auth timeout"))??
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "auth eof"))?;
+    let auth = timeout(Duration::from_secs(10), ws.next()).await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "auth timeout"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "auth eof"))?
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("auth read failed: {e}")))?;
     if !matches!(auth, Message::Text(ref text) if text.as_ref() == "AUTH:OK") { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "auth failed")); }
     let data = "DATA:Local|load-test|ZTSecurity|load|Rust-Native/1|User|Linux|GPU|CPU|Unknown|Unknown|0m|0m|0 ms|load-hwid|".to_string() + fingerprint;
     let until = Instant::now() + duration;

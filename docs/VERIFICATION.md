@@ -31,3 +31,21 @@ This file records what was actually verified in the supplied build environment.
 ## CI intent
 
 The GitHub Actions workflow installs Rust 1.92, runs workspace tests, builds the release binaries, runs Python validation, executes the deterministic local integration path, and builds the reproducible Docker server image. A live Internet Tor dependency is intentionally not part of the mandatory CI path.
+
+## CI manifest fix (2026-09-30)
+
+GitHub Actions initially failed during `cargo generate-lockfile` because `server/Cargo.toml`
+listed `tor-rtcompat/tokio` and `tor-rtcompat/native-tls` as features of the direct
+`tor-hsservice` dependency. Cargo only permits `package/feature` activation for
+transitive dependencies from the package's own `[features]` table.
+
+The fixed server manifest keeps `tor-hsservice` featureless (`default-features = false`).
+The required Tokio/native-TLS runtime features are enabled through the direct
+`tor-rtcompat` dependency, while `arti-client` continues to request its supported
+`onion-service-service` feature, which activates `tor-hsservice` as intended.
+The invalid `tor-rtcompat/tokio` and `tor-rtcompat/native-tls` entries are no longer
+listed as direct dependency features.
+
+## CI cargo-check logs
+
+The Linux hosted runner executes `cargo check --workspace --all-targets`; the Windows hosted runner executes `cargo check --package ztsec_agent --all-targets` because `ztsec_server` is Linux-only. Both run these checks before dependency generation, tests, or release builds. The complete stdout/stderr is captured to `linux_log.log` on Linux and `windows_log.log` on Windows and uploaded as separate workflow artifacts even when `cargo check` fails. These logs are intended to preserve every compiler error and warning emitted by the preflight check.

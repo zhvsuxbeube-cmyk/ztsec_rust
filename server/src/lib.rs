@@ -186,7 +186,7 @@ impl Server {
                 Ok(value) => value,
                 Err(error) => {
                     self.shutdown();
-                    let _ = timeout(Duration::from_secs(5), ipc_task).await;
+                    ipc_task.abort();
                     return Err(error);
                 }
             };
@@ -398,15 +398,17 @@ impl Server {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "authentication admission timeout"))?
             .map_err(|_| io::Error::new(io::ErrorKind::Other, "authentication semaphore closed"))?;
         let first = timeout(self.config.auth_timeout, ws.next()).await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "authentication timeout"))??
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "client closed during authentication"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "authentication timeout"))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "client closed during authentication"))?
+            .map_err(ws_err)?;
         let fingerprint = match first { tokio_tungstenite::tungstenite::Message::Text(text) => ztsec_protocol::parse_fingerprint_line(text.as_ref()).map_err(protocol_err)?.to_owned(), _ => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "authentication must begin with fingerprint hello")) };
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
         ws.send(tokio_tungstenite::tungstenite::Message::Text(format!("AUTH:CHALLENGE:{}", STANDARD.encode(nonce)).into())).await.map_err(ws_err)?;
         let response = timeout(self.config.auth_timeout, ws.next()).await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "authentication response timeout"))??
-            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "client closed during authentication response"))?;
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "authentication response timeout"))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "client closed during authentication response"))?
+            .map_err(ws_err)?;
         let (public_hex, signature_b64) = match response {
             tokio_tungstenite::tungstenite::Message::Text(text) => parse_auth_response(text.as_ref())?,
             _ => return Err(io::Error::new(io::ErrorKind::PermissionDenied, "authentication response must be text")),
