@@ -81,8 +81,28 @@ jobs:
           set -o pipefail
           chmod +x tools/local_integration.sh 2>&1 | tee -a linux_log.log
           bash tools/local_integration.sh 2>&1 | tee -a linux_log.log
+      - name: Initialize Docker build log
+        shell: bash
+        run: |
+          : > docker_build.log
       - name: Docker build validation
-        run: docker build -f docker/rust-server-builder.Dockerfile --target artifacts -t ztsec-rust-builder .
+        shell: bash
+        run: |
+          set -o pipefail
+          docker build -f docker/rust-server-builder.Dockerfile --target artifacts -t ztsec-rust-builder . 2>&1 | tee -a docker_build.log linux_log.log
+          container_id=$(docker create ztsec-rust-builder)
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true; rm -f ztsec-server-docker' EXIT
+          docker cp "$container_id:/ztsec-server" ./ztsec-server-docker 2>&1 | tee -a docker_build.log linux_log.log
+          test -s ./ztsec-server-docker
+          file ./ztsec-server-docker | tee -a docker_build.log linux_log.log
+          ls -lh ./ztsec-server-docker | tee -a docker_build.log linux_log.log
+      - name: Upload Docker build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-docker-build-log
+          path: docker_build.log
+          if-no-files-found: error
       - name: Upload Linux cargo check log
         if: always()
         uses: actions/upload-artifact@v4

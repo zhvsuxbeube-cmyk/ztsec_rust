@@ -79,3 +79,11 @@ The newest Linux log showed all workspace tests passing, followed by `error: no 
 ## CI permission-denied failure
 
 The Linux runner reported `tools/local_integration.sh: Permission denied` with exit code 126. The workflow previously executed the file directly. The job now explicitly runs `chmod +x tools/local_integration.sh` followed by `bash tools/local_integration.sh`, so CI no longer depends on repository executable-bit metadata. The script itself is also stored executable in the working tree.
+
+## CI Docker failure: root package target missing
+
+The Linux runner successfully compiled and tested the ZTSEC Rust workspace and produced `target/release/ztsec-server`. The Docker build then failed in its dependency-cache stage because the repository root is itself a Cargo package and the Dockerfile copied only Cargo manifests before running `cargo generate-lockfile`. With no `src/main.rs` present in `/src`, Cargo reported `no targets specified in the manifest`.
+
+The Dockerfile now seeds minimal target source files for every ZTSEC workspace package before `cargo generate-lockfile`; the real source trees are copied afterward and replace those stubs before the release build. This preserves dependency-layer caching while ensuring Cargo can parse the complete application workspace.
+
+No `vendor/arti` source was modified. CI also records the Docker build output in `docker_build.log` and appends it to `linux_log.log`, then extracts `/ztsec-server` from the scratch image and verifies the extracted artifact is non-empty.

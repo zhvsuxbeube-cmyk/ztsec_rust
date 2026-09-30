@@ -24,3 +24,23 @@ bin_match = re.search(r'(?ms)^\[\[bin\]\]\s*name\s*=\s*"([^"]+)"\s*path\s*=\s*"(
 if not bin_match or bin_match.group(1) != "ztsec-server" or bin_match.group(2) != "src/main.rs":
     raise SystemExit("server/Cargo.toml binary target must be ztsec-server from src/main.rs")
 print("OK: vendor/arti is excluded and ztsec-server is the explicit Linux binary target")
+dockerfile = ROOT / "docker" / "rust-server-builder.Dockerfile"
+docker_text = dockerfile.read_text(encoding="utf-8")
+import re as _re
+lock_match = _re.search(r"(?m)^\s+cargo generate-lockfile\s*$", docker_text)
+if not lock_match:
+    raise SystemExit("Dockerfile must contain a cargo generate-lockfile step")
+lock_step = lock_match.start()
+required_target_markers = [
+    "printf 'fn main() {}\\n' > src/main.rs",
+    "printf 'fn main() {}\\n' > server/src/main.rs",
+    "printf 'pub fn docker_lockfile_stub() {}\\n' > server/src/lib.rs",
+    "printf 'pub fn docker_lockfile_stub() {}\\n' > protocol/src/lib.rs",
+    "printf 'fn main() {}\\n' > tools/auth-keygen/src/main.rs",
+    "printf 'fn main() {}\\n' > tools/load-test/src/main.rs",
+]
+for marker in required_target_markers:
+    pos = docker_text.find(marker)
+    if pos < 0 or pos > lock_step:
+        raise SystemExit(f"Dockerfile must seed workspace target before cargo generate-lockfile: {marker}")
+print("OK: Docker lockfile stage seeds every ZTSEC workspace package target")

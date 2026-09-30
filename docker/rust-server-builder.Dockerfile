@@ -9,6 +9,17 @@ COPY protocol/Cargo.toml ./protocol/Cargo.toml
 COPY server/Cargo.toml ./server/Cargo.toml
 COPY vendor/arti/Cargo.toml ./vendor/arti/Cargo.toml
 COPY vendor/arti/crates ./vendor/arti/crates
+# Every ZTSEC workspace package must have an inferred target for Cargo to
+# parse the application workspace during `cargo generate-lockfile`. The real
+# source tree is copied later; these tiny targets exist only for this cache
+# layer and are overwritten before the release build.
+RUN mkdir -p src protocol/src server/src tools/auth-keygen/src tools/load-test/src \
+    && printf 'fn main() {}\n' > src/main.rs \
+    && printf 'fn main() {}\n' > server/src/main.rs \
+    && printf 'pub fn docker_lockfile_stub() {}\n' > server/src/lib.rs \
+    && printf 'pub fn docker_lockfile_stub() {}\n' > protocol/src/lib.rs \
+    && printf 'fn main() {}\n' > tools/auth-keygen/src/main.rs \
+    && printf 'fn main() {}\n' > tools/load-test/src/main.rs
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
