@@ -64,6 +64,10 @@ jobs:
         run: |
           set -o pipefail
           cargo build --release --package ztsec_server --bin ztsec-server 2>&1 | tee -a linux_log.log
+          test -f target/release/ztsec-server
+          test -x target/release/ztsec-server
+          ls -lh target/release/ztsec-server | tee -a linux_log.log
+          file target/release/ztsec-server | tee -a linux_log.log
           cargo build --manifest-path tools/auth-keygen/Cargo.toml 2>&1 | tee -a linux_log.log
           cargo build --manifest-path tools/load-test/Cargo.toml --release 2>&1 | tee -a linux_log.log
       - name: Python tests
@@ -83,10 +87,12 @@ jobs:
           path: linux_log.log
           if-no-files-found: error
       - name: Upload Linux server
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ztsec-server-linux-x64
           path: target/release/ztsec-server
+          if-no-files-found: error
 
   windows:
     runs-on: windows-latest
@@ -157,6 +163,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & cargo build --release --target x86_64-pc-windows-msvc --bin ztsec_agent 2>&1 | Tee-Object -FilePath windows_log.log -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $agentPath = Join-Path $PWD 'target\x86_64-pc-windows-msvc\release\ztsec_agent.exe'
+          if (-not (Test-Path $agentPath -PathType Leaf)) { throw "agent binary was not produced: $agentPath" }
+          $agentSize = (Get-Item $agentPath).Length
+          if ($agentSize -le 0) { throw 'agent binary is empty' }
+          Write-Host "agent binary: $agentPath ($agentSize bytes)"
+          Add-Content -Path windows_log.log -Value "agent binary: $agentPath ($agentSize bytes)"
       - name: Plugin
         shell: pwsh
         run: |

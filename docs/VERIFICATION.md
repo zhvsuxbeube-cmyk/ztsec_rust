@@ -52,7 +52,7 @@ The preflight intentionally does not use Cargo `--all-targets`. The previous Lin
 
 ## CI cargo-check logs
 
-The Linux hosted runner executes `cargo check --workspace`; the Windows hosted runner executes `cargo check --package ztsec_agent` because `ztsec_server` is Linux-only. These are the application workspace targets, excluding upstream dependency test targets. Both run these checks before dependency generation, tests, or release builds. The complete stdout/stderr is captured to `linux_log.log` on Linux and `windows_log.log` on Windows and uploaded as separate workflow artifacts even when `cargo check` fails. These logs are intended to preserve every compiler error and warning emitted by the preflight check.
+The Linux server package explicitly declares the `ztsec-server` binary target so CI produces the documented executable name. The Linux hosted runner executes `cargo check --workspace`; the Windows hosted runner executes `cargo check --package ztsec_agent` because `ztsec_server` is Linux-only. These are the application workspace targets, excluding upstream dependency test targets. Both run these checks before dependency generation, tests, or release builds. The complete stdout/stderr is captured to `linux_log.log` on Linux and `windows_log.log` on Windows and uploaded as separate workflow artifacts even when `cargo check` fails. These logs are intended to preserve every compiler error and warning emitted by the preflight check.
 
 ## CI #90 error inventory
 
@@ -134,3 +134,6 @@ exclude = ["vendor/arti"]
 This keeps Arti available as a normal path dependency for the ZTSEC agent/server while preventing `cargo test --workspace` from selecting Arti's own test targets. No Arti source was changed.
 
 A CI preflight script (`tools/verify_workspace.py`) is run on both Linux and Windows before Cargo validation to ensure the exclusion remains present.
+
+## Linux binary production guard
+The server package explicitly declares the hyphenated `ztsec-server` binary target used by CI, Docker, local integration, deployment, and release packaging. After the Linux release build, CI verifies that `target/release/ztsec-server` exists, is executable, and is non-empty before attempting artifact upload.

@@ -69,3 +69,9 @@ while the test asserted the existing 64-character fingerprint contract. The fixt
 This is a test-data correction; protocol behavior was not changed.
 
 No `vendor/arti` source was modified.
+
+## Latest Linux binary-production failure
+The newest Linux log showed that `cargo test --workspace` completed successfully, including all ZTSEC tests. The failure then occurred in the release-build step: Cargo reported `no bin target named ztsec-server` for package `ztsec_server`, with `ztsec_server` suggested as the existing target. The CI/deployment/tooling consistently expect the hyphenated executable `ztsec-server`. The server package now explicitly declares `[[bin]] name = "ztsec-server" path = "src/main.rs"`, aligning Cargo's target name with the intended executable and existing deployment paths.
+
+## Latest Linux binary-production failure
+The newest Linux log showed all workspace tests passing, followed by `error: no bin target named ztsec-server`; Cargo reported `ztsec_server` as the available target. This prevented linking and therefore no server executable could be uploaded. The server manifest now explicitly declares `[[bin]] name = "ztsec-server" path = "src/main.rs"`, matching all existing deployment/Docker/integration references. CI also verifies the resulting executable immediately after the release build.

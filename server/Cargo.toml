@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.92"
 license = "MIT"
 
+[[bin]]
+name = "ztsec-server"
+path = "src/main.rs"
+
 [dependencies]
 arti-client = { path = "../vendor/arti/crates/arti-client", version = "0.46.0", default-features = false, features = ["tokio", "native-tls", "onion-service-service", "static-sqlite"] }
 base64 = "0.22.1"
