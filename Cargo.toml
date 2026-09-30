@@ -9,7 +9,7 @@ members = ["protocol", "server", "tools/auth-keygen", "tools/load-test"]
 resolver = "3"
 
 [dependencies]
-arti-client = { path = "vendor/arti/crates/arti-client", version = "0.46.0", default-features = false, features = ["tokio", "native-tls", "onion-service-client"] }
+arti-client = { path = "vendor/arti/crates/arti-client", version = "0.46.0", default-features = false, features = ["tokio", "native-tls", "onion-service-client", "static-sqlite"] }
 base64 = "0.22.1"
 ed25519-dalek = "=2.2.0"
 futures-util = "0.3.34"

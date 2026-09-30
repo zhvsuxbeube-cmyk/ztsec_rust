@@ -75,3 +75,9 @@ Cargo commands. This ensures later compiler/linker errors and warnings are retai
 The upstream Arti `tor-dirclient` warning about `LZMA_DICT_MEM_LIMIT` is emitted by the
 vendored Arti 0.46.0 source and is not modified here; changing upstream warning behavior
 would unnecessarily fork the supplied Arti source.
+
+## CI log repair — latest build failure
+
+The latest Linux log showed `shutdown.changed()` requiring a mutable watch receiver and a Rust 2024 RPIT lifetime capture on `launch_onion_service`; both are fixed. The unused `peer` parameter is renamed.
+
+The latest Windows log showed `LNK1181: cannot open input file sqlite3.lib`. The agent and server now enable Arti 0.46.0's `static-sqlite` feature so libsqlite3 is built from the Arti dependency tree instead of requiring an external Windows `sqlite3.lib`.

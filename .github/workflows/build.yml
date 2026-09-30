@@ -13,6 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Initialize Linux build log
+        shell: bash
+        run: |
+          : > linux_log.log
       - name: Install pinned Rust toolchain
         shell: bash
         run: |
@@ -32,7 +36,6 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          : > linux_log.log
           cargo check --workspace --all-targets 2>&1 | tee -a linux_log.log
       - name: Generate dependency lockfile
         shell: bash
@@ -77,6 +80,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Initialize Windows build log
+        shell: pwsh
+        run: Set-Content -Path windows_log.log -Value ''
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
@@ -100,7 +106,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Set-Content -Path windows_log.log -Value ''
           & cargo check --package ztsec_agent --all-targets 2>&1 | Tee-Object -FilePath windows_log.log -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Generate dependency lockfile

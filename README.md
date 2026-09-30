@@ -396,3 +396,8 @@ MIGRATION
 ## CI compiler logs
 
 The Linux and Windows CI jobs run `cargo check --workspace --all-targets` before lockfile generation, tests, or release builds. Complete stdout/stderr is captured to `linux_log.log` and `windows_log.log` respectively. The logs are uploaded as dedicated artifacts on every runner outcome and are included in the final release bundle when both platform jobs succeed.
+
+
+## Source archive contents
+
+Release source archives produced for this handoff omit the unchanged `vendor/arti` directory because that directory is already present in the GitHub repository. The working tree retains the full vendored Arti source. If a future change modifies anything under `vendor/arti`, that entire directory will be included in the corresponding output archive.

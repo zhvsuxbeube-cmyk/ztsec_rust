@@ -208,7 +208,7 @@ impl Server {
 
         let metrics_task = {
             let metrics = Arc::clone(&self.metrics);
-            let shutdown = self.shutdown.subscribe();
+            let mut shutdown = self.shutdown.subscribe();
             let tx = self.ipc_tx.clone();
             let queue_limit = self.config.max_ipc_queue;
             let metrics_interval = self.config.metrics_interval;
@@ -252,7 +252,7 @@ impl Server {
         }
     }
 
-    pub async fn launch_onion_service(&self) -> io::Result<(Arc<RunningOnionService>, impl futures_util::Stream<Item = tor_hsservice::RendRequest>)> {
+    pub async fn launch_onion_service(&self) -> io::Result<(Arc<RunningOnionService>, impl futures_util::Stream<Item = tor_hsservice::RendRequest> + use<>)> {
         fs::create_dir_all(&self.config.state_dir)?;
         fs::create_dir_all(&self.config.cache_dir)?;
         let config = TorClientConfigBuilder::from_directories(&self.config.state_dir, &self.config.cache_dir)
@@ -347,7 +347,7 @@ impl Server {
         }
     }
 
-    async fn websocket_session<S>(&self, stream: S, peer: &str) -> io::Result<()>
+    async fn websocket_session<S>(&self, stream: S, _peer: &str) -> io::Result<()>
     where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static {
         let expected_path = self.config.websocket_path.clone();
         let callback = move |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response: tokio_tungstenite::tungstenite::handshake::server::Response| {
