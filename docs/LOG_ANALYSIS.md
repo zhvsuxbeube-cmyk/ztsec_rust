@@ -75,3 +75,7 @@ The newest Linux log showed that `cargo test --workspace` completed successfully
 
 ## Latest Linux binary-production failure
 The newest Linux log showed all workspace tests passing, followed by `error: no bin target named ztsec-server`; Cargo reported `ztsec_server` as the available target. This prevented linking and therefore no server executable could be uploaded. The server manifest now explicitly declares `[[bin]] name = "ztsec-server" path = "src/main.rs"`, matching all existing deployment/Docker/integration references. CI also verifies the resulting executable immediately after the release build.
+
+## CI permission-denied failure
+
+The Linux runner reported `tools/local_integration.sh: Permission denied` with exit code 126. The workflow previously executed the file directly. The job now explicitly runs `chmod +x tools/local_integration.sh` followed by `bash tools/local_integration.sh`, so CI no longer depends on repository executable-bit metadata. The script itself is also stored executable in the working tree.

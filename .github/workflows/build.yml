@@ -76,7 +76,11 @@ jobs:
           python3 -m unittest tools.test_python_service
           python3 tools/test_update_contract.py
       - name: Local server/Python integration test
-        run: tools/local_integration.sh
+        shell: bash
+        run: |
+          set -o pipefail
+          chmod +x tools/local_integration.sh 2>&1 | tee -a linux_log.log
+          bash tools/local_integration.sh 2>&1 | tee -a linux_log.log
       - name: Docker build validation
         run: docker build -f docker/rust-server-builder.Dockerfile --target artifacts -t ztsec-rust-builder .
       - name: Upload Linux cargo check log

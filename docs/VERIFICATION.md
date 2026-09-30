@@ -137,3 +137,7 @@ A CI preflight script (`tools/verify_workspace.py`) is run on both Linux and Win
 
 ## Linux binary production guard
 The server package explicitly declares the hyphenated `ztsec-server` binary target used by CI, Docker, local integration, deployment, and release packaging. After the Linux release build, CI verifies that `target/release/ztsec-server` exists, is executable, and is non-empty before attempting artifact upload.
+
+### CI shell-script execution
+
+`tools/local_integration.sh` is executed explicitly with Bash in GitHub Actions after `chmod +x`, avoiding failures caused by checkout/filesystem executable-bit metadata.
