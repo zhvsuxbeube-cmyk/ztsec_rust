@@ -72,7 +72,7 @@ async fn run_one(endpoint: &str, fingerprint: &str, signing: &SigningKey, durati
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "auth timeout"))?
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "auth eof"))?
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("auth read failed: {e}")))?;
-    if !matches!(auth, Message::Text(ref text) if text.as_ref() == "AUTH:OK") { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "auth failed")); }
+    if !matches!(auth, Message::Text(ref text) if text.as_str() == "AUTH:OK") { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "auth failed")); }
     let data = "DATA:Local|load-test|ZTSecurity|load|Rust-Native/1|User|Linux|GPU|CPU|Unknown|Unknown|0m|0m|0 ms|load-hwid|".to_string() + fingerprint;
     let until = Instant::now() + duration;
     while Instant::now() < until {
@@ -82,6 +82,17 @@ async fn run_one(endpoint: &str, fingerprint: &str, signing: &SigningKey, durati
     }
     let _ = ws.close(None).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_exact_auth_ok_response() {
+        let message = Message::Text("AUTH:OK".to_owned().into());
+        assert!(matches!(message, Message::Text(ref text) if text.as_str() == "AUTH:OK"));
+    }
 }
 
 fn hex_nibble(value: u8) -> Option<u8> {

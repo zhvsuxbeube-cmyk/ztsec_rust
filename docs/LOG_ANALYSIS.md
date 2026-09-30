@@ -40,3 +40,7 @@ The latest hosted Linux preflight failed after `ztsec_server` and `ztsec_agent` 
 The same run then checked an upstream `tor-circmgr` library test from the vendored Arti dependency and reported feature-gated test symbols such as `VanguardMgr`, `OwnedPath`, and `construct_custom_netdir`. These are not ZTSEC code defects. The CI gate is corrected to avoid `--all-targets`, which is what brought those dependency test targets into the application check. No Arti source is changed.
 
 Project-owned warnings in the same run were Windows-only symbols being compiled into the Linux build (`fmt_duration`, plugin error strings, registry constants, PowerShell constants, and `PARENT_WAIT`). Those are now cfg-gated so the Linux production target does not carry unused Windows-only items.
+## Latest Linux CI failure — `ztsec_load_test` E0283
+
+The newly uploaded Linux log progressed through the ZTSEC server and agent checks and failed only when checking `ztsec_load_test`. The exact error was `E0283` at `tools/load-test/src/main.rs:75`: Tungstenite 0.30.0 defines multiple `AsRef` implementations for `Utf8Bytes`, making `text.as_ref() == "AUTH:OK"` ambiguous. The comparison now uses `text.as_str() == "AUTH:OK"`, which is explicit and allocation-free. A regression unit test was added for the exact authentication response. No file under `vendor/arti` was modified.
+

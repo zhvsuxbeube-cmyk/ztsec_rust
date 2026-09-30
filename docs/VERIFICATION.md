@@ -100,3 +100,7 @@ The Windows log itself reached successful release compilation and tests. Its onl
 remaining diagnostic was the upstream `LZMA_DICT_MEM_LIMIT` warning. That warning is
 intentionally not modified because `vendor/arti` must remain an untouched copy of the
 supplied Arti 0.46.0 source.
+## Latest uploaded Linux log repair
+
+The latest hosted run failed at `tools/load-test/src/main.rs:75` with Rust `E0283` because Tungstenite 0.30.0's `Utf8Bytes` has multiple `AsRef` implementations. The load test now uses `Utf8Bytes::as_str()` for the `AUTH:OK` comparison and includes a regression test for that response. No Arti source is modified.
+
