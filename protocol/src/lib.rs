@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn parse_existing_telemetry_shape() {
-        let line = "DATA:Local|host|ZTSecurity|user|Rust-Native/1|User|Windows|GPU|CPU|8/16 GB|AV|1h 2m|0m|1 ms|hwid|abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdef";
+        let line = "DATA:Local|host|ZTSecurity|user|Rust-Native/1|User|Windows|GPU|CPU|8/16 GB|AV|1h 2m|0m|1 ms|hwid|abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
         let telemetry = parse_data_line(line).unwrap();
         assert_eq!(telemetry.fields().len(), 16);
         assert_eq!(telemetry.fingerprint.len(), 64);

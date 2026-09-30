@@ -60,3 +60,12 @@ Arti source remains byte-for-byte unchanged.
 The latest Linux failure was not a ZTSEC compiler error. It was the upstream Arti `tor-circmgr` unit-test target being selected by `cargo test --workspace`. The ZTSEC workspace now explicitly excludes `vendor/arti`, which prevents Cargo from treating the vendored path dependency as an application workspace member while retaining it as a normal dependency.
 
 No `vendor/arti` source was changed.
+
+## Latest Linux CI failure — protocol test fixture
+
+The latest Linux runner completed `cargo check` and compilation successfully. The only failing test was
+`protocol::tests::parse_existing_telemetry_shape`. Its fixture contained a 66-character hexadecimal fingerprint
+while the test asserted the existing 64-character fingerprint contract. The fixture was corrected to 64 characters.
+This is a test-data correction; protocol behavior was not changed.
+
+No `vendor/arti` source was modified.
