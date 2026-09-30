@@ -1,5 +1,5 @@
 use std::{
-    ffi::{OsString, OsStr},
+    ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
@@ -561,7 +561,7 @@ fn wait_for_process_exit(_pid: u32) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn wide(value: &OsStr) -> Vec<u16> {
+fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     value.encode_wide().chain(std::iter::once(0)).collect()
 }

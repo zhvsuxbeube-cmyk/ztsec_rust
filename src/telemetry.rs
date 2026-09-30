@@ -1,4 +1,7 @@
-use std::{env, process::Command};
+use std::env;
+
+#[cfg(windows)]
+use std::process::Command;
 
 #[cfg(windows)]
 use std::net::{Ipv4Addr, ToSocketAddrs};

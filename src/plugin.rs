@@ -1,7 +1,12 @@
-use std::collections::HashMap;
+#[derive(Clone)]
+pub struct PluginOutput {
+    pub event: String,
+    pub payload: Vec<u8>,
+}
 
 #[cfg(windows)]
 mod win {
+    use std::collections::HashMap;
     use super::*;
     use crate::{syscall, text, update};
     use std::fs::{self, File, OpenOptions};
@@ -304,12 +309,6 @@ mod win {
         received: u64,
     }
 
-    #[derive(Clone)]
-    pub struct PluginOutput {
-        pub event: String,
-        pub payload: Vec<u8>,
-    }
-
     pub struct Manager {
         map: HashMap<String, Plugin>,
         transfers: HashMap<String, PluginTransfer>,
@@ -443,10 +442,65 @@ pub struct Host;
 #[cfg(not(windows))]
 impl Host {
     pub fn new() -> Self { Self }
-    pub fn load(&mut self, _id: &str, _data: &[u8], _host: &[u8]) -> Result<(), String> { Err("windows only".into()) }
+
+    pub fn load(&mut self, _id: &str, _data: &[u8], _host: &[u8]) -> Result<(), String> {
+        Err("plugins are only supported on Windows".into())
+    }
+
+    pub fn begin_transfer(
+        &mut self,
+        _id: &str,
+        _transfer_id: &str,
+        _size: u64,
+        _hash: &str,
+    ) -> Result<u64, String> {
+        Err("plugin transfers are only supported on Windows".into())
+    }
+
+    pub fn resume_transfer(&self, _transfer_id: &str) -> Option<u64> {
+        None
+    }
+
+    pub fn append_transfer(
+        &mut self,
+        _transfer_id: &str,
+        _offset: u64,
+        _data: &[u8],
+    ) -> Result<u64, String> {
+        Err("plugin transfers are only supported on Windows".into())
+    }
+
+    pub fn finish_transfer(&mut self, _transfer_id: &str, _host: &[u8]) -> Result<String, String> {
+        Err("plugin transfers are only supported on Windows".into())
+    }
+
+    pub fn drain_outputs(&mut self) -> Vec<PluginOutput> {
+        Vec::new()
+    }
+
     pub fn event(&self, _: &str, _: &[u8]) {}
     pub fn unload(&mut self, _: &str) -> bool { false }
     pub fn clear(&mut self) {}
 }
 
 pub use Host as Manager;
+
+#[cfg(all(test, not(windows)))]
+mod non_windows_tests {
+    use super::{Host, PluginOutput};
+
+    #[test]
+    fn non_windows_host_matches_network_api() {
+        let mut host = Host::new();
+        assert!(host.load("p", &[], &[]).is_err());
+        assert!(host.begin_transfer("p", "t", 1, &"0".repeat(64)).is_err());
+        assert_eq!(host.resume_transfer("t"), None);
+        assert!(host.append_transfer("t", 0, &[]).is_err());
+        assert!(host.finish_transfer("t", &[]).is_err());
+        let outputs: Vec<PluginOutput> = host.drain_outputs();
+        assert!(outputs.is_empty());
+        host.event("test", &[]);
+        assert!(!host.unload("p"));
+        host.clear();
+    }
+}

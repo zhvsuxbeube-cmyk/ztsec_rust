@@ -72,12 +72,26 @@ The Windows MSVC environment is initialized before the preflight and all subsequ
 Cargo commands. This ensures later compiler/linker errors and warnings are retained in
 `linux_log.log` or `windows_log.log`, not only errors from the initial check.
 
-The upstream Arti `tor-dirclient` warning about `LZMA_DICT_MEM_LIMIT` is emitted by the
-vendored Arti 0.46.0 source and is not modified here; changing upstream warning behavior
-would unnecessarily fork the supplied Arti source.
+The supplied Arti 0.46.0 source is intentionally unchanged. Its upstream
+`tor-dirclient` `LZMA_DICT_MEM_LIMIT` dead-code warning is retained as an upstream warning
+rather than modifying or forking Arti. The output source ZIP excludes the unchanged
+`vendor/arti` tree because the same vendor source is already present in the GitHub repository.
 
 ## CI log repair — latest build failure
 
 The latest Linux log showed `shutdown.changed()` requiring a mutable watch receiver and a Rust 2024 RPIT lifetime capture on `launch_onion_service`; both are fixed. The unused `peer` parameter is renamed.
 
 The latest Windows log showed `LNK1181: cannot open input file sqlite3.lib`. The agent and server now enable Arti 0.46.0's `static-sqlite` feature so libsqlite3 is built from the Arti dependency tree instead of requiring an external Windows `sqlite3.lib`.
+
+## Latest CI log repair
+
+The newly uploaded `Logged.zip` reproduced the Linux failure in the shared agent crate:
+`ztsec_agent` referenced plugin-manager methods that existed only in the Windows
+implementation. The non-Windows `Host` stub now exposes the complete API used by
+`src/net.rs` and `src/legacy_net.rs`, returning bounded errors/empty output as appropriate.
+The three Linux unused imports are also platform-gated or made fully-qualified.
+
+The Windows log itself reached successful release compilation and tests. Its only
+remaining diagnostic was the upstream `LZMA_DICT_MEM_LIMIT` warning. That warning is
+intentionally not modified because `vendor/arti` must remain an untouched copy of the
+supplied Arti 0.46.0 source.
