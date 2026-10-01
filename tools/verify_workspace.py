@@ -89,7 +89,7 @@ def verify_relay_controls() -> None:
     transport = (ROOT / "src" / "transport.rs").read_text(encoding="utf-8")
     for marker in (
         "RateLimiter::new(server.config.max_control_requests_per_second)",
-        "CMD:DIRECT_CONNECT:",
+        "CMD:DIRECT_CONNECT",
         "CMD:DIRECT_DISCONNECT",
         "CMD:RECONNECT",
         "CMD:CLOSE",
@@ -118,10 +118,66 @@ def verify_relay_controls() -> None:
     if "fn format_authority(host: &str, port: u16) -> String" not in transport:
         raise SystemExit("WebSocket authority formatter missing for IPv6 direct endpoints")
     command_client = (ROOT / "tools" / "command_client.py").read_text(encoding="utf-8")
-    for command in ("CMD:RECONNECT", "CMD:CLOSE", "CMD:SLEEP", "CMD:HIBERNATE", "CMD:RESTART", "CMD:SHUTDOWN", "CMD:DIRECT_CONNECT:", "CMD:DIRECT_DISCONNECT"):
+    telemetry_service = (ROOT / "telemetry_service.py").read_text(encoding="utf-8")
+    for command in (
+        "REQ:DATA", "CMD:RECONNECT", "CMD:CLOSE", "CMD:SLEEP", "CMD:HIBERNATE", "CMD:RESTART", "CMD:SHUTDOWN",
+        "CMD:DIRECT_CONNECT", "CMD:DIRECT_DISCONNECT", "CMD:PLUGIN:", "CMD:PLUGIN_BEGIN:", "CMD:PLUGIN_CHUNK:",
+        "CMD:PLUGIN_END:", "CMD:PLUGIN_RESUME:", "CMD:PLUGIN_MSG:", "CMD:PLUGIN_EVENT:", "CMD:UNLOAD:",
+        "CMD:UPDATE:", "CMD:UPDATE_BEGIN:", "CMD:UPDATE_CHUNK:", "CMD:UPDATE_END:", "CMD:EXECUTE:", "CMD:UNLOAD:",
+    ):
         if command not in command_client:
             raise SystemExit(f"control command client relay vocabulary is incomplete: {command}")
-    print("OK: management relay, direct-switch, and IPv6 transport guards present")
+    prefix_start = command_client.find("PREFIX_COMMANDS")
+    prefix_region = command_client[prefix_start:command_client.find(")", prefix_start) if prefix_start >= 0 else len(command_client)]
+    if "CMD:DIRECT_CONNECT:" in prefix_region:
+        raise SystemExit("control command client must not whitelist operator-supplied direct IPs")
+    if "MAX_COMMAND: Final = 3 * 1024 * 1024" not in command_client:
+        raise SystemExit("control command client maximum command size is stale")
+    if "def is_supported_command(command: str) -> bool" not in telemetry_service:
+        raise SystemExit("telemetry service command vocabulary helper is missing")
+    for command in ("CMD:PLUGIN:", "CMD:PLUGIN_BEGIN:", "CMD:PLUGIN_CHUNK:", "CMD:PLUGIN_END:", "CMD:PLUGIN_RESUME:", "CMD:PLUGIN_MSG:", "CMD:PLUGIN_EVENT:", "CMD:UNLOAD:", "CMD:UPDATE:", "CMD:UPDATE_BEGIN:", "CMD:UPDATE_CHUNK:", "CMD:UPDATE_END:", "CMD:EXECUTE:"):
+        if command not in telemetry_service:
+            raise SystemExit(f"telemetry service command vocabulary is incomplete: {command}")
+    helper_start = telemetry_service.find("prefixes = (")
+    helper_region = telemetry_service[helper_start:telemetry_service.find(")", helper_start) if helper_start >= 0 else len(telemetry_service)]
+    if "CMD:DIRECT_CONNECT:" in helper_region:
+        raise SystemExit("telemetry service must not whitelist operator-supplied direct IPs")
+    public_ip = (ROOT / "server" / "src" / "public_ip.rs").read_text(encoding="utf-8")
+    if "https://ifconfig.me/ip" not in public_ip or "https://ipv4.ifconfig.me/ip" not in public_ip or "https://ipv6.ifconfig.me/ip" not in public_ip:
+        raise SystemExit("server public IP discovery must use ifconfig.me and family-specific fallbacks")
+    if "redirect(reqwest::redirect::Policy::none())" not in public_ip or ".no_proxy()" not in public_ip:
+        raise SystemExit("public-IP lookup must disable proxy inheritance and redirects")
+    server_main = (ROOT / "server" / "src" / "main.rs").read_text(encoding="utf-8")
+    if "--direct-endpoint" in server_main or "--direct-listen" in server_main:
+        raise SystemExit("direct public endpoint/listener must not be configurable through CLI flags")
+    if 'DEFAULT_DIRECT_LISTEN: &str = "0.0.0.0:4794"' not in server:
+        raise SystemExit("server direct listener must use the built-in TCP 4794 default")
+    if 'max_broadcast_targets: 4096' not in server:
+        raise SystemExit("server default broadcast bound must cover the default 4096 connection capacity")
+    if 'format!("[{ip}]")' not in server or 'CMD:DIRECT_CONNECT:{host}' not in server:
+        raise SystemExit("server direct-connect materialization must format IPv6 socket addresses correctly")
+    expected_exact = (
+        "REQ:DATA", "CMD:RECONNECT", "CMD:CLOSE", "CMD:SLEEP", "CMD:HIBERNATE",
+        "CMD:RESTART", "CMD:SHUTDOWN", "CMD:DIRECT_CONNECT", "CMD:DIRECT_DISCONNECT",
+    )
+    expected_prefixes = (
+        "CMD:PLUGIN:", "CMD:PLUGIN_BEGIN:", "CMD:PLUGIN_CHUNK:", "CMD:PLUGIN_END:",
+        "CMD:PLUGIN_RESUME:", "CMD:PLUGIN_MSG:", "CMD:PLUGIN_EVENT:", "CMD:UNLOAD:",
+        "CMD:UPDATE:", "CMD:UPDATE_BEGIN:", "CMD:UPDATE_CHUNK:", "CMD:UPDATE_END:", "CMD:EXECUTE:",
+    )
+    for command in expected_exact:
+        if command not in command_client:
+            raise SystemExit(f"control command client relay vocabulary is incomplete: {command}")
+        if command != "CMD:DIRECT_CONNECT" and command not in telemetry_service:
+            raise SystemExit(f"telemetry service command vocabulary is incomplete: {command}")
+    for command in expected_prefixes:
+        if command not in command_client or command not in telemetry_service:
+            raise SystemExit(f"Python relay vocabulary is incomplete: {command}")
+    if '"CMD:DIRECT_CONNECT:"' in prefix_region:
+        raise SystemExit("control command client must not whitelist operator-supplied direct IPs")
+    if '"CMD:DIRECT_CONNECT:"' in helper_region:
+        raise SystemExit("telemetry service must not whitelist operator-supplied direct IPs")
+    print("OK: management relay, complete command vocabulary, direct-switch, public-IP discovery, and transport guards present")
 
 
 verify_relay_controls()

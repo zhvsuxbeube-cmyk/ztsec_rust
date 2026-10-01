@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local ZTSEC control client for bounded, allowlisted agent-management commands."""
+"""Local ZTSEC control client for the authenticated, bounded agent relay."""
 from __future__ import annotations
 
 import argparse
@@ -10,10 +10,44 @@ import socket
 import struct
 import sys
 from pathlib import Path
+from typing import Final
 
-MAX_FRAME = 64 * 1024
-MAX_REQUEST_ID = 64
-MAX_COMMAND = 1024
+MAX_COMMAND: Final = 3 * 1024 * 1024
+MAX_FRAME: Final = MAX_COMMAND + 64 * 1024
+MAX_REQUEST_ID: Final = 64
+
+EXACT_COMMANDS: Final = {
+    "REQ:DATA",
+    "CMD:RECONNECT",
+    "CMD:CLOSE",
+    "CMD:SLEEP",
+    "CMD:HIBERNATE",
+    "CMD:RESTART",
+    "CMD:SHUTDOWN",
+    "CMD:DIRECT_CONNECT",
+    "CMD:DIRECT_DISCONNECT",
+}
+PREFIX_COMMANDS: Final = (
+    "CMD:PLUGIN:",
+    "CMD:PLUGIN_BEGIN:",
+    "CMD:PLUGIN_CHUNK:",
+    "CMD:PLUGIN_END:",
+    "CMD:PLUGIN_RESUME:",
+    "CMD:PLUGIN_MSG:",
+    "CMD:PLUGIN_EVENT:",
+    "CMD:UNLOAD:",
+    "CMD:UPDATE:",
+    "CMD:UPDATE_BEGIN:",
+    "CMD:UPDATE_CHUNK:",
+    "CMD:UPDATE_END:",
+    "CMD:EXECUTE:",
+)
+
+
+def is_supported_command(command: str) -> bool:
+    """Mirror the shared Rust relay vocabulary; direct IPs are server-generated."""
+    upper = command.upper()
+    return upper in EXACT_COMMANDS or any(upper.startswith(prefix) for prefix in PREFIX_COMMANDS)
 
 
 def read_exact(sock: socket.socket, size: int) -> bytes:
@@ -27,35 +61,17 @@ def read_exact(sock: socket.socket, size: int) -> bytes:
 
 
 def request(socket_path: Path, target: str, command: str, request_id: str | None = None) -> dict:
-    request_id = request_id or secrets.token_hex(8)
+    if request_id is None:
+        request_id = secrets.token_hex(8)
     if not request_id or len(request_id.encode("utf-8")) > MAX_REQUEST_ID or not request_id.isascii() or any(ord(ch) < 33 or ord(ch) > 126 for ch in request_id):
         raise ValueError("invalid request id")
-    if len(command.encode("utf-8")) > MAX_COMMAND or any(ch in command for ch in "\r\n\x00"):
-        raise ValueError("invalid command length/content")
     normalized = command.strip()
-    upper = normalized.upper()
-    if upper in {"REQ:DATA", "CMD:RECONNECT", "CMD:CLOSE", "CMD:SLEEP", "CMD:HIBERNATE", "CMD:RESTART", "CMD:SHUTDOWN", "CMD:DIRECT_DISCONNECT"}:
-        pass
-    elif upper.startswith("CMD:DIRECT_CONNECT:") and normalized[len("CMD:DIRECT_CONNECT:"):].strip():
-        try:
-            socket_value = normalized[len("CMD:DIRECT_CONNECT:"):].strip()
-            if socket_value.startswith("["):
-                end = socket_value.rfind("]:" )
-                if end <= 0:
-                    raise ValueError
-                host = socket_value[1:end]
-                port = int(socket_value[end + 2:])
-            else:
-                host, port_text = socket_value.rsplit(":", 1)
-                port = int(port_text)
-            import ipaddress
-            address = ipaddress.ip_address(host)
-            if address.is_unspecified or address.is_multicast or not 1 <= port <= 65535:
-                raise ValueError
-        except (ValueError, TypeError):
-            raise ValueError("invalid direct endpoint address") from None
-    else:
-        raise ValueError("command is not permitted by the control client")
+    if not normalized or len(normalized.encode("utf-8")) > MAX_COMMAND or any(ch in normalized for ch in "\r\n\x00"):
+        raise ValueError("invalid command length/content")
+    if not is_supported_command(normalized):
+        raise ValueError("command is not supported by the ZTSEC agent protocol")
+    if normalized.upper().startswith("CMD:DIRECT_CONNECT:"):
+        raise ValueError("direct-connect must be requested as CMD:DIRECT_CONNECT; the server supplies its current public IP")
     if not (target.lower() == "broadcast" or (len(target) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in target))):
         raise ValueError("target must be broadcast or a 64-hex agent fingerprint")
 
@@ -87,7 +103,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", default=os.getenv("ZTSEC_CONTROL_SOCKET", "/run/ztsec/control.sock"))
     parser.add_argument("--target", required=True, help="64-hex fingerprint or broadcast")
-    parser.add_argument("--command", required=True, help="one of the bounded management commands")
+    parser.add_argument("--command", required=True, help="command implemented by the ZTSEC agent")
     parser.add_argument("--request-id")
     args = parser.parse_args()
     try:

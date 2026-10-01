@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 1;
-pub const MAX_WS_MESSAGE_BYTES: usize = 512 * 1024;
-pub const MAX_COMMAND_BYTES: usize = 384 * 1024;
+pub const MAX_WS_MESSAGE_BYTES: usize = 3 * 1024 * 1024;
+pub const MAX_COMMAND_BYTES: usize = MAX_WS_MESSAGE_BYTES;
 pub const MAX_EXECUTE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_PLUGIN_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_UPDATE_BYTES: usize = 64 * 1024 * 1024;
@@ -12,10 +12,10 @@ pub const MAX_TELEMETRY_FIELD_BYTES: usize = 64 * 1024;
 pub const MAX_AUTH_KEY_HEX_LEN: usize = 64;
 
 
-pub const MAX_CONTROL_FRAME_BYTES: usize = 64 * 1024;
+pub const MAX_CONTROL_FRAME_BYTES: usize = MAX_CONTROL_COMMAND_LEN + 64 * 1024;
 pub const MAX_CONTROL_REQUEST_ID_LEN: usize = 64;
 pub const MAX_CONTROL_TARGET_LEN: usize = 128;
-pub const MAX_CONTROL_COMMAND_LEN: usize = 1024;
+pub const MAX_CONTROL_COMMAND_LEN: usize = 3 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControlRequest {
@@ -38,6 +38,40 @@ pub struct ControlResponse {
     pub detail: String,
 }
 
+pub fn is_supported_agent_command(command: &str) -> bool {
+    let command = command.trim();
+    const EXACT: &[&str] = &[
+        "REQ:DATA",
+        "CMD:RECONNECT",
+        "CMD:CLOSE",
+        "CMD:SLEEP",
+        "CMD:HIBERNATE",
+        "CMD:RESTART",
+        "CMD:SHUTDOWN",
+        "CMD:DIRECT_CONNECT",
+        "CMD:DIRECT_DISCONNECT",
+    ];
+    if EXACT.iter().any(|value| command.eq_ignore_ascii_case(value)) {
+        return true;
+    }
+    const PREFIXES: &[&str] = &[
+        "CMD:PLUGIN:",
+        "CMD:PLUGIN_BEGIN:",
+        "CMD:PLUGIN_CHUNK:",
+        "CMD:PLUGIN_END:",
+        "CMD:PLUGIN_RESUME:",
+        "CMD:PLUGIN_MSG:",
+        "CMD:PLUGIN_EVENT:",
+        "CMD:UNLOAD:",
+        "CMD:UPDATE:",
+        "CMD:UPDATE_BEGIN:",
+        "CMD:UPDATE_CHUNK:",
+        "CMD:UPDATE_END:",
+        "CMD:EXECUTE:",
+    ];
+    PREFIXES.iter().any(|prefix| command.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)))
+}
+
 impl ControlRequest {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if self.protocol_version != PROTOCOL_VERSION || self.message_type != "agent_command" {
@@ -52,6 +86,9 @@ impl ControlRequest {
         }
         if self.command.is_empty() || self.command.len() > MAX_CONTROL_COMMAND_LEN
             || self.command.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0) {
+            return Err(ProtocolError::InvalidControlField("command"));
+        }
+        if !is_supported_agent_command(&self.command) {
             return Err(ProtocolError::InvalidControlField("command"));
         }
         Ok(())
@@ -242,6 +279,24 @@ impl std::error::Error for ProtocolError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relay_vocabulary_covers_all_agent_command_families() {
+        for command in [
+            "REQ:DATA", "CMD:RECONNECT", "CMD:CLOSE", "CMD:SLEEP", "CMD:HIBERNATE",
+            "CMD:RESTART", "CMD:SHUTDOWN", "CMD:DIRECT_CONNECT", "CMD:DIRECT_DISCONNECT",
+            "CMD:PLUGIN:x:eA==", "CMD:PLUGIN_BEGIN:x:y:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "CMD:PLUGIN_CHUNK:y:0:eA==", "CMD:PLUGIN_END:y", "CMD:PLUGIN_RESUME:y",
+            "CMD:PLUGIN_MSG:x:eA==", "CMD:PLUGIN_EVENT:ping", "CMD:UNLOAD:x",
+            "CMD:UPDATE:a:ZW1wdHk=", "CMD:UPDATE_BEGIN:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1",
+            "CMD:UPDATE_CHUNK:0:eA==", "CMD:UPDATE_END:", "CMD:EXECUTE:ps1:ZW1wdHk=",
+        ] {
+            assert!(is_supported_agent_command(command), "not relayable: {command}");
+        }
+        assert!(!is_supported_agent_command("CMD:SHELL"));
+        // Control clients must request server-side direct discovery; they may not inject an address.
+        assert!(!is_supported_agent_command("CMD:DIRECT_CONNECT:203.0.113.10:4794"));
+    }
 
     #[test]
     fn valid_control_request_is_accepted() {

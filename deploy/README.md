@@ -22,16 +22,14 @@ For a public `.onion` service, the server needs outbound Tor connectivity for Ar
 
 ## Direct listener and control socket
 
-To expose the same authenticated WebSocket protocol on a direct IP path, configure both the bind address and the exact advertised endpoint:
+To expose the same authenticated WebSocket protocol on a direct IP path, the server uses its built-in direct listener on port 4794. The server discovers its current public IP automatically via ifconfig.me when a direct-connect command is requested:
 
 ```bash
 ./ztsec-server \
-  --direct-listen 0.0.0.0:4794 \
-  --direct-endpoint 203.0.113.10:4794 \
   --control-socket /run/ztsec/control.sock
 ```
 
-The direct endpoint list is an allowlist. The agent will only accept `CMD:DIRECT_CONNECT` values sent by the Rust server that match a configured `--direct-endpoint`.
+The Rust server accepts `CMD:DIRECT_CONNECT` without an IP/port from the control plane, queries `https://ifconfig.me/ip` (with family-specific ifconfig.me fallback), combines the discovered public IP with the built-in TCP port 4794, and sends the concrete `CMD:DIRECT_CONNECT:<ip>:4794` command to the agent.
 
 The local application/operator layer can submit an allowlisted management command with:
 
@@ -51,7 +49,7 @@ python3 tools/command_client.py \
   --command REQ:DATA
 ```
 
-The same control interface can relay the allowlisted simple management commands `CMD:RECONNECT`, `CMD:CLOSE`, `CMD:SLEEP`, `CMD:HIBERNATE`, `CMD:RESTART`, and `CMD:SHUTDOWN` to either one fingerprint or `broadcast`.
+The same control interface can relay every command family supported by the existing agent protocol to either one fingerprint or `broadcast`, subject to the shared size and resource limits. This includes lifecycle, plugin load/transfer/message/event/unload, update/transfer, execute, data-request, and transport-switch commands.
 
 Direct-switch example:
 
@@ -59,7 +57,7 @@ Direct-switch example:
 python3 tools/command_client.py \
   --socket /run/ztsec/control.sock \
   --target <agent-fingerprint> \
-  --command CMD:DIRECT_CONNECT:203.0.113.10:4794
+  --command CMD:DIRECT_CONNECT
 ```
 
 Return an agent to Tor/the configured endpoint:
@@ -71,6 +69,8 @@ python3 tools/command_client.py \
   --command CMD:DIRECT_DISCONNECT
 ```
 
-The command client intentionally rejects commands outside this bounded control vocabulary before they reach the Rust service. The server additionally applies the same allowlist, direct-endpoint IP/port allowlist, per-control-connection request-rate limit, and bounded per-agent queues.
+The command client accepts every command family supported by the existing agent protocol; `CMD:DIRECT_CONNECT` is the only command whose destination is generated server-side. The operator never supplies a direct IP or port. The Rust server applies the same shared protocol vocabulary check, strict frame/field limits, rate limiting, bounded per-agent queues, and special server-side construction of direct-connect addresses.
+
+The default broadcast fan-out is 4096, matching the server's default maximum authenticated connection count.
 
 For tuning the relay resource limits without changing the protocol, the server accepts `--max-agent-command-queue`, `--max-broadcast-targets`, and `--max-control-requests-per-second`. Keep these bounded according to the host's expected agent population.

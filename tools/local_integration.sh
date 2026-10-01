@@ -33,11 +33,9 @@ test "$PRIVATE" = "$SEED"
 printf '%s %s\n' "$FINGERPRINT" "$PUBLIC" > "$TMP/authorized_keys"
 printf '%s %s\n' "$FINGERPRINT_B" "$PUBLIC" >> "$TMP/authorized_keys"
 
-"$ROOT/target/release/ztsec-server" \
+ZTSEC_CI=1 ZTSEC_TEST_PUBLIC_IP=127.0.0.1 "$ROOT/target/release/ztsec-server" \
   --no-onion \
   --local-listen 127.0.0.1:4793 \
-  --direct-listen 127.0.0.1:4794 \
-  --direct-endpoint 127.0.0.1:4794 \
   --authorized-keys "$TMP/authorized_keys" \
   --local-socket "$TMP/telemetry.sock" \
   --control-socket "$TMP/control.sock" \
@@ -139,7 +137,7 @@ ZTSEC_LOAD_FINGERPRINT="$FINGERPRINT" \
 cargo run --quiet --manifest-path "$ROOT/tools/load-test/Cargo.toml" --release >"$TMP/direct.out" 2>"$TMP/direct.err" &
 LOAD_PIDS+=($!)
 sleep 1
-control_request_until_queued "$TMP/direct-connect.control" --target "$FINGERPRINT" --command CMD:DIRECT_CONNECT:127.0.0.1:4794
+control_request_until_queued "$TMP/direct-connect.control" --target "$FINGERPRINT" --command CMD:DIRECT_CONNECT
 for _ in $(seq 1 80); do
   grep -q 'direct transport connected' "$TMP/direct.out" && break
   sleep 0.1

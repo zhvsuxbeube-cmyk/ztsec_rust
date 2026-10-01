@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fs, io, net::SocketAddr, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, fs, io, net::{IpAddr, SocketAddr}, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+
+#[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
 
 use arti_client::{config::TorClientConfigBuilder, TorClient};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -11,10 +14,12 @@ use tor_proto::stream::IncomingStreamRequest;
 use tracing::{debug, info, warn};
 
 mod control;
+mod public_ip;
 use control::{AgentRegistry, RouteStatus};
 
 pub const DEFAULT_LOCAL_SOCKET: &str = "/run/ztsec/telemetry.sock";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/run/ztsec/control.sock";
+pub const DEFAULT_DIRECT_LISTEN: &str = "0.0.0.0:4794";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -23,8 +28,7 @@ pub struct Config {
     pub cache_dir: PathBuf,
     pub authorized_keys: PathBuf,
     pub local_listen: Option<String>,
-    pub direct_listen: Option<String>,
-    pub direct_endpoints: Vec<SocketAddr>,
+    pub direct_listen: String,
     pub enable_onion: bool,
     pub local_socket: PathBuf,
     pub control_socket: PathBuf,
@@ -53,13 +57,12 @@ impl Default for Config {
             cache_dir: data_dir.join("arti-cache"),
             authorized_keys: PathBuf::from("/etc/ztsec/authorized_keys"),
             local_listen: None,
-            direct_listen: None,
-            direct_endpoints: Vec::new(),
+            direct_listen: DEFAULT_DIRECT_LISTEN.into(),
             enable_onion: true,
             local_socket: PathBuf::from(DEFAULT_LOCAL_SOCKET),
             control_socket: PathBuf::from(DEFAULT_CONTROL_SOCKET),
             max_agent_command_queue: 16,
-            max_broadcast_targets: 1024,
+            max_broadcast_targets: 4096,
             max_control_requests_per_second: 10,
             websocket_path: "/ztsec".into(),
             onion_port: 443,
@@ -220,16 +223,13 @@ impl Server {
             },
             None => None,
         };
-        let direct_listener = match self.config.direct_listen.clone() {
-            Some(address) => match TcpListener::bind(&address).await {
-                Ok(listener) => Some(listener),
-                Err(error) => {
-                    let _ = fs::remove_file(&control_path);
-                    let _ = fs::remove_file(&ipc_path);
-                    return Err(io::Error::new(error.kind(), format!("bind direct listener {address}: {error}")));
-                }
-            },
-            None => None,
+        let direct_listener = match TcpListener::bind(&self.config.direct_listen).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                let _ = fs::remove_file(&control_path);
+                let _ = fs::remove_file(&ipc_path);
+                return Err(io::Error::new(error.kind(), format!("bind direct listener {}: {error}", self.config.direct_listen)));
+            }
         };
 
         let ipc_metrics = Arc::clone(&self.metrics);
@@ -246,11 +246,11 @@ impl Server {
             let server = self.clone_for_task();
             tokio::spawn(async move { server.accept_tcp(listener).await })
         });
-        let direct_task = direct_listener.map(|listener| {
-            info!("direct WebSocket listener enabled");
+        info!("direct WebSocket listener enabled on {}", self.config.direct_listen);
+        let direct_task = {
             let server = self.clone_for_task();
-            tokio::spawn(async move { server.accept_tcp(listener).await })
-        });
+            tokio::spawn(async move { server.accept_tcp(direct_listener).await })
+        };
 
         let onion_service = if self.config.enable_onion {
             let (service, request_stream) = match self.launch_onion_service().await {
@@ -259,6 +259,7 @@ impl Server {
                     self.shutdown();
                     ipc_task.abort();
                     control_task.abort();
+                    direct_task.abort();
                     let _ = fs::remove_file(&self.config.control_socket);
                     let _ = fs::remove_file(&self.config.local_socket);
                     return Err(error);
@@ -304,7 +305,7 @@ impl Server {
 
         self.shutdown();
         if let Some(task) = local_task { task.abort(); }
-        if let Some(task) = direct_task { task.abort(); }
+        direct_task.abort();
         control_task.abort();
         let _ = fs::remove_file(&self.config.control_socket);
         metrics_task.abort();
@@ -440,8 +441,9 @@ impl Server {
         let mut ping_tick = interval(self.config.ping_interval);
         let mut last_activity = Instant::now();
 
-        loop {
-            let step: Result<bool, io::Error> = tokio::select! {
+        let result = async {
+            loop {
+                let step = tokio::select! {
                 _ = ping_tick.tick() => {
                     if last_activity.elapsed() > self.config.idle_timeout {
                         Ok(true)
@@ -451,7 +453,7 @@ impl Server {
                 }
                 command = command_registration.rx.recv() => {
                     match command {
-                        Some(command) => ws.send(tokio_tungstenite::tungstenite::Message::Text(command.into())).await.map_err(ws_err).map(|_| false),
+                        Some(command) => ws.send(tokio_tungstenite::tungstenite::Message::Text(command.as_ref().to_owned().into())).await.map_err(ws_err).map(|_| false),
                         None => Ok(true),
                     }
                 }
@@ -487,14 +489,19 @@ impl Server {
                         Ok(Some(Err(error))) => Err(ws_err(error)),
                     }
                 }
-            }?;
-            if step {
-                break;
+                }?;
+                if step {
+                    break;
+                }
             }
-        }
+            Ok::<(), io::Error>(())
+        }.await;
 
+        // Always unregister, including when the session exits through a WebSocket/protocol error.
+        // The session ID prevents an older connection from removing a newer registration with
+        // the same fingerprint.
         self.registry.unregister(&fingerprint, session_id).await;
-        Ok(())
+        result
     }
 
     async fn authenticate<S>(&self, ws: &mut tokio_tungstenite::WebSocketStream<S>) -> io::Result<String>
@@ -608,7 +615,7 @@ async fn handle_control_client(server: &Server, stream: tokio::net::UnixStream) 
     loop {
         let mut header = [0u8; 4];
         match timeout(Duration::from_secs(10), reader.read_exact(&mut header)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "control IPC idle timeout")),
@@ -619,7 +626,7 @@ async fn handle_control_client(server: &Server, stream: tokio::net::UnixStream) 
         }
         let mut payload = vec![0u8; len];
         match timeout(Duration::from_secs(10), reader.read_exact(&mut payload)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(_)) => {}
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "control IPC payload timeout")),
         }
@@ -664,10 +671,11 @@ impl Server {
         if !valid_control_target(&request.target) {
             return control_response(request_id, target, "rejected", 0, 0, "target must be 'broadcast' or a 64-hex agent fingerprint".into());
         }
-        if let Err(error) = validate_relay_command(&request.command, &self.config) {
-            return control_response(request_id, target, "rejected", 0, 0, error);
-        }
-        let (queued, dropped, status) = self.registry.route(&request.target, &request.command, self.config.max_broadcast_targets).await;
+        let command = match materialize_relay_command(&request.command, &self.config).await {
+            Ok(command) => command,
+            Err(error) => return control_response(request_id, target, "rejected", 0, 0, error),
+        };
+        let (queued, dropped, status) = self.registry.route(&request.target, command, self.config.max_broadcast_targets).await;
         match status {
             RouteStatus::Queued => control_response(request_id, target, "queued", queued, dropped, "command queued".into()),
             RouteStatus::QueueFull => control_response(request_id, target, "partial", queued, dropped, "one or more agent command queues were full".into()),
@@ -698,58 +706,38 @@ fn valid_control_target(target: &str) -> bool {
     target.eq_ignore_ascii_case("broadcast") || (target.len() == 64 && target.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-fn validate_relay_command(command: &str, config: &Config) -> Result<(), String> {
+async fn materialize_relay_command(command: &str, config: &Config) -> Result<Arc<str>, String> {
     let normalized = command.trim();
-    if normalized.eq_ignore_ascii_case("REQ:DATA")
-        || normalized.eq_ignore_ascii_case("CMD:RECONNECT")
-        || normalized.eq_ignore_ascii_case("CMD:CLOSE")
-        || normalized.eq_ignore_ascii_case("CMD:SLEEP")
-        || normalized.eq_ignore_ascii_case("CMD:HIBERNATE")
-        || normalized.eq_ignore_ascii_case("CMD:RESTART")
-        || normalized.eq_ignore_ascii_case("CMD:SHUTDOWN")
-        || normalized.eq_ignore_ascii_case("CMD:DIRECT_DISCONNECT")
-    {
-        return Ok(());
+    if normalized.eq_ignore_ascii_case("CMD:DIRECT_CONNECT") {
+        let listen_addr = config.direct_listen.as_str()
+            .parse::<SocketAddr>()
+            .map_err(|_| "server direct-listen address is invalid".to_owned())?;
+        let public = public_ip::resolve_public_ip(listen_addr)
+            .await
+            .map_err(|error| format!("unable to determine server public IP: {error}"))?;
+        return Ok(materialize_direct_command(public, listen_addr));
     }
-    if let Some(value) = strip_prefix_ascii_ci(normalized, "CMD:DIRECT_CONNECT:") {
-        let addr = value.trim().parse::<SocketAddr>().map_err(|_| "invalid direct endpoint address".to_owned())?;
-        if addr.ip().is_unspecified() || addr.ip().is_multicast() {
-            return Err("direct endpoint address is not usable".into());
-        }
-        if config.direct_endpoints.iter().any(|allowed| allowed == &addr) {
-            return Ok(());
-        }
-        return Err("direct endpoint is not in the server allowlist".into());
+    if strip_prefix_ascii_ci(normalized, "CMD:DIRECT_CONNECT:").is_some() {
+        return Err("direct-connect must omit the IP and port; the server discovers its public IP via ifconfig.me".into());
     }
-    Err("command is not relayable by the transport control plane".into())
+    if !ztsec_protocol::is_supported_agent_command(normalized) {
+        return Err("command is not supported by the ZTSEC agent protocol".into());
+    }
+    Ok(Arc::<str>::from(normalized.to_owned()))
+}
+
+fn materialize_direct_command(public_ip: IpAddr, listen_addr: SocketAddr) -> Arc<str> {
+    let host = match public_ip {
+        IpAddr::V4(ip) => ip.to_string(),
+        IpAddr::V6(ip) => format!("[{ip}]"),
+    };
+    Arc::<str>::from(format!("CMD:DIRECT_CONNECT:{host}:{}", listen_addr.port()))
 }
 
 fn validate_direct_listener_configuration(config: &Config) -> io::Result<()> {
-    if config.direct_listen.is_none() && !config.direct_endpoints.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--direct-endpoint requires --direct-listen"));
-    }
-    let Some(listen) = config.direct_listen.as_deref() else {
-        return Ok(());
-    };
-    if config.direct_endpoints.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--direct-listen requires at least one --direct-endpoint"));
-    }
-    let listen_addr = listen.parse::<SocketAddr>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "--direct-listen must be an IP:PORT socket address"))?;
-    for endpoint in &config.direct_endpoints {
-        if endpoint.port() != listen_addr.port() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("direct endpoint {endpoint} must use the --direct-listen port {}", listen_addr.port())));
-        }
-        if endpoint.ip().is_unspecified() || endpoint.ip().is_multicast() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("direct endpoint {endpoint} is not a usable advertised address")));
-        }
-        if listen_addr.ip().is_unspecified() {
-            let same_family = listen_addr.is_ipv4() == endpoint.is_ipv4();
-            if !same_family {
-                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("direct endpoint {endpoint} does not match the --direct-listen address family")));
-            }
-        } else if endpoint.ip() != listen_addr.ip() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("direct endpoint {endpoint} does not match --direct-listen address {listen_addr}")));
-        }
+    let listen_addr = config.direct_listen.parse::<SocketAddr>().map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "direct listener must be an IP:PORT socket address"))?;
+    if listen_addr.port() == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "direct listener port must not be zero"));
     }
     Ok(())
 }
@@ -782,7 +770,6 @@ fn bind_ipc_listener(path: &Path) -> io::Result<UnixListener> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::FileTypeExt;
             if !metadata.file_type().is_socket() {
                 return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("IPC path {} exists and is not a Unix socket", path.display())));
             }
@@ -865,7 +852,7 @@ async fn ipc_worker(
                 continue;
             }
             match timeout(Duration::from_secs(2), writer.write_all(&frame)).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(_)) => {}
                 Ok(Err(error)) => {
                     debug!(?error, queue_limit, "Python IPC connection dropped while forwarding telemetry");
                     metrics.ipc_connected.store(false, Ordering::Relaxed);
@@ -951,53 +938,62 @@ mod tests {
     }
 
     #[test]
-    fn relay_command_allowlist_rejects_code_execution() {
+    fn relay_accepts_all_agent_command_families() {
+        for command in [
+            "REQ:DATA",
+            "CMD:RECONNECT", "CMD:CLOSE", "CMD:SLEEP", "CMD:HIBERNATE", "CMD:RESTART", "CMD:SHUTDOWN",
+            "CMD:DIRECT_CONNECT", "CMD:DIRECT_DISCONNECT",
+            "CMD:PLUGIN:x:eA==", "CMD:PLUGIN_BEGIN:x:y:1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "CMD:PLUGIN_CHUNK:y:0:eA==", "CMD:PLUGIN_END:y", "CMD:PLUGIN_RESUME:y", "CMD:PLUGIN_MSG:x:eA==",
+            "CMD:PLUGIN_EVENT:ping", "CMD:UNLOAD:x",
+            "CMD:UPDATE:a:ZW1wdHk=", "CMD:UPDATE_BEGIN:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1",
+            "CMD:UPDATE_CHUNK:0:eA==", "CMD:UPDATE_END:", "CMD:EXECUTE:ps1:ZW1wdHk=",
+        ] {
+            assert!(ztsec_protocol::is_supported_agent_command(command), "not relayable: {command}");
+        }
+        assert!(!ztsec_protocol::is_supported_agent_command("CMD:SHELL"));
+        assert!(!ztsec_protocol::is_supported_agent_command("CMD:DIRECT_CONNECT:203.0.113.10:4794"));
+    }
+
+    #[test]
+    fn relay_direct_command_uses_discovered_public_ip_and_listener_port() {
+        let address: IpAddr = "203.0.113.10".parse().unwrap();
+        let listen: SocketAddr = "0.0.0.0:4794".parse().unwrap();
+        assert_eq!(materialize_direct_command(address, listen).as_ref(), "CMD:DIRECT_CONNECT:203.0.113.10:4794");
+    }
+
+    #[test]
+    fn relay_direct_command_brackets_ipv6_address() {
+        let address: IpAddr = "2001:db8::10".parse().unwrap();
+        let listen: SocketAddr = "[::]:4794".parse().unwrap();
+        assert_eq!(materialize_direct_command(address, listen).as_ref(), "CMD:DIRECT_CONNECT:[2001:db8::10]:4794");
+    }
+
+    #[test]
+    fn default_direct_listener_is_valid_and_has_fixed_port() {
         let config = Config::default();
-        assert!(validate_relay_command("CMD:RECONNECT", &config).is_ok());
-        assert!(validate_relay_command("REQ:DATA", &config).is_ok());
-        assert!(validate_relay_command("CMD:SLEEP", &config).is_ok());
-        assert!(validate_relay_command("CMD:HIBERNATE", &config).is_ok());
-        assert!(validate_relay_command("CMD:RESTART", &config).is_ok());
-        assert!(validate_relay_command("CMD:SHUTDOWN", &config).is_ok());
-        assert!(validate_relay_command("CMD:EXECUTE:cmd", &config).is_err());
-        assert!(validate_relay_command("CMD:UPDATE:anything", &config).is_err());
-        assert!(validate_relay_command("CMD:SHELL", &config).is_err());
-    }
-
-    #[test]
-    fn relay_direct_endpoint_requires_allowlist() {
-        let mut config = Config::default();
-        let address: SocketAddr = "203.0.113.10:4794".parse().unwrap();
-        config.direct_endpoints.push(address);
-        assert!(validate_relay_command("CMD:DIRECT_CONNECT:203.0.113.10:4794", &config).is_ok());
-        assert!(validate_relay_command("cmd:direct_connect:203.0.113.10:4794", &config).is_ok());
-        assert!(validate_relay_command("CMD:DIRECT_CONNECT:203.0.113.11:4794", &config).is_err());
-        assert!(validate_relay_command("CMD:DIRECT_CONNECT:0.0.0.0:4794", &config).is_err());
-        assert!(validate_relay_command("CMD:DIRECT_CONNECT:239.1.1.1:4794", &config).is_err());
-    }
-
-    #[test]
-    fn direct_listener_configuration_matches_advertised_endpoint() {
-        let mut config = Config::default();
-        config.direct_listen = Some("0.0.0.0:4794".into());
-        config.direct_endpoints.push("203.0.113.10:4794".parse().unwrap());
+        assert_eq!(config.direct_listen, DEFAULT_DIRECT_LISTEN);
         assert!(validate_direct_listener_configuration(&config).is_ok());
-        config.direct_endpoints[0] = "203.0.113.10:4795".parse().unwrap();
-        assert!(validate_direct_listener_configuration(&config).is_err());
+        assert_eq!(config.direct_listen.parse::<SocketAddr>().unwrap().port(), 4794);
     }
 
     #[test]
-    fn direct_listener_rejects_mismatched_specific_ip() {
-        let mut config = Config::default();
-        config.direct_listen = Some("192.0.2.10:4794".into());
-        config.direct_endpoints.push("192.0.2.11:4794".parse().unwrap());
-        assert!(validate_direct_listener_configuration(&config).is_err());
+    fn default_broadcast_bound_covers_default_connection_capacity() {
+        let config = Config::default();
+        assert_eq!(config.max_broadcast_targets, config.max_connections);
     }
 
     #[test]
-    fn direct_endpoint_requires_listener() {
+    fn invalid_direct_listener_is_rejected() {
         let mut config = Config::default();
-        config.direct_endpoints.push("192.0.2.10:4794".parse().unwrap());
+        config.direct_listen = "0.0.0.0:0".into();
         assert!(validate_direct_listener_configuration(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_direct_address_is_rejected() {
+        let mut config = Config::default();
+        config.direct_listen = "127.0.0.1:4794".into();
+        assert!(materialize_relay_command("CMD:DIRECT_CONNECT:127.0.0.1:4794", &config).await.is_err());
     }
 }

@@ -2,7 +2,6 @@
 """Local ZTSEC telemetry consumer; intentionally has no Internet-facing listener."""
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
 import os
@@ -20,8 +19,25 @@ RETRY_MAX = 10.0
 LOGGER = logging.getLogger("ztsec-telemetry")
 
 
-MAX_CONTROL_FRAME = 64 * 1024
-MAX_CONTROL_COMMAND = 1024
+MAX_CONTROL_COMMAND = 3 * 1024 * 1024
+MAX_CONTROL_FRAME = MAX_CONTROL_COMMAND + 64 * 1024
+
+def is_supported_command(command: str) -> bool:
+    upper = command.upper()
+    exact = {
+        "REQ:DATA", "CMD:RECONNECT", "CMD:CLOSE", "CMD:SLEEP",
+        "CMD:HIBERNATE", "CMD:RESTART", "CMD:SHUTDOWN",
+        "CMD:DIRECT_CONNECT", "CMD:DIRECT_DISCONNECT",
+    }
+    prefixes = (
+        "CMD:PLUGIN:", "CMD:PLUGIN_BEGIN:", "CMD:PLUGIN_CHUNK:",
+        "CMD:PLUGIN_END:", "CMD:PLUGIN_RESUME:", "CMD:PLUGIN_MSG:",
+        "CMD:PLUGIN_EVENT:", "CMD:UNLOAD:", "CMD:UPDATE:",
+        "CMD:UPDATE_BEGIN:", "CMD:UPDATE_CHUNK:", "CMD:UPDATE_END:",
+        "CMD:EXECUTE:",
+    )
+    return upper in exact or any(upper.startswith(prefix) for prefix in prefixes)
+
 
 def send_agent_command(socket_path: Path, target: str, command: str, request_id: str) -> dict[str, Any]:
     """Send one bounded control request over the private Unix socket."""
@@ -32,26 +48,11 @@ def send_agent_command(socket_path: Path, target: str, command: str, request_id:
     if not command or len(command.encode("utf-8")) > MAX_CONTROL_COMMAND or any(ch in command for ch in "\r\n\x00"):
         raise ValueError("invalid command")
     normalized = command.strip()
-    upper = normalized.upper()
-    if upper not in {"REQ:DATA", "CMD:RECONNECT", "CMD:CLOSE", "CMD:SLEEP", "CMD:HIBERNATE", "CMD:RESTART", "CMD:SHUTDOWN", "CMD:DIRECT_DISCONNECT"} and not upper.startswith("CMD:DIRECT_CONNECT:"):
+    if not is_supported_command(normalized):
         raise ValueError("command is not permitted by the control plane")
-    if upper.startswith("CMD:DIRECT_CONNECT:"):
-        direct_value = normalized[len("CMD:DIRECT_CONNECT:"):].strip()
-        try:
-            if direct_value.startswith("["):
-                end = direct_value.rfind("]:")
-                if end <= 1:
-                    raise ValueError
-                host = direct_value[1:end]
-                port_text = direct_value[end + 2:]
-            else:
-                host, port_text = direct_value.rsplit(":", 1)
-            address = ipaddress.ip_address(host)
-            port = int(port_text)
-            if address.is_unspecified or address.is_multicast or not 1 <= port <= 65535:
-                raise ValueError
-        except (ValueError, TypeError):
-            raise ValueError("invalid direct endpoint address") from None
+    if normalized.upper().startswith("CMD:DIRECT_CONNECT:"):
+        raise ValueError("direct-connect must be requested without an address; the server supplies its public IP")
+
     request = {
         "protocol_version": 1,
         "message_type": "agent_command",
@@ -100,7 +101,10 @@ def receive_frame(sock: socket.socket) -> dict[str, Any] | None:
     payload = read_exact(sock, size)
     if not payload:
         raise ValueError("empty IPC payload")
-    value = json.loads(payload.decode("utf-8"))
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"invalid IPC JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError("IPC payload must be an object")
     return value
@@ -162,7 +166,11 @@ def serve(socket_path: Path) -> None:
                 LOGGER.info("connected to Rust IPC at %s", socket_path)
                 delay = 1.0
                 while True:
-                    message = receive_frame(sock)
+                    try:
+                        message = receive_frame(sock)
+                    except (ValueError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+                        LOGGER.warning("discarding malformed telemetry frame: %s", exc)
+                        continue
                     if message is None:
                         return
                     try:

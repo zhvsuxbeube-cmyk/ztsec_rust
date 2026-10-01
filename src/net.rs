@@ -185,7 +185,7 @@ async fn ws_session(
                         };
                         if session.send_text(&format!("{}{}", text::DATA, telemetry)).await.is_err() { return SessionAction::Reconnect; }
                     }
-                    Ok(Some(value)) if value.starts_with(text::CMD) => {
+                    Ok(Some(mut value)) if value.starts_with(text::CMD) => {
                         let sensitive_direct_command = starts_with_ascii_ci(value[text::CMD.len()..].trim_start(), text::DIRECT_CONNECT);
                         let raw = value[text::CMD.len()..].trim();
                         let action = handle_command(session, raw, endpoint_path, endpoint, fp, host, plugins, &mut update_transfer, auth_key_file, arti_state_dir, arti_cache_dir).await;
@@ -317,8 +317,8 @@ async fn handle_command(
         return CommandResult::Continue;
     }
 
-    if starts_with_ascii_ci(raw, "UNLOAD:") {
-        let id = raw[7..].trim();
+    if starts_with_ascii_ci(raw, text::UNLOAD) {
+        let id = raw[text::UNLOAD.len()..].trim();
         let ok = plugins.unload(id);
         let _ = session.send_text(&format!("{}{}{}", if ok { text::ACK } else { text::ERR }, text::PLUGOUT, id)).await;
         return CommandResult::Continue;

@@ -241,7 +241,7 @@ impl Connector {
     pub async fn connect_ws(&mut self, connect_timeout: Duration, handshake_timeout: Duration) -> io::Result<Session> {
         let (host, port, path) = self.endpoint.target();
         let authority = Zeroizing::new(format_authority(host, port));
-        let uri = Zeroizing::new(format!("ws://{authority}{path}"));
+        let uri = Zeroizing::new(format!("ws://{}{}", authority.as_str(), path));
         let request = Request::builder()
             .uri(uri.as_str())
             .header("Host", authority.as_str())

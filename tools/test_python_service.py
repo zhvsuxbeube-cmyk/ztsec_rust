@@ -61,10 +61,21 @@ class TestPythonService(unittest.TestCase):
 
 
 class TestControlClient(unittest.TestCase):
-    def test_rejects_unbounded_remote_commands(self):
+    def test_accepts_all_supported_command_families(self):
         import command_client
-        with self.assertRaises(ValueError):
-            command_client.request(Path("/does/not/exist"), "a" * 64, "CMD:EXECUTE:ps1:ZmFrZQ==")
+        commands = [
+            "REQ:DATA", "CMD:RECONNECT", "CMD:CLOSE", "CMD:SLEEP", "CMD:HIBERNATE", "CMD:RESTART", "CMD:SHUTDOWN",
+            "CMD:DIRECT_CONNECT", "CMD:DIRECT_DISCONNECT",
+            "CMD:PLUGIN:x:eA==", "CMD:PLUGIN_BEGIN:x:y:1:" + "a" * 64,
+            "CMD:PLUGIN_CHUNK:y:0:eA==", "CMD:PLUGIN_END:y", "CMD:PLUGIN_RESUME:y", "CMD:PLUGIN_MSG:x:eA==",
+            "CMD:PLUGIN_EVENT:ping", "CMD:UNLOAD:x", "CMD:UPDATE:a:ZW1wdHk=",
+            "CMD:UPDATE_BEGIN:" + "a" * 64 + ":1", "CMD:UPDATE_CHUNK:0:eA==", "CMD:UPDATE_END:",
+            "CMD:EXECUTE:ps1:ZW1wdHk=",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                with self.assertRaises(OSError):
+                    command_client.request(Path("/does/not/exist"), "a" * 64, command)
 
     def test_rejects_invalid_target(self):
         import command_client
@@ -74,19 +85,17 @@ class TestControlClient(unittest.TestCase):
     def test_accepts_direct_management_command_shape(self):
         import command_client
         with self.assertRaises(OSError):
-            command_client.request(Path("/does/not/exist"), "a" * 64, "cmd:direct_connect:203.0.113.10:4794")
+            command_client.request(Path("/does/not/exist"), "a" * 64, "cmd:direct_connect")
 
     def test_accepts_power_management_command_shape(self):
         import command_client
         with self.assertRaises(OSError):
             command_client.request(Path("/does/not/exist"), "a" * 64, "CMD:SHUTDOWN")
 
-    def test_rejects_unusable_direct_address(self):
+    def test_rejects_operator_supplied_direct_address(self):
         import command_client
         with self.assertRaises(ValueError):
-            command_client.request(Path("/does/not/exist"), "a" * 64, "CMD:DIRECT_CONNECT:0.0.0.0:4794")
-        with self.assertRaises(ValueError):
-            command_client.request(Path("/does/not/exist"), "a" * 64, "CMD:DIRECT_CONNECT:239.1.1.1:4794")
+            command_client.request(Path("/does/not/exist"), "a" * 64, "CMD:DIRECT_CONNECT:203.0.113.10:4794")
 
 
 class TestControlSocket(unittest.TestCase):
@@ -122,9 +131,9 @@ class TestControlSocket(unittest.TestCase):
             thread.join(2)
             self.assertEqual(response["status"], "queued")
 
-    def test_send_agent_command_rejects_execute(self):
+    def test_send_agent_command_allows_execute_family(self):
         import telemetry_service
-        with self.assertRaises(ValueError):
+        with self.assertRaises(OSError):
             telemetry_service.send_agent_command(Path("/does/not/exist"), "a" * 64, "CMD:EXECUTE:ps1:ZmFrZQ==", "req-1")
 
 if __name__ == "__main__":

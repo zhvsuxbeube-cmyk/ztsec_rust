@@ -149,28 +149,16 @@ The server returns:
 }
 ```
 
-The transport control plane deliberately accepts only bounded management commands:
+The authenticated control plane accepts every command family implemented by the existing agent. Commands remain bounded by the shared protocol maximums and may be unicast to one fingerprint or broadcast to a bounded number of connected agents. `CMD:DIRECT_CONNECT` is special: the operator submits it without an address; the server discovers its current public IP via ifconfig.me and constructs the concrete wire command sent to the agent.
 
-```text
-REQ:DATA
-CMD:RECONNECT
-CMD:CLOSE
-CMD:SLEEP
-CMD:HIBERNATE
-CMD:RESTART
-CMD:SHUTDOWN
-CMD:DIRECT_CONNECT:<configured-ip>:<configured-port>
-CMD:DIRECT_DISCONNECT
-```
-
-Code-execution, plugin-deployment, and update-transfer commands are not relayable through this new control socket because their payloads exceed the small control frame contract or would turn the control socket into an arbitrary code/deployment bus. The existing simple power-management commands are relayable and remain subject to the same authenticated, bounded unicast/broadcast path.
+All command families implemented by the existing agent are relayable through the authenticated private control socket. The default broadcast limit is 4096, matching the server's default authenticated connection limit, and remains configurable downward. The protocol and transport remain bounded: command/control frames have explicit size limits, broadcasts have bounded fan-out, and each agent has a bounded command queue. Direct-connect is the sole special case: the operator submits `CMD:DIRECT_CONNECT` without an address, and the server inserts its current public address discovered from ifconfig.me.
 
 ### Direct transport switch
 
-`CMD:DIRECT_CONNECT:<socket-address>` causes the authenticated agent to close the current WebSocket and reconnect to the configured direct listener using a normal TCP/WebSocket connection. The connection uses the same Ed25519 authentication as the onion path.
+The server-generated `CMD:DIRECT_CONNECT:<socket-address>` causes the authenticated agent to close the current WebSocket and reconnect to the built-in direct listener using a normal TCP/WebSocket connection. The connection uses the same Ed25519 authentication as the onion path.
 
 IPv4 uses `203.0.113.10:4794`; IPv6 uses standard bracket notation such as `[2001:db8::10]:4794`.
 
-The server only accepts direct endpoints that were explicitly configured with `--direct-endpoint`. This prevents the control plane from redirecting an agent to an arbitrary address. Direct-connect addresses are accepted case-insensitively for the command prefix, but the IP/port must exactly match the allowlist entry.
+The control plane does not accept an operator-supplied direct IP or port. `CMD:DIRECT_CONNECT` causes the Rust server to discover its current public IP through ifconfig.me and send that address with the built-in direct-listener port 4794. There is no direct-listener CLI flag. This removes the stale public-IP CLI allowlist and prevents command clients from choosing an arbitrary destination.
 
 `CMD:DIRECT_DISCONNECT` closes the direct session and returns the agent to its original configured endpoint. The direct endpoint is not persisted to disk or added to startup arguments. The agent drops and zeroizes the runtime direct-endpoint strings on return to the configured transport. This is best-effort memory hygiene; it does not erase operating-system, shell, or audit logs.

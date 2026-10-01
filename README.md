@@ -46,7 +46,7 @@ Windows endpoint
 +-----------------------------------------------------------+
 ```
 
-The application protocol remains the agent's existing `HELLO:FINGERPRINT:*`, `DATA:*`, `HB`, `PONG`, `REQ:DATA`, and `CMD:*` vocabulary. Production WebSocket messages are text frames carrying those same application messages.
+The application protocol remains the agent's existing `HELLO:FINGERPRINT:*`, `DATA:*`, `HB`, `PONG`, `REQ:DATA`, and `CMD:*` vocabulary. Production WebSocket messages are text frames carrying those same application messages. The authenticated control socket can relay every command family already implemented by the agent—lifecycle, plugin load/transfer/event/unload, update/transfer, execute, and transport switching—to one fingerprint or to a bounded broadcast set.
 
 `protocol`, `server`, `tools/auth-keygen`, and `tools/load-test` are members of the root Cargo workspace so clean workspace commands validate their dependency graph together.
 
@@ -147,6 +147,8 @@ $env:ZTSEC_ARTI_CACHE_DIR = 'C:\ProgramData\ZTSEC\arti-cache'
 
 The `--endpoint`, `--auth-key-file`, `--arti-state-dir`, and `--arti-cache-dir` command-line forms are also supported. Endpoint parsing rejects DNS-based onion lookup: a `.onion` endpoint must be a valid v3 hostname, and the code passes that hostname directly to Arti.
 
+The direct-connection command does not accept an operator-supplied server IP. The Rust relay receives `CMD:DIRECT_CONNECT`, queries `https://ifconfig.me/ip` (with a family-specific fallback), combines that current public address with the built-in direct-listener port 4794, and only then sends the concrete address to the authenticated agent.
+
 For an identity bootstrap/debug value, the agent can print its existing telemetry fingerprint without opening a network connection:
 
 ```powershell
@@ -219,7 +221,7 @@ For deterministic local tests, disable Arti and bind a loopback WebSocket listen
   --local-socket /tmp/ztsec-telemetry.sock
 ```
 
-The local listener is intentionally a test facility, not the production public endpoint.
+The local listener is intentionally a test facility, not the production public endpoint. The direct listener is separate and is enabled by default on TCP port 4794.
 
 ## Python telemetry service
 
@@ -265,7 +267,7 @@ REQ:DATA
 CMD:*   (agent-side command vocabulary is preserved for the existing agent)
 ```
 
-The new server currently generates the telemetry acknowledgement `ACK:DATA` itself. The ZIP did not contain a pre-existing production server/business layer for remote command delivery, so the new Rust/Python boundary intentionally does not invent a separate command-control application. The existing legacy direct-TCP path remains available for local compatibility and for the original plugin/update command behavior.
+The new server currently generates the telemetry acknowledgement `ACK:DATA` itself. The ZIP did not contain a pre-existing production server/business layer for remote command delivery, so the new Rust/Python boundary intentionally does not invent a separate command-control application. The existing legacy direct-TCP path remains available for local compatibility; the new authenticated relay preserves the complete existing agent command vocabulary rather than inventing a second command protocol.
 
 ## Resource controls
 
@@ -404,10 +406,10 @@ Release source archives produced for this handoff omit the unchanged `vendor/art
 
 ## Bidirectional management relay
 
-The Rust server now maintains a bounded registry of authenticated agents. The local control socket at `/run/ztsec/control.sock` can route a small allowlisted management vocabulary to one authenticated agent or to a bounded broadcast set.
+The Rust server maintains a bounded registry of authenticated agents. The local control socket at `/run/ztsec/control.sock` can route every command family supported by the agent protocol to one authenticated agent or to a bounded broadcast set.
 
-Supported relay commands are `REQ:DATA`, `CMD:RECONNECT`, `CMD:CLOSE`, `CMD:SLEEP`, `CMD:HIBERNATE`, `CMD:RESTART`, `CMD:SHUTDOWN`, `CMD:DIRECT_CONNECT:<configured-ip>:<port>`, and `CMD:DIRECT_DISCONNECT`. Commands are queued in small per-agent bounded channels, so a slow agent cannot cause an unbounded server queue.
+Supported relay commands cover every command family implemented by the agent: `REQ:DATA`; lifecycle (`CMD:RECONNECT`, `CMD:CLOSE`, `CMD:SLEEP`, `CMD:HIBERNATE`, `CMD:RESTART`, `CMD:SHUTDOWN`); plugin load/transfer/event/unload; update/transfer; execute; and transport switching (`CMD:DIRECT_CONNECT`, `CMD:DIRECT_DISCONNECT`). Commands are queued in small per-agent bounded channels, so a slow agent cannot cause an unbounded server queue. The default broadcast limit is 4096, matching the default connection limit; deployments can lower it for additional fan-out protection.
 
-The control plane deliberately does not become a general-purpose remote execution or software-deployment bus. Existing `EXECUTE`, plugin-deployment, and update-transfer commands are rejected by the new relay boundary; the existing simple power-management commands remain explicitly allowlisted. The Linux local integration test exercises unicast and broadcast command delivery through the private control socket, including the direct-connect/direct-disconnect path on the direct listener.
+The control plane is an authenticated relay for the existing agent command protocol. It exposes all command families already implemented by the agent: power/lifecycle, execute, plugin load/transfer/event, update transfer, telemetry request, and direct transport switching. The Linux local integration test exercises unicast and broadcast command delivery through the private control socket, including the direct-connect/direct-disconnect path on the direct listener; command-family coverage is also enforced by protocol/Python regression tests.
 
-The agent's direct transport switch is runtime-only. A successful `CMD:DIRECT_CONNECT` closes the Tor WebSocket and reconnects to the explicitly allowlisted direct server endpoint. `CMD:DIRECT_DISCONNECT` closes that direct session and returns to the configured endpoint. The direct endpoint is not persisted in agent configuration, and its in-memory strings are zeroized when released; this does not erase external audit or OS logs.
+The agent's direct transport switch is runtime-only. A successful `CMD:DIRECT_CONNECT` closes the Tor WebSocket and reconnects to the server-discovered direct endpoint. `CMD:DIRECT_DISCONNECT` closes that direct session and returns to the configured endpoint. The direct endpoint is not persisted in agent configuration, and its in-memory strings are zeroized when released; this does not erase external audit or OS logs.
