@@ -170,3 +170,10 @@ The final `artifacts` image intentionally uses `FROM scratch` and contains only 
 ### Management relay verification
 
 The Linux local integration harness now exercises the private control socket end-to-end: one authenticated mock agent receives a unicast `CMD:RECONNECT`, two authenticated mock agents with different fingerprints receive a broadcast `CMD:RECONNECT`, and a third mock agent follows `CMD:DIRECT_CONNECT` to the direct listener, authenticates there, receives `CMD:DIRECT_DISCONNECT`, and reconnects to the primary listener. The harness requires the server control response to report queue admission at each transition. The test does not use arbitrary command execution.
+
+## External panel gateway verification
+
+- `python3 -m py_compile tools/panel.py tools/test_panel_gateway.py`
+- `python3 -m unittest -v tools.test_panel_gateway tools.test_python_service tools.panel_test tools.test_update_contract`
+- TLS mock handshake verified using the generated CA/server certificate: HMAC proof accepted and the raw 32-character secret was absent from both panel authentication messages.
+- Gateway is telemetry-only; the existing private Unix control socket remains the command plane.

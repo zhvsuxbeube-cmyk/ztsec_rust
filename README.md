@@ -413,3 +413,7 @@ Supported relay commands cover every command family implemented by the agent: `R
 The control plane is an authenticated relay for the existing agent command protocol. It exposes all command families already implemented by the agent: power/lifecycle, execute, plugin load/transfer/event, update transfer, telemetry request, and direct transport switching. The Linux local integration test exercises unicast and broadcast command delivery through the private control socket, including the direct-connect/direct-disconnect path on the direct listener; command-family coverage is also enforced by protocol/Python regression tests.
 
 The agent's direct transport switch is runtime-only. A successful `CMD:DIRECT_CONNECT` closes the Tor WebSocket and reconnects to the server-discovered direct endpoint. `CMD:DIRECT_DISCONNECT` closes that direct session and returns to the configured endpoint. The direct endpoint is not persisted in agent configuration, and its in-memory strings are zeroized when released; this does not erase external audit or OS logs.
+
+## External panel gateway
+
+An optional TLS panel gateway is available for remote telemetry/status consumption. It is disabled by default. Enable it with `--panel-listen`, `--panel-cert`, `--panel-key`, `--panel-secret-file`, and `--panel-id`. The Python client in `tools/panel.py` supports `--remote-host` and performs the same fresh-challenge HMAC authentication. The 32-character secret is local-only and never appears on the wire. See `docs/PANEL_GATEWAY.md`.

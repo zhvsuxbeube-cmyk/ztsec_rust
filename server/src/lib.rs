@@ -14,8 +14,10 @@ use tor_proto::stream::IncomingStreamRequest;
 use tracing::{debug, info, warn};
 
 mod control;
+mod panel;
 mod public_ip;
 use control::{AgentRegistry, RouteStatus};
+use panel::PanelHub;
 
 pub const DEFAULT_LOCAL_SOCKET: &str = "/run/ztsec/telemetry.sock";
 pub const DEFAULT_CONTROL_SOCKET: &str = "/run/ztsec/control.sock";
@@ -32,6 +34,12 @@ pub struct Config {
     pub enable_onion: bool,
     pub local_socket: PathBuf,
     pub control_socket: PathBuf,
+    pub panel_listen: Option<String>,
+    pub panel_cert: PathBuf,
+    pub panel_key: PathBuf,
+    pub panel_secret_file: PathBuf,
+    pub panel_id: String,
+    pub panel_max_connections: usize,
     pub max_agent_command_queue: usize,
     pub max_broadcast_targets: usize,
     pub max_control_requests_per_second: u32,
@@ -61,6 +69,12 @@ impl Default for Config {
             enable_onion: true,
             local_socket: PathBuf::from(DEFAULT_LOCAL_SOCKET),
             control_socket: PathBuf::from(DEFAULT_CONTROL_SOCKET),
+            panel_listen: None,
+            panel_cert: PathBuf::from("/etc/ztsec/panel/server.crt"),
+            panel_key: PathBuf::from("/etc/ztsec/panel/server.key"),
+            panel_secret_file: PathBuf::from("/etc/ztsec/panel/secret"),
+            panel_id: "panel-01".into(),
+            panel_max_connections: 64,
             max_agent_command_queue: 16,
             max_broadcast_targets: 4096,
             max_control_requests_per_second: 10,
@@ -170,16 +184,24 @@ pub struct Server {
     registry: AgentRegistry,
     control_limit: Arc<Semaphore>,
     session_ids: Arc<AtomicU64>,
+    panel_hub: PanelHub,
 }
 
 impl Server {
     pub fn new(config: Config) -> io::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         if config.websocket_path.is_empty() || !config.websocket_path.starts_with('/') { return Err(io::Error::new(io::ErrorKind::InvalidInput, "websocket path must start with '/'") ); }
-        if config.max_connections == 0 || config.max_auth_inflight == 0 || config.max_ipc_queue == 0 { return Err(io::Error::new(io::ErrorKind::InvalidInput, "resource limits must be non-zero")); }
-        if config.max_messages_per_second == 0 || config.max_agent_command_queue == 0 || config.max_broadcast_targets == 0 || config.max_control_requests_per_second == 0 { return Err(io::Error::new(io::ErrorKind::InvalidInput, "resource limits must be non-zero")); }
+        if config.max_connections == 0 || config.max_auth_inflight == 0 || config.max_ipc_queue == 0 || config.panel_max_connections == 0
+            || config.max_messages_per_second == 0 || config.max_agent_command_queue == 0
+            || config.max_broadcast_targets == 0 || config.max_control_requests_per_second == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "resource limits must be non-zero"));
+        }
+        if config.panel_id.is_empty() || config.panel_id.len() > 64 || config.panel_id.bytes().any(|byte| !byte.is_ascii_graphic()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "panel ID must be 1-64 ASCII graphic characters"));
+        }
         validate_direct_listener_configuration(&config)?;
         let keys = KeyStore::load(&config.authorized_keys)?;
         let (ipc_tx, ipc_rx) = mpsc::channel(config.max_ipc_queue);
+        let panel_hub = PanelHub::new(config.max_ipc_queue);
         let (shutdown, _) = watch::channel(false);
         let server = Self {
             connection_limit: Arc::new(Semaphore::new(config.max_connections)),
@@ -193,6 +215,7 @@ impl Server {
             registry: AgentRegistry::default(),
             control_limit: Arc::new(Semaphore::new(16)),
             session_ids: Arc::new(AtomicU64::new(1)),
+            panel_hub,
         };
         Ok((server, ipc_rx))
     }
@@ -231,6 +254,18 @@ impl Server {
                 return Err(io::Error::new(error.kind(), format!("bind direct listener {}: {error}", self.config.direct_listen)));
             }
         };
+        let panel_listener = if let Some(address) = self.config.panel_listen.clone() {
+            panel::validate_secret_file(&self.config.panel_secret_file)?;
+            let listener = TcpListener::bind(&address).await.map_err(|error| {
+                let _ = fs::remove_file(&control_path);
+                let _ = fs::remove_file(&ipc_path);
+                io::Error::new(error.kind(), format!("bind panel listener {address}: {error}"))
+            })?;
+            let tls = panel::build_tls_acceptor(&self.config.panel_cert, &self.config.panel_key)?;
+            Some((listener, Arc::new(tls)))
+        } else {
+            None
+        };
 
         let ipc_metrics = Arc::clone(&self.metrics);
         let ipc_shutdown = self.shutdown.subscribe();
@@ -251,6 +286,21 @@ impl Server {
             let server = self.clone_for_task();
             tokio::spawn(async move { server.accept_tcp(direct_listener).await })
         };
+        let panel_task = panel_listener.map(|(listener, tls)| {
+            info!(address = ?self.config.panel_listen, "external panel gateway enabled (TLS + challenge/response; telemetry only)");
+            let panel_config = panel::PanelConfig {
+                cert: self.config.panel_cert.clone(),
+                key: self.config.panel_key.clone(),
+                secret_file: self.config.panel_secret_file.clone(),
+                panel_id: self.config.panel_id.clone(),
+                handshake_timeout: self.config.auth_timeout,
+                idle_timeout: self.config.idle_timeout,
+            };
+            let hub = self.panel_hub.clone();
+            let limit = Arc::new(Semaphore::new(self.config.panel_max_connections));
+            let shutdown = self.shutdown.subscribe();
+            tokio::spawn(async move { panel::run(listener, tls, panel_config, hub, limit, shutdown).await })
+        });
 
         let onion_service = if self.config.enable_onion {
             let (service, request_stream) = match self.launch_onion_service().await {
@@ -306,6 +356,7 @@ impl Server {
         self.shutdown();
         if let Some(task) = local_task { task.abort(); }
         direct_task.abort();
+        if let Some(task) = panel_task { task.abort(); }
         control_task.abort();
         let _ = fs::remove_file(&self.config.control_socket);
         metrics_task.abort();
@@ -321,7 +372,7 @@ impl Server {
         Self {
             config: self.config.clone(), keys: self.keys.clone(), metrics: Arc::clone(&self.metrics), ipc_tx: self.ipc_tx.clone(),
             sequence: Arc::clone(&self.sequence), connection_limit: Arc::clone(&self.connection_limit), auth_limit: Arc::clone(&self.auth_limit), shutdown: self.shutdown.clone(),
-            registry: self.registry.clone(), control_limit: Arc::clone(&self.control_limit), session_ids: Arc::clone(&self.session_ids),
+            registry: self.registry.clone(), control_limit: Arc::clone(&self.control_limit), session_ids: Arc::clone(&self.session_ids), panel_hub: self.panel_hub.clone(),
         }
     }
 
@@ -563,17 +614,18 @@ impl Server {
         let timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis().min(u64::MAX as u128) as u64;
         let sequence_number = self.sequence.fetch_add(1, Ordering::Relaxed);
         let envelope = ztsec_protocol::IpcEnvelope { protocol_version: ztsec_protocol::PROTOCOL_VERSION, message_type: "telemetry", agent_id: fingerprint, fingerprint, timestamp_ms, sequence_number, telemetry: &telemetry };
-        let mut frame = Vec::with_capacity(4 + text.len().min(256 * 1024));
-        frame.extend_from_slice(&0u32.to_be_bytes());
-        serde_json::to_writer(&mut frame, &envelope).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-        let payload_len = frame.len().saturating_sub(4);
+        let payload = serde_json::to_vec(&envelope).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        let payload_len = payload.len();
         if payload_len > 256 * 1024 { self.metrics.oversized.fetch_add(1, Ordering::Relaxed); return Err(io::Error::new(io::ErrorKind::InvalidData, "IPC payload too large")); }
-        frame[..4].copy_from_slice(&(payload_len as u32).to_be_bytes());
         match self.ipc_tx.try_send(frame) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => { self.metrics.ipc_dropped.fetch_add(1, Ordering::Relaxed); return Err(io::Error::new(io::ErrorKind::WouldBlock, "Python IPC queue full")); }
             Err(mpsc::error::TrySendError::Closed(_)) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "Python IPC is unavailable")),
         }
+        self.panel_hub.publish(String::from_utf8(payload).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "telemetry JSON was not UTF-8"))?, fingerprint).await;
         // This acknowledgement is intentionally small: it provides a deterministic readiness signal for
         // the updater while avoiding application-level buffering on the Rust side.
         ws.send(tokio_tungstenite::tungstenite::Message::Text("ACK:DATA".into())).await.map_err(ws_err)?;

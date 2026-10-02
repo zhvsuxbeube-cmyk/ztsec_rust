@@ -74,3 +74,41 @@ The command client accepts every command family supported by the existing agent 
 The default broadcast fan-out is 4096, matching the server's default maximum authenticated connection count.
 
 For tuning the relay resource limits without changing the protocol, the server accepts `--max-agent-command-queue`, `--max-broadcast-targets`, and `--max-control-requests-per-second`. Keep these bounded according to the host's expected agent population.
+
+## External panel telemetry gateway
+
+The external panel gateway is **disabled by default**. When enabled it listens on a dedicated TCP address and requires TLS followed by a challenge/response using a local 32-character secret. The secret is never sent over the network. The public gateway intentionally exposes telemetry/status only; the existing powerful agent command plane remains on the private Unix control socket.
+
+Generate deployment credentials on the relay host with:
+
+```sh
+tools/generate_panel_credentials.sh /etc/ztsec/panel
+```
+
+Pass the relay DNS name as the second argument to the helper so it is placed in the server certificate SAN. For an IP-based connection, the certificate must instead be issued with that IP in its SAN, and the Python panel client must verify it with `--remote-ca-cert`.
+
+Enable the gateway with:
+
+```sh
+/opt/ztsec/bin/ztsec-server \\
+  --authorized-keys /etc/ztsec/authorized_keys \\
+  --local-socket /run/ztsec/telemetry.sock \\
+  --control-socket /run/ztsec/control.sock \\
+  --panel-listen 0.0.0.0:8443 \\
+  --panel-cert /etc/ztsec/panel/server.crt \\
+  --panel-key /etc/ztsec/panel/server.key \\
+  --panel-secret-file /etc/ztsec/panel/secret \\
+  --panel-id panel-01
+```
+
+From the external panel host, copy only the panel secret and CA certificate through a trusted administrative channel, then run:
+
+```sh
+python3 tools/panel.py \\
+  --remote-host relay.example.com \\
+  --remote-port 8443 \\
+  --remote-server-name relay.example.com \\
+  --remote-panel-id panel-01 \\
+  --remote-secret-file ./panel.secret \\
+  --remote-ca-cert ./ca.crt
+```

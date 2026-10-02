@@ -35,6 +35,12 @@ fn parse_args() -> io::Result<Config> {
             "--no-onion" => config.enable_onion = false,
             "--local-socket" => config.local_socket = PathBuf::from(next(&mut args, "local-socket")?),
             "--control-socket" => config.control_socket = PathBuf::from(next(&mut args, "control-socket")?),
+            "--panel-listen" => config.panel_listen = Some(next(&mut args, "panel-listen")?),
+            "--panel-cert" => config.panel_cert = PathBuf::from(next(&mut args, "panel-cert")?),
+            "--panel-key" => config.panel_key = PathBuf::from(next(&mut args, "panel-key")?),
+            "--panel-secret-file" => config.panel_secret_file = PathBuf::from(next(&mut args, "panel-secret-file")?),
+            "--panel-id" => config.panel_id = next(&mut args, "panel-id")?,
+            "--panel-max-connections" => config.panel_max_connections = parse_usize(&next(&mut args, "panel-max-connections")?)?,
             "--path" => config.websocket_path = next(&mut args, "path")?,
             "--onion-port" => config.onion_port = parse_u16(&next(&mut args, "onion-port")?)?,
             "--max-connections" => config.max_connections = parse_usize(&next(&mut args, "max-connections")?)?,
@@ -47,7 +53,7 @@ fn parse_args() -> io::Result<Config> {
             "--ping-interval" => config.ping_interval = parse_seconds(&next(&mut args, "ping-interval")?)?,
             "--metrics-interval" => config.metrics_interval = parse_seconds(&next(&mut args, "metrics-interval")?)?,
             "--help" | "-h" => {
-                println!("ztsec-server options: --nickname N --state-dir DIR --cache-dir DIR --authorized-keys FILE --local-listen ADDR --no-onion --local-socket PATH --control-socket PATH --path PATH --onion-port PORT --max-connections N --max-auth-inflight N --ipc-queue N --message-rate N --max-agent-command-queue N --max-broadcast-targets N --max-control-requests-per-second N --handshake-timeout S --auth-timeout S --idle-timeout S --ping-interval S --metrics-interval S");
+                println!("ztsec-server options: --nickname N --state-dir DIR --cache-dir DIR --authorized-keys FILE --local-listen ADDR --no-onion --local-socket PATH --control-socket PATH --panel-listen ADDR --panel-cert FILE --panel-key FILE --panel-secret-file FILE --panel-id ID --panel-max-connections N --path PATH --onion-port PORT --max-connections N --max-auth-inflight N --ipc-queue N --message-rate N --max-agent-command-queue N --max-broadcast-targets N --max-control-requests-per-second N --handshake-timeout S --auth-timeout S --idle-timeout S --ping-interval S --metrics-interval S");
                 std::process::exit(0);
             }
             other => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("unknown option {other}"))),
