@@ -118,3 +118,12 @@ The artifacts image uses `FROM scratch`, so it has no implicit shell or default 
 ## Management relay hardening
 
 The relay uses a bounded per-agent queue, bounded broadcast fan-out, a separate local control-socket connection limit, and a per-control-connection request rate limit. The command vocabulary mirrors every command family already implemented by the agent: lifecycle, plugin operations, update operations, execute, and transport switching. The relay does not invent new command semantics; it authenticates, validates, bounds, and forwards existing agent command text. `CMD:DIRECT_CONNECT` is special: the control client may request only the abstract command, and the Rust server obtains its current public address from `https://ifconfig.me/ip` before constructing the concrete agent command. Direct endpoint state is runtime-only on the agent and is zeroized when released.
+
+## Supplied Linux/Windows logs — 2026-10-02 remediation
+
+The newly supplied Linux Cargo log contains one ZTSEC compilation error in `server/src/public_ip.rs`:
+`IpAddr::is_unicast_link_local` does not exist on Rust 1.92.0; the diagnostic identifies the method as an `Ipv6Addr` API. The validator now performs the link-local check per address family: `Ipv4Addr::is_link_local()` for IPv4 and `Ipv6Addr::is_unicast_link_local()` for IPv6. The regression tests also correct the IPv6 listener fixture to the valid `[::]:4794` socket syntax and add explicit IPv4/IPv6 link-local rejection coverage.
+
+The supplied Windows log contains no ZTSEC compilation or test failure; it completes the agent check/build/test stages successfully, with only the existing upstream Arti `tor-dirclient` dead-code warning.
+
+Local Python validation passes. Rust/Cargo execution is not available in this packaging environment, so hosted Rust CI remains the authoritative compile/build verification for the patched Rust source.

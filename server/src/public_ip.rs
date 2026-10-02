@@ -68,7 +68,11 @@ async fn fetch_ip(url: &str, listen_addr: SocketAddr) -> io::Result<IpAddr> {
 }
 
 fn validate_family(ip: IpAddr, listen_addr: SocketAddr, allow_loopback_for_test: bool) -> io::Result<()> {
-    if ip.is_unspecified() || ip.is_multicast() || ip.is_unicast_link_local() || (!allow_loopback_for_test && ip.is_loopback()) {
+    let is_link_local = match ip {
+        IpAddr::V4(address) => address.is_link_local(),
+        IpAddr::V6(address) => address.is_unicast_link_local(),
+    };
+    if ip.is_unspecified() || ip.is_multicast() || is_link_local || (!allow_loopback_for_test && ip.is_loopback()) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "public IP lookup returned a non-publicly-routable address"));
     }
     if matches!((ip, listen_addr), (IpAddr::V4(_), SocketAddr::V6(_)) | (IpAddr::V6(_), SocketAddr::V4(_))) {
@@ -90,7 +94,15 @@ mod tests {
 
     #[test]
     fn rejects_mismatched_family() {
-        let listen: SocketAddr = ":::4794".parse().unwrap();
+        let listen: SocketAddr = "[::]:4794".parse().unwrap();
         assert!(validate_family("203.0.113.10".parse().unwrap(), listen, false).is_err());
+    }
+
+    #[test]
+    fn rejects_ipv4_and_ipv6_link_local_addresses() {
+        let listen_v4: SocketAddr = "0.0.0.0:4794".parse().unwrap();
+        let listen_v6: SocketAddr = "[::]:4794".parse().unwrap();
+        assert!(validate_family("169.254.10.20".parse().unwrap(), listen_v4, false).is_err());
+        assert!(validate_family("fe80::10".parse().unwrap(), listen_v6, false).is_err());
     }
 }
