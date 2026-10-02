@@ -127,3 +127,10 @@ The newly supplied Linux Cargo log contains one ZTSEC compilation error in `serv
 The supplied Windows log contains no ZTSEC compilation or test failure; it completes the agent check/build/test stages successfully, with only the existing upstream Arti `tor-dirclient` dead-code warning.
 
 Local Python validation passes. Rust/Cargo execution is not available in this packaging environment, so hosted Rust CI remains the authoritative compile/build verification for the patched Rust source.
+## Supplied Linux Cargo log — panel gateway compile fix and command-surface remediation
+
+The supplied Linux `cargo check` log stops on one ZTSEC compiler error in `server/src/panel.rs`: `telemetry_fingerprint` attempted to return `&str` borrowed from a local `serde_json::Value` (`E0515`). The helper now returns an owned fingerprint string before comparison, eliminating the invalid borrow.
+
+The same log reported two project-owned warnings: an unused `rustls` import in `server/src/panel.rs` and the production-only dead-code warning for `Endpoint::is_direct`. The import is removed and `is_direct` is test-only. The remaining `tor-dirclient` warning is in the unchanged vendored Arti 0.46.0 tree and is intentionally not modified.
+
+The panel gateway was also missing the command path entirely and capped frames at 64 KiB. The authenticated gateway now accepts the shared `agent_command` request shape, routes it through the existing Rust command validator/target validator/queueing/direct-connect materialization path, applies the existing per-connection control request rate limit, returns `agent_command_result`, and raises its frame limit to the shared control-plane limit. The Python remote panel client now exposes target selection and command submission while preserving the existing TLS + fresh-challenge HMAC authentication.

@@ -60,6 +60,7 @@ impl Endpoint {
         matches!(self, Self::Onion { .. })
     }
 
+    #[cfg(test)]
     pub fn is_direct(&self) -> bool {
         matches!(self, Self::Direct { .. })
     }

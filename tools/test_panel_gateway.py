@@ -30,6 +30,39 @@ class PanelGatewayProtocolTests(unittest.TestCase):
             self.assertEqual(len(value), 32)
             self.assertTrue(value.isascii() and value.isprintable())
 
+
+    def test_command_frame_uses_shared_control_shape(self):
+        request, request_id = panel.panel_command(
+            "a" * 64,
+            "CMD:EXECUTE:ps1:ZmFrZQ==",
+        )
+        self.assertEqual(request["protocol_version"], panel.PANEL_PROTOCOL_VERSION)
+        self.assertEqual(request["message_type"], "agent_command")
+        self.assertEqual(request["request_id"], request_id)
+        self.assertEqual(request["target"], "a" * 64)
+        self.assertEqual(request["command"], "CMD:EXECUTE:ps1:ZmFrZQ==")
+
+    def test_remote_command_builder_covers_full_current_vocabulary(self):
+        target = "b" * 64
+        cases = {
+            "data": "REQ:DATA",
+            "close": "CMD:CLOSE",
+            "reconnect": "CMD:RECONNECT",
+            "sleep": "CMD:SLEEP",
+            "hibernate": "CMD:HIBERNATE",
+            "restart": "CMD:RESTART",
+            "shutdown": "CMD:SHUTDOWN",
+            "unload:plug": "CMD:UNLOAD:plug",
+            "event:ping": "CMD:PLUGIN_EVENT:ping",
+            "send:CMD:DIRECT_CONNECT": "CMD:DIRECT_CONNECT",
+        }
+        for raw, expected in cases.items():
+            _, command = panel.parse_remote_command(raw, target)
+            self.assertEqual(command, expected)
+
+    def test_remote_frame_limit_matches_control_plane_limit(self):
+        self.assertEqual(panel.MAX_PANEL_FRAME_BYTES, panel.MAX_CONTROL_COMMAND_BYTES + 64 * 1024)
+        self.assertGreater(panel.MAX_PANEL_FRAME_BYTES, 3 * 1024 * 1024)
     def test_frame_rejects_oversized_payload(self):
         class Sink:
             def sendall(self, _):

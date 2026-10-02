@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 use tokio::{io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}, net::{TcpListener, TcpStream}, sync::{broadcast, Semaphore}, time::timeout};
-use tokio_rustls::{rustls::{self, pki_types::CertificateDer, ServerConfig}, TlsAcceptor};
+use tokio_rustls::{rustls::{pki_types::CertificateDer, ServerConfig}, TlsAcceptor};
 use tracing::{debug, info, warn};
 
-const MAX_FRAME_BYTES: usize = 64 * 1024;
+const MAX_FRAME_BYTES: usize = ztsec_protocol::MAX_CONTROL_FRAME_BYTES;
 const CHALLENGE_BYTES: usize = 32;
 const MAX_AUTH_ATTEMPTS: usize = 3;
 const AUTH_DOMAIN: &[u8] = b"ZTSEC-PANEL-AUTH-V1\0";
@@ -30,7 +30,7 @@ impl PanelHub {
         let payload: Arc<str> = Arc::from(payload);
         {
             let mut cache = self.cache.write().await;
-            if let Some(index) = cache.iter().position(|entry| telemetry_fingerprint(entry) == Some(fingerprint)) {
+            if let Some(index) = cache.iter().position(|entry| telemetry_fingerprint(entry).as_deref() == Some(fingerprint)) {
                 cache[index] = Arc::clone(&payload);
             } else {
                 cache.push(Arc::clone(&payload));
@@ -48,9 +48,9 @@ impl PanelHub {
     async fn snapshot(&self) -> Vec<Arc<str>> { self.cache.read().await.clone() }
 }
 
-fn telemetry_fingerprint(payload: &str) -> Option<&str> {
+fn telemetry_fingerprint(payload: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(payload).ok()?;
-    value.get("fingerprint")?.as_str()
+    value.get("fingerprint")?.as_str().map(str::to_owned)
 }
 
 #[derive(Clone)]
@@ -61,9 +61,10 @@ pub struct PanelConfig {
     pub panel_id: String,
     pub handshake_timeout: Duration,
     pub idle_timeout: Duration,
+    pub max_requests_per_second: u32,
 }
 
-pub async fn run(listener: TcpListener, tls: Arc<TlsAcceptor>, config: PanelConfig, hub: PanelHub, limit: Arc<Semaphore>, shutdown: tokio::sync::watch::Receiver<bool>) {
+pub async fn run(listener: TcpListener, tls: Arc<TlsAcceptor>, config: PanelConfig, hub: PanelHub, limit: Arc<Semaphore>, server: crate::Server, shutdown: tokio::sync::watch::Receiver<bool>) {
     let secret = match load_secret(&config.secret_file) {
         Ok(secret) => Arc::new(secret),
         Err(error) => {
@@ -94,10 +95,11 @@ pub async fn run(listener: TcpListener, tls: Arc<TlsAcceptor>, config: PanelConf
         let tls = Arc::clone(&tls);
         let config = config.clone();
         let hub = hub.clone();
+        let server = server.clone_for_task();
         let secret = Arc::clone(&secret);
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle_connection(stream, peer.to_string(), tls, config, hub, secret).await {
+            if let Err(error) = handle_connection(stream, peer.to_string(), tls, config, hub, server, secret).await {
                 debug!(peer = %peer, ?error, "panel connection closed");
             }
         });
@@ -110,6 +112,7 @@ async fn handle_connection(
     tls: Arc<TlsAcceptor>,
     config: PanelConfig,
     hub: PanelHub,
+    server: crate::Server,
     secret: Arc<Zeroizing<Vec<u8>>>,
 ) -> io::Result<()> {
     let stream = timeout(config.handshake_timeout, tls.accept(stream)).await
@@ -151,14 +154,14 @@ async fn handle_connection(
         if mac.verify_slice(&supplied).is_ok() {
             write_json(&mut writer, &PanelAuthenticated { protocol_version: 1, message_type: "panel_authenticated", expires_at_ms }).await?;
             info!(peer = %peer, panel_id = %config.panel_id, "panel authenticated");
-            return stream_events(reader, writer, hub, config.idle_timeout).await;
+            return stream_events(reader, writer, hub, server, config.idle_timeout, config.max_requests_per_second).await;
         }
     }
 
     Err(io::Error::new(io::ErrorKind::PermissionDenied, "panel authentication failed"))
 }
 
-async fn stream_events<R, W>(mut reader: R, mut writer: W, hub: PanelHub, idle_timeout: Duration) -> io::Result<()>
+async fn stream_events<R, W>(mut reader: R, mut writer: W, hub: PanelHub, server: crate::Server, idle_timeout: Duration, max_requests_per_second: u32) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -167,6 +170,7 @@ where
         write_raw(&mut writer, payload.as_bytes()).await?;
     }
     let mut rx = hub.subscribe();
+    let mut limiter = crate::RateLimiter::new(max_requests_per_second);
     loop {
         tokio::select! {
             incoming = timeout(idle_timeout, read_json::<PanelMessage, _>(&mut reader)) => {
@@ -174,7 +178,19 @@ where
                     Ok(Ok(message)) if message.message_type == "panel_ping" && message.protocol_version.unwrap_or(1) == 1 => {
                         write_json(&mut writer, &PanelPong { protocol_version: 1, message_type: "panel_pong" }).await?;
                     }
-                    Ok(Ok(message)) if message.message_type == "panel_close" => return Ok(()),
+                    Ok(Ok(message)) if message.message_type == "panel_close" && message.protocol_version.unwrap_or(1) == 1 => return Ok(()),
+                    Ok(Ok(message)) if message.message_type == "agent_command" => {
+                        let request = message.into_control_request()?;
+                        let request_id = request.request_id.clone();
+                        let target = request.target.clone();
+                        let response = if limiter.allow() {
+                            server.route_control(request).await
+                        } else {
+                            server.metrics.rate_limited.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::control_response(request_id, target, "rate_limited", 0, 0, "panel command rate limit exceeded".into())
+                        };
+                        write_json(&mut writer, &response).await?;
+                    }
                     Ok(Ok(_)) => return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported panel message")),
                     Ok(Err(error)) => return Err(error),
                     Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "panel idle timeout")),
@@ -305,6 +321,21 @@ struct PanelAuthenticated {
 struct PanelMessage {
     protocol_version: Option<u16>,
     message_type: String,
+    request_id: Option<String>,
+    target: Option<String>,
+    command: Option<String>,
+}
+
+impl PanelMessage {
+    fn into_control_request(self) -> io::Result<ztsec_protocol::ControlRequest> {
+        Ok(ztsec_protocol::ControlRequest {
+            protocol_version: self.protocol_version.unwrap_or_default(),
+            message_type: self.message_type,
+            request_id: self.request_id.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "panel command missing request_id"))?,
+            target: self.target.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "panel command missing target"))?,
+            command: self.command.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "panel command missing command"))?,
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -331,6 +362,29 @@ mod tests {
     #[test]
     fn telemetry_cache_extracts_fingerprint() {
         let value = r#"{"fingerprint":"abc","message_type":"telemetry"}"#;
-        assert_eq!(telemetry_fingerprint(value), Some("abc"));
+        assert_eq!(telemetry_fingerprint(value).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn panel_message_converts_to_shared_control_request() {
+        let message = PanelMessage {
+            protocol_version: Some(1),
+            message_type: "agent_command".into(),
+            request_id: Some("req-01".into()),
+            target: Some("a".repeat(64)),
+            command: Some("CMD:RECONNECT".into()),
+        };
+        let request = message.into_control_request().unwrap();
+        assert_eq!(request.protocol_version, ztsec_protocol::PROTOCOL_VERSION);
+        assert_eq!(request.message_type, "agent_command");
+        assert_eq!(request.request_id, "req-01");
+        assert_eq!(request.target.len(), 64);
+        assert_eq!(request.command, "CMD:RECONNECT");
+        assert!(request.validate().is_ok());
+    }
+
+    #[test]
+    fn panel_frame_limit_matches_shared_control_limit() {
+        assert_eq!(MAX_FRAME_BYTES, ztsec_protocol::MAX_CONTROL_FRAME_BYTES);
     }
 }

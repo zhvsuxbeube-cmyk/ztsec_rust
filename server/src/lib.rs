@@ -287,7 +287,7 @@ impl Server {
             tokio::spawn(async move { server.accept_tcp(direct_listener).await })
         };
         let panel_task = panel_listener.map(|(listener, tls)| {
-            info!(address = ?self.config.panel_listen, "external panel gateway enabled (TLS + challenge/response; telemetry only)");
+            info!(address = ?self.config.panel_listen, "external panel gateway enabled (TLS + HMAC challenge/response; telemetry + authenticated commands)");
             let panel_config = panel::PanelConfig {
                 cert: self.config.panel_cert.clone(),
                 key: self.config.panel_key.clone(),
@@ -295,11 +295,13 @@ impl Server {
                 panel_id: self.config.panel_id.clone(),
                 handshake_timeout: self.config.auth_timeout,
                 idle_timeout: self.config.idle_timeout,
+                max_requests_per_second: self.config.max_control_requests_per_second,
             };
             let hub = self.panel_hub.clone();
             let limit = Arc::new(Semaphore::new(self.config.panel_max_connections));
+            let server_for_panel = self.clone_for_task();
             let shutdown = self.shutdown.subscribe();
-            tokio::spawn(async move { panel::run(listener, tls, panel_config, hub, limit, shutdown).await })
+            tokio::spawn(async move { panel::run(listener, tls, panel_config, hub, limit, server_for_panel, shutdown).await })
         });
 
         let onion_service = if self.config.enable_onion {
@@ -714,7 +716,7 @@ async fn handle_control_client(server: &Server, stream: tokio::net::UnixStream) 
 }
 
 impl Server {
-    async fn route_control(&self, request: ztsec_protocol::ControlRequest) -> ztsec_protocol::ControlResponse {
+    pub(crate) async fn route_control(&self, request: ztsec_protocol::ControlRequest) -> ztsec_protocol::ControlResponse {
         let target = request.target.clone();
         let request_id = request.request_id.clone();
         if let Err(error) = request.validate() {

@@ -28,7 +28,15 @@ After TLS is established, messages use:
 JSON UTF-8 payload
 ```
 
-The maximum frame is 64 KiB.
+The maximum frame matches the authenticated control-plane limit (3 MiB command payload plus 64 KiB framing headroom), so the panel does not impose a smaller cap than the existing command relay.
+
+Command requests use the same shape as the private control socket:
+
+```json
+{"protocol_version":1,"message_type":"agent_command","request_id":"req-01","target":"<64-hex-fingerprint-or-broadcast>","command":"CMD:RECONNECT"}
+```
+
+A successful routing response is the shared `agent_command_result` object.
 
 Authentication messages are:
 
@@ -50,10 +58,10 @@ Successful authentication returns:
 {"protocol_version":1,"message_type":"panel_authenticated","expires_at_ms":123}
 ```
 
-After authentication, the gateway streams current telemetry snapshots followed by live telemetry updates. A lightweight `panel_ping` / `panel_pong` keeps the session active.
+After authentication, the gateway streams current telemetry snapshots followed by live telemetry updates. The same authenticated session also accepts `agent_command` messages and returns the shared `agent_command_result` response. Commands go through the exact same protocol validation, target validation, direct-connect materialization, bounded queueing, broadcast limit, and per-connection rate limiting used by the private control plane. A lightweight `panel_ping` / `panel_pong` keeps the session active.
 
 ## Scope
 
-The public gateway is deliberately telemetry/status only. It does not accept `agent_command` requests or expose the agent's existing execution, plugin, update, lifecycle, or transport-switching control vocabulary on the Internet. Those capabilities remain behind the private Unix control socket.
+The optional gateway is a remote administrative surface, not an unauthenticated shell. After successful TLS plus challenge/response authentication, it exposes the same bounded command vocabulary already implemented by the agent: lifecycle, plugin load/transfer/event/unload, update/transfer, execute, telemetry request, and transport switching. `CMD:DIRECT_CONNECT` remains server-generated: panels may request the abstract command, but they cannot inject an IP or port.
 
-For privileged command operations from an external administrative workstation, use an authenticated administrative tunnel to `/run/ztsec/control.sock` rather than publishing the command surface as a public TCP service.
+The gateway is disabled by default. Keep the listener behind an appropriate network boundary, protect the panel secret like a credential, and rely on the same rate limits and bounded queues as the private control socket.

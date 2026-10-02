@@ -416,4 +416,4 @@ The agent's direct transport switch is runtime-only. A successful `CMD:DIRECT_CO
 
 ## External panel gateway
 
-An optional TLS panel gateway is available for remote telemetry/status consumption. It is disabled by default. Enable it with `--panel-listen`, `--panel-cert`, `--panel-key`, `--panel-secret-file`, and `--panel-id`. The Python client in `tools/panel.py` supports `--remote-host` and performs the same fresh-challenge HMAC authentication. The 32-character secret is local-only and never appears on the wire. See `docs/PANEL_GATEWAY.md`.
+An optional TLS panel gateway is available for remote administration. It is disabled by default. Enable it with `--panel-listen`, `--panel-cert`, `--panel-key`, `--panel-secret-file`, and `--panel-id`. The Python client in `tools/panel.py` supports `--remote-host`, performs the same fresh-challenge HMAC authentication, and can route the shared agent command vocabulary to a selected fingerprint or bounded broadcast target. The 32-character secret is local-only and never appears on the wire; command requests still pass through the shared Rust validation and rate/broadcast/queue controls. See `docs/PANEL_GATEWAY.md`.

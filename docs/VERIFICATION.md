@@ -176,4 +176,4 @@ The Linux local integration harness now exercises the private control socket end
 - `python3 -m py_compile tools/panel.py tools/test_panel_gateway.py`
 - `python3 -m unittest -v tools.test_panel_gateway tools.test_python_service tools.panel_test tools.test_update_contract`
 - TLS mock handshake verified using the generated CA/server certificate: HMAC proof accepted and the raw 32-character secret was absent from both panel authentication messages.
-- Gateway is telemetry-only; the existing private Unix control socket remains the command plane.
+- Gateway command path verified by protocol-shape tests: authenticated panels can submit `agent_command` requests and receive `agent_command_result`; Rust routes these through the same command validation, target validation, direct-connect materialization, bounded queues, broadcast limits, and per-connection rate limiting as the private control socket.

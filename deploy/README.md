@@ -75,9 +75,9 @@ The default broadcast fan-out is 4096, matching the server's default maximum aut
 
 For tuning the relay resource limits without changing the protocol, the server accepts `--max-agent-command-queue`, `--max-broadcast-targets`, and `--max-control-requests-per-second`. Keep these bounded according to the host's expected agent population.
 
-## External panel telemetry gateway
+## External panel administrative gateway
 
-The external panel gateway is **disabled by default**. When enabled it listens on a dedicated TCP address and requires TLS followed by a challenge/response using a local 32-character secret. The secret is never sent over the network. The public gateway intentionally exposes telemetry/status only; the existing powerful agent command plane remains on the private Unix control socket.
+The external panel gateway is **disabled by default**. When enabled it listens on a dedicated TCP address and requires TLS followed by a challenge/response using a local 32-character secret. The secret is never sent over the network. After authentication, the panel can use the same bounded agent command vocabulary as the private control socket, including lifecycle, plugin, update, execute, telemetry request, and transport-switching commands. The Rust relay still enforces target validation, command validation, per-panel rate limiting, bounded queues, broadcast limits, and server-side direct-connect address discovery.
 
 Generate deployment credentials on the relay host with:
 
