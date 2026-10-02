@@ -249,9 +249,11 @@ impl Connector {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
         let endpoint = self.endpoint.clone();
-        match endpoint {
+        // Endpoint implements Drop so its owned String fields cannot be moved out. Borrowing the
+        // cloned endpoint also keeps the endpoint data independent from the mutable Tor cache.
+        match &endpoint {
             Endpoint::Local { host, port, .. } => {
-                let stream = timeout(connect_timeout, TcpStream::connect((host.as_str(), port)))
+                let stream = timeout(connect_timeout, TcpStream::connect((host.as_str(), *port)))
                     .await
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket connect timeout"))??;
                 let (ws, _) = timeout(handshake_timeout, client_async_with_config(request, stream, Some(ws_config())))
@@ -262,7 +264,7 @@ impl Connector {
             }
             Endpoint::Onion { host, port, .. } => {
                 let tor = self.ensure_tor(handshake_timeout).await?;
-                let stream = timeout(connect_timeout, tor.connect((host.as_str(), port)))
+                let stream = timeout(connect_timeout, tor.connect((host.as_str(), *port)))
                     .await
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Tor onion connection timeout"))?
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Tor onion connection failed: {e}")))?;
@@ -273,7 +275,7 @@ impl Connector {
                 Ok(Session::Tor(ws))
             }
             Endpoint::Direct { host, port, .. } => {
-                let stream = timeout(connect_timeout, TcpStream::connect((host.as_str(), port)))
+                let stream = timeout(connect_timeout, TcpStream::connect((host.as_str(), *port)))
                     .await
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "direct WebSocket connect timeout"))?
                     .map_err(|e| io::Error::new(e.kind(), format!("direct endpoint connection failed: {e}")))?;

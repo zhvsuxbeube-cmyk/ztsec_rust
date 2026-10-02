@@ -26,6 +26,8 @@ fn transport_contract() {
     assert!(source.contains("tor.connect"));
     assert!(source.contains("client_async_with_config"));
     assert!(source.contains("MAX_WS_MESSAGE_BYTES"));
+    assert!(source.contains("match &endpoint"), "Drop-bearing Endpoint must be matched by reference");
+    assert!(!source.contains("match endpoint {"), "Drop-bearing Endpoint must not be destructured by value");
     let args = std::fs::read_to_string("src/args.rs").unwrap();
     assert!(args.contains("ZTSEC_ENDPOINT"));
     assert!(args.contains("ZTSEC_AUTH_KEY_FILE"));
